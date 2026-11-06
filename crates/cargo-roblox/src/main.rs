@@ -208,7 +208,11 @@ fn build(args: &[String]) -> Result<(), String> {
         }
     }
     let src = std::fs::read_to_string(&artifact).map_err(|e| e.to_string())?;
-    let src = if minify.unwrap_or(release) { luau_lir::minify::minify(&src) } else { src };
+    let src = if minify.unwrap_or(release) {
+        luau_lir::minify::minify_with(&src, luau_lir::minify::Options { strip_local_types: tiny })
+    } else {
+        src
+    };
     std::fs::write(&out, src).map_err(|e| format!("write {}: {e}", out.display()))?;
     let size = std::fs::metadata(&out).map(|m| m.len()).unwrap_or(0);
     eprintln!("    Finished {} ({} KiB)", out.display(), size / 1024);

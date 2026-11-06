@@ -206,8 +206,10 @@ fn declared(toks: &[Tok]) -> HashSet<String> {
 }
 
 /// Which token positions are renameable name uses (not fields, keys or type annotations).
-fn renameable(toks: &[Tok], decl: &HashSet<String>) -> Vec<bool> {
+fn renameable(toks: &[Tok], decl: &HashSet<String>, strip: &mut Vec<bool>) -> Vec<bool> {
     let mut out = vec![false; toks.len()];
+    *strip = vec![false; toks.len()];
+    let mut strip_this_type = false;
     // track brace depth to recognize `{ key = value }`
     let mut brace = 0i32;
     // type-annotation regions: after ':' in local/param position until ',', '=', ')'
@@ -226,6 +228,9 @@ fn renameable(toks: &[Tok], decl: &HashSet<String>) -> Vec<bool> {
                 _ => {}
             }
             if in_type {
+                if strip_this_type {
+                    strip[i] = true;
+                }
                 continue;
             }
         }
@@ -253,6 +258,11 @@ fn renameable(toks: &[Tok], decl: &HashSet<String>) -> Vec<bool> {
                     // type annotation in a declaration (local x: T / (a: T) / ): T )
                     in_type = true;
                     type_depth = 0;
+                    // annotations on locals are optional; parameter annotations guide native codegen
+                    strip_this_type = decl_ctx == 1;
+                    if strip_this_type {
+                        strip[i] = true;
+                    }
                 }
                 "=" | "in" => decl_ctx = 0,
                 ")" if decl_ctx == 2 => {
@@ -348,10 +358,31 @@ fn needs_space(a: &str, b: &str) -> bool {
 /// emitter reserves room for these).
 pub const MAX_ALIASES: usize = 24;
 
+#[derive(Clone, Copy, Default)]
+pub struct Options {
+    /// Drop type annotations on `local` declarations (smaller; can cost some native-code speed).
+    pub strip_local_types: bool,
+}
+
 pub fn minify(src: &str) -> String {
-    let (directives, mut toks) = tokenize(src);
-    let decl = declared(&toks);
-    let ren = renameable(&toks, &decl);
+    minify_with(src, Options::default())
+}
+
+pub fn minify_with(src: &str, opts: Options) -> String {
+    let (directives, toks0) = tokenize(src);
+    let decl = declared(&toks0);
+    let mut strip = vec![];
+    let ren0 = renameable(&toks0, &decl, &mut strip);
+    // drop stripped tokens up front
+    let mut toks = vec![];
+    let mut ren = vec![];
+    for (i, t) in toks0.into_iter().enumerate() {
+        if opts.strip_local_types && strip[i] {
+            continue;
+        }
+        toks.push(t);
+        ren.push(ren0[i]);
+    }
 
     // repeated long string literals -> K[i]
     let mut str_count: HashMap<&str, usize> = HashMap::new();
