@@ -1,0 +1,9 @@
+[package]
+name = "luau_rt"
+version = "0.1.0"
+edition = "2024"
+description = "Runtime support for Rust compiled to Luau by rustc_codegen_luau"
+
+[features]
+default = ["panic-handler"]
+panic-handler = []

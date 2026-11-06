@@ -1,0 +1,7 @@
+[package]
+name = "luau-tests"
+version = "0.1.0"
+edition = "2024"
+description = "Differential test runner: native rustc vs rustc_codegen_luau under Lune"
+
+[dependencies]

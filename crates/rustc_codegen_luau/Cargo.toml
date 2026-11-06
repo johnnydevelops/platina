@@ -1,0 +1,13 @@
+[package]
+name = "rustc_codegen_luau"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+crate-type = ["dylib"]
+
+[dependencies]
+luau_lir = { path = "../luau_lir" }
+
+[package.metadata.rust-analyzer]
+rustc_private = true
