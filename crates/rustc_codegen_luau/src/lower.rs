@@ -1665,6 +1665,10 @@ impl<'a, 'tcx> FnLower<'a, 'tcx> {
                 let info = self.unsized_info(a, b, old);
                 vec![v[0], info]
             }
+            (ty::Pat(a, _), ty::Pat(b, _)) => {
+                let (al, bl) = (self.layout(*a), self.layout(*b));
+                self.unsize_val(v, al, bl)
+            }
             (ty::Adt(da, _), ty::Adt(db, _)) if da == db => {
                 // field-wise coercion (Box, NonNull, Rc, ...)
                 let mut out = vec![];
@@ -1989,7 +1993,18 @@ impl<'a, 'tcx> FnLower<'a, 'tcx> {
                         finish(self);
                         return;
                     }
-                    match self.cx.resolve_symbol(&name) {
+                    if name == rustc_symbol_mangling::mangle_internal_symbol(tcx, "__rust_no_alloc_shim_is_unstable_v2") {
+                        finish(self);
+                        return;
+                    }
+                    let resolved = self.cx.resolve_symbol(&name).or_else(|| {
+                        // allocator shim: __rust_X falls back to the default __rdl_X
+                        let item = tcx.item_name(d);
+                        let base = item.as_str().strip_prefix("__rust_")?;
+                        let alt = rustc_symbol_mangling::mangle_internal_symbol(tcx, &format!("__rdl_{base}"));
+                        self.cx.resolve_symbol(&alt)
+                    });
+                    match resolved {
                         Some(def) => callee_inst = Some(def),
                         None => self.fatal(format!("unresolved external function `{name}`")),
                     }
@@ -2253,6 +2268,7 @@ pub fn leaf_of(ty: Ty<'_>) -> Option<LeafKind> {
         return Some(k);
     }
     match ty.kind() {
+        ty::Pat(base, _) => leaf_of(*base),
         ty::RawPtr(..) | ty::Ref(..) | ty::FnPtr(..) => Some(LeafKind::Int(IntKind::U32)),
         _ => None,
     }

@@ -1,6 +1,16 @@
 //! Runtime support for Rust programs compiled to Luau.
 #![no_std]
 
+#[cfg(feature = "alloc")]
+extern crate alloc;
+
+#[cfg(feature = "alloc")]
+pub mod heap;
+
+#[cfg(all(feature = "alloc", feature = "global-allocator"))]
+#[global_allocator]
+static GLOBAL: heap::LuauAlloc = heap::LuauAlloc::new();
+
 use core::fmt::{self, Write};
 
 unsafe extern "C" {

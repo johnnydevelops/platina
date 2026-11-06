@@ -29,7 +29,7 @@ fn native(root: &Path, test: &Path, name: &str) -> Result<String, String> {
     std::fs::write(
         &main,
         format!(
-            "#![allow(dead_code, unused)]\nmod t {{ include!({:?}); }}\nfn main() {{ let mut s = String::new(); t::run(&mut s); print!(\"{{s}}\"); }}\n",
+            "#![allow(dead_code, unused)]\nextern crate alloc;\nmod t {{ include!({:?}); }}\nfn main() {{ let mut s = String::new(); t::run(&mut s); print!(\"{{s}}\"); }}\n",
             test
         ),
     )
@@ -53,7 +53,7 @@ fn luau(root: &Path, test: &Path, name: &str) -> Result<String, String> {
     std::fs::write(
         krate.join("src/lib.rs"),
         format!(
-            "#![no_std]\n#![allow(dead_code, unused)]\nextern crate luau_rt;\nmod t {{ include!({:?}); }}\n#[unsafe(no_mangle)]\npub extern \"C\" fn main() {{ let mut o = luau_rt::Out::new(); t::run(&mut o); o.flush(); }}\n",
+            "#![no_std]\n#![allow(dead_code, unused)]\nextern crate alloc;\nextern crate luau_rt;\nmod t {{ include!({:?}); }}\n#[unsafe(no_mangle)]\npub extern \"C\" fn main() {{ let mut o = luau_rt::Out::new(); t::run(&mut o); o.flush(); }}\n",
             test
         ),
     )

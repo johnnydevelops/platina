@@ -5,5 +5,7 @@ edition = "2024"
 description = "Runtime support for Rust compiled to Luau by rustc_codegen_luau"
 
 [features]
-default = ["panic-handler"]
+default = ["panic-handler", "alloc", "global-allocator"]
 panic-handler = []
+alloc = []
+global-allocator = ["alloc"]

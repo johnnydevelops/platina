@@ -155,6 +155,7 @@ pub fn prim_kind<'tcx>(ty: Ty<'tcx>) -> Option<LeafKind> {
             UintTy::U64 => LeafKind::I64 { signed: false },
             UintTy::U128 => LeafKind::I128 { signed: false },
         },
+        ty::Pat(base, _) => return prim_kind(*base),
         ty::Float(f) => match f {
             FloatTy::F32 => LeafKind::F32,
             FloatTy::F64 => LeafKind::F64,
