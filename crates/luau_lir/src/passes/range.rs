@@ -103,10 +103,95 @@ impl Ranges {
     }
 }
 
+/// For each block: interval refinements valid at block entry, from the branch of its single
+/// predecessor (`a < b` / `a <= b` on integer-ranged operands). Refinements for a var hold
+/// until that var is redefined inside the block.
+fn edge_facts(f: &Function, r: &Ranges) -> Vec<Vec<(VarId, Iv)>> {
+    let n = f.vars.len();
+    let mut def_at: Vec<Option<(usize, usize)>> = vec![None; n];
+    let mut defs = vec![0u32; n];
+    for (bi, b) in f.blocks.iter().enumerate() {
+        for (si, s) in b.stmts.iter().enumerate() {
+            for d in s.def() {
+                defs[d as usize] += 1;
+                def_at[d as usize] = Some((bi, si));
+            }
+        }
+    }
+    let mut preds = vec![Vec::new(); f.blocks.len()];
+    for (bi, b) in f.blocks.iter().enumerate() {
+        for s in crate::structure::succs_dedup(&b.term) {
+            preds[s as usize].push(bi);
+        }
+    }
+    let int = |v: VarId| f.vars[v as usize].range.is_some();
+    let mut out = vec![Vec::new(); f.blocks.len()];
+    for (bi, ps) in preds.iter().enumerate() {
+        if ps.len() != 1 {
+            continue;
+        }
+        let p = ps[0];
+        let Term::Br(Operand::Var(c), t, e) = f.blocks[p].term else { continue };
+        if t == e || defs[c as usize] != 1 {
+            continue;
+        }
+        let Some((db, ds)) = def_at[c as usize] else { continue };
+        if db != p {
+            continue;
+        }
+        let Stmt::Assign(_, Rv::Bin(op, a, b)) = &f.blocks[p].stmts[ds] else { continue };
+        // operands must not be redefined between the compare and the branch
+        let later = &f.blocks[p].stmts[ds + 1..];
+        let redefined = |o: &Operand| match o {
+            Operand::Var(v) => later.iter().any(|s| s.def().contains(v)),
+            _ => false,
+        };
+        if redefined(a) || redefined(b) {
+            continue;
+        }
+        let taken = t as usize == bi;
+        // normalize to x < y (strict) or x <= y
+        let (x, y, strict) = match (op, taken) {
+            (Bin::Lt, true) => (*a, *b, true),
+            (Bin::Le, true) => (*a, *b, false),
+            (Bin::Lt, false) => (*b, *a, false), // !(a<b) => b <= a
+            (Bin::Le, false) => (*b, *a, true),  // !(a<=b) => b < a
+            _ => continue,
+        };
+        let is_int = |o: &Operand| match o {
+            Operand::Var(v) => int(*v),
+            Operand::Num(n) => n.fract() == 0.0,
+            _ => false,
+        };
+        if !(is_int(&x) && is_int(&y)) {
+            continue;
+        }
+        let d = if strict { 1.0 } else { 0.0 };
+        let (ix, iy) = (r.op(&x), r.op(&y));
+        if let Operand::Var(xv) = x {
+            out[bi].push((xv, Iv(ix.0, ix.1.min(iy.1 - d))));
+        }
+        if let Operand::Var(yv) = y {
+            out[bi].push((yv, Iv(iy.0.max(ix.0 + d), iy.1)));
+        }
+    }
+    out
+}
+
 fn analyze(f: &Function) -> Ranges {
+    let base = analyze_flow(f, &vec![Vec::new(); f.blocks.len()]);
+    let facts = edge_facts(f, &base);
+    if facts.iter().all(|v| v.is_empty()) {
+        return base;
+    }
+    analyze_flow(f, &facts)
+}
+
+fn analyze_flow(f: &Function, facts: &[Vec<(VarId, Iv)>]) -> Ranges {
     let n = f.vars.len();
     let declared: Vec<Option<Iv>> = f.vars.iter().map(|v| v.range.map(|(a, b)| Iv(a, b))).collect();
     let mut r = Ranges { iv: vec![None; n] };
+    let _ = &facts;
     // params, call results, sp: declared or unknown
     for p in &f.params {
         r.iv[*p as usize] = Some(declared[*p as usize].unwrap_or(Iv::FULL));
@@ -127,10 +212,26 @@ fn analyze(f: &Function) -> Ranges {
     // fixpoint with widening
     for round in 0..6 {
         let mut changed = false;
-        for b in &f.blocks {
+        for (bi, b) in f.blocks.iter().enumerate() {
+            // block-entry refinements, valid until the var is redefined in this block
+            let mut local: Vec<(VarId, Iv)> = facts[bi].clone();
             for s in &b.stmts {
                 if let Stmt::Assign(v, rv) = s {
-                    let mut x = r.rv(rv);
+                    let mut x = if local.is_empty() {
+                        r.rv(rv)
+                    } else {
+                        let saved: Vec<(VarId, Option<Iv>)> = local.iter().map(|(lv, _)| (*lv, r.iv[*lv as usize])).collect();
+                        for (lv, iv) in &local {
+                            let cur = r.iv[*lv as usize].unwrap_or(Iv::FULL);
+                            r.iv[*lv as usize] = Some(Iv(cur.0.max(iv.0), cur.1.min(iv.1)));
+                        }
+                        let x = r.rv(rv);
+                        for (lv, old) in saved {
+                            r.iv[lv as usize] = old;
+                        }
+                        x
+                    };
+                    local.retain(|(lv, _)| lv != v);
                     if x.0.is_nan() || x.1.is_nan() {
                         x = Iv::FULL;
                     }
@@ -148,6 +249,10 @@ fn analyze(f: &Function) -> Ranges {
                     if Some(nx) != cur {
                         r.iv[*v as usize] = Some(nx);
                         changed = true;
+                    }
+                } else {
+                    for d in s.def() {
+                        local.retain(|(lv, _)| *lv != d);
                     }
                 }
             }

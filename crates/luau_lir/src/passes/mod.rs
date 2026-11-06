@@ -2,6 +2,7 @@
 
 use crate::ir::*;
 
+mod cond;
 mod inline;
 mod mem;
 mod range;
@@ -28,6 +29,9 @@ pub fn simplify(f: &mut Function) {
         changed |= copy_prop(f);
         changed |= fold_consts(f);
         changed |= dce(f);
+        if enabled("cond") {
+            changed |= cond::run(f);
+        }
         if enabled("range") {
             changed |= range::run(f);
         }
