@@ -490,8 +490,22 @@ impl<'a> FnEmitter<'a> {
                 }
                 acc.unwrap()
             }
+            Cond::NotEqAny(o, vals) => {
+                let e = self.operand(o);
+                let mut acc: Option<E> = None;
+                for v in vals {
+                    let t = bin("~=", P_CMP, e.clone(), E::Num(*v));
+                    acc = Some(match acc {
+                        None => t,
+                        Some(a) => bin("and", P_AND, a, t),
+                    });
+                }
+                acc.unwrap()
+            }
             Cond::Label(id) => bin("==", P_CMP, E::Name("lbl".into()), E::Num(*id as f64)),
+            Cond::NotLabel(id) => bin("~=", P_CMP, E::Name("lbl".into()), E::Num(*id as f64)),
             Cond::LabelSet => bin("~=", P_CMP, E::Name("lbl".into()), E::Num(0.0)),
+            Cond::LabelUnset => bin("==", P_CMP, E::Name("lbl".into()), E::Num(0.0)),
         }
     }
 
@@ -500,6 +514,41 @@ impl<'a> FnEmitter<'a> {
             let last = i + 1 == ss.len();
             self.s(s, last);
         }
+    }
+
+    /// `while true do [code] if c then break end ... end` -> `while not c do ... end` when the
+    /// header code folds entirely into the condition.
+    fn try_while(&mut self, body: &[S]) -> bool {
+        let ncode = body.iter().take_while(|s| matches!(s, S::Code(_))).count();
+        let (code, rest) = body.split_at(ncode);
+        let Some(S::If(c, a, e)) = rest.first() else { return false };
+        if !(matches!(a.as_slice(), [S::Break]) && e.is_empty()) {
+            return false;
+        }
+        // emit header code into a scratch buffer; it must produce no statements
+        let saved_out = std::mem::take(&mut self.out);
+        let saved_pending = self.pending.clone();
+        for s in code {
+            let S::Code(b) = s else { unreachable!() };
+            let blk = &self.f.blocks[*b as usize];
+            for st in &blk.stmts {
+                self.flush_pending_before(st);
+                self.stmt(st);
+            }
+        }
+        if !self.out.is_empty() {
+            self.out = saved_out;
+            self.pending = saved_pending;
+            return false;
+        }
+        self.out = saved_out;
+        let cond = negate(self.cond(c)).to_string();
+        self.line(&format!("while {cond} do"));
+        self.indent += 1;
+        self.seq(&rest[1..]);
+        self.indent -= 1;
+        self.line("end");
+        true
     }
 
     fn jump(&mut self, text: &str, last: bool) {
@@ -547,6 +596,7 @@ impl<'a> FnEmitter<'a> {
                 }
                 self.line("end");
             }
+            S::Loop { once: false, body } if self.try_while(body) => {}
             S::Loop { once, body } => {
                 self.line(if *once { "repeat" } else { "while true do" });
                 self.indent += 1;

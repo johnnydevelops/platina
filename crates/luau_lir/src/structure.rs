@@ -17,9 +17,12 @@ pub enum Cond {
     Falsy(Operand),
     /// Operand (a number) equals any of the values.
     EqAny(Operand, Vec<f64>),
+    NotEqAny(Operand, Vec<f64>),
     /// The multi-level-exit label variable equals this id.
     Label(u32),
+    NotLabel(u32),
     LabelSet,
+    LabelUnset,
 }
 
 /// Luau-level structured statement.
@@ -286,7 +289,8 @@ impl<'a> Ramsey<'a> {
     }
 }
 
-/// Union-find over labels for "exit continuation" equivalence.
+/// Union-find over continuations. A continuation is `exit(l) = 2l` (just after construct `l`)
+/// or `head(l) = 2l+1` (the top of loop `l`).
 struct Uf(HashMap<u32, u32>);
 impl Uf {
     fn find(&mut self, x: u32) -> u32 {
@@ -307,8 +311,18 @@ impl Uf {
     }
 }
 
-fn ends_in_jump(ws: &[W]) -> bool {
-    matches!(ws.last(), Some(W::Br(_) | W::Return(_) | W::Trap(_) | W::Unreachable))
+fn exit(l: u32) -> u32 {
+    l * 2
+}
+fn head(l: u32) -> u32 {
+    l * 2 + 1
+}
+
+type Labels = std::collections::HashSet<u32>;
+
+/// Continuation a `Br(l)` jumps to.
+fn target(l: u32, loops: &Labels) -> u32 {
+    if loops.contains(&l) { head(l) } else { exit(l) }
 }
 
 /// Remove statements after unconditional jumps.
@@ -328,8 +342,9 @@ fn truncate_dead(ws: &mut Vec<W>) {
     }
 }
 
-/// Pass 1: label equivalences and tail-branch removal.
-fn normalize(ws: &mut Vec<W>, fall: Option<u32>, uf: &mut Uf) {
+/// Pass 1: continuation equivalences ("falling off the end of X is the same as jumping to
+/// Y") and removal of branches that only jump to where control would fall anyway.
+fn normalize(ws: &mut Vec<W>, fall: Option<u32>, uf: &mut Uf, loops: &Labels) {
     let n = ws.len();
     let mut i = 0;
     while i < ws.len() {
@@ -338,28 +353,27 @@ fn normalize(ws: &mut Vec<W>, fall: Option<u32>, uf: &mut Uf) {
         match &mut ws[i] {
             W::Block(l, body) => {
                 if let Some(f) = tail_fall {
-                    uf.union(*l, f);
+                    uf.union(exit(*l), f);
                 }
                 let l = *l;
-                normalize(body, Some(l), uf);
+                normalize(body, Some(exit(l)), uf, loops);
             }
             W::Loop(l, body) => {
                 if let Some(f) = tail_fall {
-                    uf.union(*l, f);
+                    uf.union(exit(*l), f);
                 }
-                normalize(body, None, uf);
+                let l = *l;
+                // falling off the end of a Luau loop body repeats the loop
+                normalize(body, Some(head(l)), uf, loops);
             }
             W::If(_, a, b) => {
-                normalize(a, tail_fall, uf);
-                normalize(b, tail_fall, uf);
+                normalize(a, tail_fall, uf, loops);
+                normalize(b, tail_fall, uf, loops);
             }
             W::Br(l) => {
                 if let Some(f) = tail_fall {
-                    // only exits (blocks) can be fallthrough; loop labels are "heads" here
-                    // and are never unioned via a Block, so comparing roots is enough as long
-                    // as the label refers to a block — checked by the caller's label kinds.
-                    let l = *l;
-                    if uf.find(l) == uf.find(f) {
+                    let t = target(*l, loops);
+                    if uf.find(t) == uf.find(f) {
                         ws.remove(i);
                         continue;
                     }
@@ -408,51 +422,58 @@ fn flatten_unused(ws: Vec<W>, counts: &HashMap<u32, u32>) -> Vec<W> {
 #[derive(Clone, Copy)]
 struct LuauLoop {
     label: u32,
-    is_loop: bool, // W::Loop (head is meaningful) vs repeat-block
+    /// `while` loop (has a head); otherwise a `repeat ... until true` block
+    is_loop: bool,
 }
 
 struct Lower<'a> {
     uf: &'a mut Uf,
-    loop_labels: &'a std::collections::HashSet<u32>,
-    repeat_blocks: std::collections::HashSet<u32>,
+    loops: &'a Labels,
+    repeat_blocks: Labels,
     stack: Vec<LuauLoop>,
-    /// pass c/d: blocks that could not be resolved
-    unresolved_blocks: std::collections::HashSet<u32>,
+    unresolved: Labels,
     next_flag: u32,
     uses_label_var: bool,
-    /// For each luau loop label: dispatch entries to emit after it (flag id, Some(action) when the
-    /// next outer loop is the target, None = propagate)
-    dispatch: HashMap<u32, Vec<(u32, Option<bool /*continue?*/>)>>,
+    /// per luau loop: (flag id, Some(continue?) when the next outer loop is the target, None = propagate)
+    dispatch: HashMap<u32, Vec<(u32, Option<bool>)>>,
 }
 
 impl<'a> Lower<'a> {
-    /// Resolve a branch at the current position. Returns statements to emit.
+    /// How luau loop `ll` can reach continuation `t`: Some(false)=break, Some(true)=continue.
+    fn reach(&mut self, ll: LuauLoop, t: u32) -> Option<bool> {
+        let t = self.uf.find(t);
+        if self.uf.find(exit(ll.label)) == t {
+            Some(false)
+        } else if ll.is_loop && self.uf.find(head(ll.label)) == t {
+            Some(true)
+        } else {
+            None
+        }
+    }
+
     fn branch(&mut self, l: u32) -> Vec<S> {
-        let is_loop_target = self.loop_labels.contains(&l);
-        let cls = self.uf.find(l);
-        let target_idx = self.stack.iter().rposition(|ll| {
-            if is_loop_target { ll.is_loop && ll.label == l } else { self.uf.find(ll.label) == cls && (!ll.is_loop || true) }
-        });
-        // For exits, a Loop whose exit class equals the block's class also matches, but a Loop's
-        // *head* never matches an exit.
-        let target_idx = match target_idx {
-            Some(i) => i,
-            None => {
-                self.unresolved_blocks.insert(l);
-                return vec![S::Break]; // placeholder; pass will be redone
+        let t = target(l, self.loops);
+        let mut found = None;
+        for i in (0..self.stack.len()).rev() {
+            if let Some(cont) = self.reach(self.stack[i], t) {
+                found = Some((i, cont));
+                break;
             }
+        }
+        let Some((ti, cont)) = found else {
+            self.unresolved.insert(l);
+            return vec![S::Break];
         };
         let innermost = self.stack.len() - 1;
-        if target_idx == innermost {
-            return vec![if is_loop_target { S::Continue } else { S::Break }];
+        if ti == innermost {
+            return vec![if cont { S::Continue } else { S::Break }];
         }
-        // multi-level
         self.uses_label_var = true;
         self.next_flag += 1;
         let id = self.next_flag;
-        for j in (target_idx + 1)..=innermost {
+        for j in (ti + 1)..=innermost {
             let crossed = self.stack[j].label;
-            let action = if j == target_idx + 1 { Some(is_loop_target) } else { None };
+            let action = if j == ti + 1 { Some(cont) } else { None };
             self.dispatch.entry(crossed).or_default().push((id, action));
         }
         vec![S::SetLabel(id), S::Break]
@@ -519,14 +540,22 @@ impl<'a> Lower<'a> {
 
 fn make_if(c: Cond, a: Vec<S>, b: Vec<S>) -> S {
     if a.is_empty() && !b.is_empty() {
-        let c = match c {
-            Cond::Truthy(o) => Cond::Falsy(o),
-            Cond::Falsy(o) => Cond::Truthy(o),
-            c => return S::If(c, a, b),
-        };
-        S::If(c, b, vec![])
+        S::If(negate_cond(c), b, vec![])
     } else {
         S::If(c, a, b)
+    }
+}
+
+fn negate_cond(c: Cond) -> Cond {
+    match c {
+        Cond::Truthy(o) => Cond::Falsy(o),
+        Cond::Falsy(o) => Cond::Truthy(o),
+        Cond::EqAny(o, v) => Cond::NotEqAny(o, v),
+        Cond::NotEqAny(o, v) => Cond::EqAny(o, v),
+        Cond::Label(id) => Cond::NotLabel(id),
+        Cond::NotLabel(id) => Cond::Label(id),
+        Cond::LabelSet => Cond::LabelUnset,
+        Cond::LabelUnset => Cond::LabelSet,
     }
 }
 
@@ -539,44 +568,36 @@ pub fn structure(f: &Function) -> Result<Structured, Irreducible> {
     let mut r = Ramsey::new(f)?;
     let mut ws = r.do_tree(f.entry);
     truncate_dead(&mut ws);
+    let mut loops = Labels::new();
+    collect_loop_labels(&ws, &mut loops);
     let mut uf = Uf(HashMap::new());
-    // loop labels must never be unioned with block labels through Br-fallthrough checks; they
-    // are unioned only as *exits*, which is what Loop labels in uf represent. A Br to a loop
-    // label means "continue", so we keep a separate set to tell them apart.
-    let mut loop_labels = std::collections::HashSet::new();
-    collect_loop_labels(&ws, &mut loop_labels);
-    normalize_with_loops(&mut ws, None, &mut uf, &loop_labels);
+    normalize(&mut ws, None, &mut uf, &loops);
     let mut counts = HashMap::new();
     count_refs(&ws, &mut counts);
     let ws = flatten_unused(ws, &counts);
 
-    // pass c: which blocks can't be resolved with loops only
     let mut lower = Lower {
         uf: &mut uf,
-        loop_labels: &loop_labels,
+        loops: &loops,
         repeat_blocks: Default::default(),
         stack: vec![],
-        unresolved_blocks: Default::default(),
+        unresolved: Default::default(),
         next_flag: 0,
         uses_label_var: false,
         dispatch: HashMap::new(),
     };
-    let _ = lower.seq(ws.clone());
-    let mut repeat = std::mem::take(&mut lower.unresolved_blocks);
-    // Also: a block whose branches would only be resolvable as multi-level is better as a
-    // repeat block. Add blocks that are branched to from positions where they aren't the
-    // innermost loop target.
-    repeat.extend(blocks_needing_repeat(&ws, lower.uf, &loop_labels));
+    // Blocks that no enclosing `while` can exit to become `repeat ... until true`.
+    let repeat = blocks_needing_repeat(&ws, &mut lower);
     lower.repeat_blocks = repeat;
-    lower.next_flag = 0;
-    lower.uses_label_var = false;
-    lower.dispatch.clear();
     let body = lower.seq(ws);
-    assert!(lower.unresolved_blocks.is_empty(), "unresolved branch targets");
+    assert!(lower.unresolved.is_empty(), "unresolved branch targets");
+    let mut body = body;
+    drop_empty_code(&mut body, f);
+    polish(&mut body);
     Ok(Structured { body, uses_label_var: lower.uses_label_var })
 }
 
-fn collect_loop_labels(ws: &[W], set: &mut std::collections::HashSet<u32>) {
+fn collect_loop_labels(ws: &[W], set: &mut Labels) {
     for w in ws {
         match w {
             W::Loop(l, b) => {
@@ -593,91 +614,111 @@ fn collect_loop_labels(ws: &[W], set: &mut std::collections::HashSet<u32>) {
     }
 }
 
-fn normalize_with_loops(ws: &mut Vec<W>, fall: Option<u32>, uf: &mut Uf, loops: &std::collections::HashSet<u32>) {
-    // A Br to a loop label is a "continue" and never a fallthrough exit; protect it by checking
-    // label kind before removal.
-    let n = ws.len();
-    let mut i = 0;
-    while i < ws.len() {
-        let at_tail = i + 1 == n;
-        let tail_fall = if at_tail { fall } else { None };
-        match &mut ws[i] {
-            W::Block(l, body) => {
-                if let Some(f) = tail_fall {
-                    uf.union(*l, f);
-                }
-                let l = *l;
-                normalize_with_loops(body, Some(l), uf, loops);
-            }
-            W::Loop(l, body) => {
-                if let Some(f) = tail_fall {
-                    uf.union(*l, f);
-                }
-                normalize_with_loops(body, None, uf, loops);
-            }
-            W::If(_, a, b) => {
-                normalize_with_loops(a, tail_fall, uf, loops);
-                normalize_with_loops(b, tail_fall, uf, loops);
-            }
-            W::Br(l) => {
-                let l = *l;
-                if !loops.contains(&l) {
-                    if let Some(f) = tail_fall {
-                        if uf.find(l) == uf.find(f) {
-                            ws.remove(i);
-                            continue;
-                        }
-                    }
-                }
-            }
-            _ => {}
-        }
-        i += 1;
-    }
-    let _ = normalize; // keep the simpler variant for reference/tests
-}
-
-/// Blocks targeted by a branch whose innermost enclosing *Loop* doesn't share the block's exit.
-fn blocks_needing_repeat(
-    ws: &[W],
-    uf: &mut Uf,
-    loops: &std::collections::HashSet<u32>,
-) -> std::collections::HashSet<u32> {
-    fn walk(
-        ws: &[W],
-        uf: &mut Uf,
-        loops: &std::collections::HashSet<u32>,
-        stack: &mut Vec<u32>,
-        out: &mut std::collections::HashSet<u32>,
-    ) {
+/// Branches to blocks that the innermost enclosing `while` can't reach by break/continue.
+fn blocks_needing_repeat(ws: &[W], lw: &mut Lower<'_>) -> Labels {
+    fn walk(ws: &[W], lw: &mut Lower<'_>, out: &mut Labels) {
         for w in ws {
             match w {
-                W::Br(l) if !loops.contains(l) => {
-                    let ok = stack.last().map(|i| uf.find(*i) == uf.find(*l)).unwrap_or(false);
+                W::Br(l) if !lw.loops.contains(l) => {
+                    let ok = match lw.stack.last() {
+                        Some(ll) => lw.reach(*ll, exit(*l)).is_some(),
+                        None => false,
+                    };
                     if !ok {
                         out.insert(*l);
                     }
                 }
                 W::Loop(l, b) => {
-                    stack.push(*l);
-                    walk(b, uf, loops, stack, out);
-                    stack.pop();
+                    lw.stack.push(LuauLoop { label: *l, is_loop: true });
+                    walk(b, lw, out);
+                    lw.stack.pop();
                 }
-                W::Block(_, b) => walk(b, uf, loops, stack, out),
+                W::Block(_, b) => walk(b, lw, out),
                 W::If(_, a, b) => {
-                    walk(a, uf, loops, stack, out);
-                    walk(b, uf, loops, stack, out);
+                    walk(a, lw, out);
+                    walk(b, lw, out);
                 }
                 _ => {}
             }
         }
     }
-    let mut out = Default::default();
-    walk(ws, uf, loops, &mut vec![], &mut out);
+    let mut out = Labels::new();
+    walk(ws, lw, &mut out);
     out
 }
 
-#[allow(dead_code)]
-fn debug_ends(ws: &[W]) -> bool {
-    ends_in_jump(ws)
+fn drop_empty_code(ss: &mut Vec<S>, f: &Function) {
+    ss.retain(|s| !matches!(s, S::Code(b) if f.blocks[*b as usize].stmts.is_empty()));
+    for s in ss.iter_mut() {
+        match s {
+            S::If(c, a, b) => {
+                drop_empty_code(a, f);
+                drop_empty_code(b, f);
+                if a.is_empty() && !b.is_empty() {
+                    *s = make_if(c.clone(), std::mem::take(a), std::mem::take(b));
+                }
+            }
+            S::Loop { body, .. } => drop_empty_code(body, f),
+            _ => {}
+        }
+    }
+}
+
+fn ends_in_jump(ss: &[S]) -> bool {
+    match ss.last() {
+        Some(S::Break | S::Continue | S::Return(_) | S::Trap(_) | S::Unreachable) => true,
+        Some(S::If(_, a, b)) => !b.is_empty() && ends_in_jump(a) && ends_in_jump(b),
+        _ => false,
+    }
+}
+
+fn size(ss: &[S]) -> usize {
+    ss.iter()
+        .map(|s| match s {
+            S::If(_, a, b) => 1 + size(a) + size(b),
+            S::Loop { body, .. } => 1 + size(body),
+            _ => 1,
+        })
+        .sum()
+}
+
+/// Cosmetic + register-pressure friendly rewrites:
+/// - `if c then A(jumps) else B end` -> `if c then A end; B` (guard clauses, flatter hot path)
+/// - `while true do if not c then break end ... end` -> `while c do ... end`
+fn polish(ss: &mut Vec<S>) {
+    let mut i = 0;
+    while i < ss.len() {
+        match &mut ss[i] {
+            S::If(_, a, b) => {
+                polish(a);
+                polish(b);
+            }
+            S::Loop { body, .. } => polish(body),
+            _ => {}
+        }
+        // guard clause flattening
+        if let S::If(c, a, b) = &ss[i] {
+            if !b.is_empty() {
+                let (ja, jb) = (ends_in_jump(a), ends_in_jump(b));
+                let pick_a = ja && (!jb || size(a) <= size(b));
+                if pick_a || jb {
+                    let (c, a, b) = (c.clone(), a.clone(), b.clone());
+                    let (cond, guard, rest) = if pick_a { (c, a, b) } else { (negate_cond(c), b, a) };
+                    ss[i] = S::If(cond, guard, vec![]);
+                    let tail: Vec<S> = ss.drain(i + 1..).collect();
+                    ss.extend(rest);
+                    // statements after an If that jumped in both arms are dead
+                    if !(ja && jb) {
+                        ss.extend(tail);
+                    }
+                    continue;
+                }
+            }
+        }
+        i += 1;
+    }
+    // dead code after jumps
+    if let Some(p) = ss.iter().position(|s| matches!(s, S::Break | S::Continue | S::Return(_) | S::Trap(_) | S::Unreachable)) {
+        ss.truncate(p + 1);
+    }
 }
