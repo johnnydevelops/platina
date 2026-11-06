@@ -107,9 +107,10 @@ fn qmatmul(o: &mut [f32], x: &[f32], w: &Q8) {
         let sc = &w.scales[r * ng..r * ng + ng];
         let mut acc = 0f64;
         for ((qg, xg), &s) in row.chunks_exact(GS).zip(x.chunks_exact(GS)).zip(sc) {
+            // unrolled by 8 over fixed-size arrays: no bounds checks, 1/8 of the loop overhead
             let mut g = 0f64;
-            for (&q, &xv) in qg.iter().zip(xg) {
-                g += q as f64 * xv as f64;
+            for (q, x) in qg.as_chunks::<16>().0.iter().zip(xg.as_chunks::<16>().0) {
+                g += q[0] as f64 * x[0] as f64 + q[1] as f64 * x[1] as f64 + q[2] as f64 * x[2] as f64 + q[3] as f64 * x[3] as f64 + q[4] as f64 * x[4] as f64 + q[5] as f64 * x[5] as f64 + q[6] as f64 * x[6] as f64 + q[7] as f64 * x[7] as f64 + q[8] as f64 * x[8] as f64 + q[9] as f64 * x[9] as f64 + q[10] as f64 * x[10] as f64 + q[11] as f64 * x[11] as f64 + q[12] as f64 * x[12] as f64 + q[13] as f64 * x[13] as f64 + q[14] as f64 * x[14] as f64 + q[15] as f64 * x[15] as f64;
             }
             acc += g * s as f64;
         }
@@ -152,6 +153,7 @@ impl Chat {
         let theta = f32::from_bits(r.i32() as u32) as f64;
         let eps = f32::from_bits(r.i32() as u32) as f64;
         let head = dim / n_heads;
+        assert!(head % 16 == 0 && dim % GS == 0 && hidden % GS == 0, "unsupported model shape");
         let kv_dim = head * n_kv;
         let embed = r.q8(vocab, dim);
         let mut layers = Vec::with_capacity(nl);
@@ -274,8 +276,8 @@ impl Chat {
                 for (t, a) in att.iter_mut().enumerate() {
                     let k = &self.kc[loff + t * kv_dim + ko..loff + t * kv_dim + ko + head];
                     let mut s = 0f64;
-                    for (&x, &y) in q.iter().zip(k) {
-                        s += x as f64 * y as f64;
+                    for (x, y) in q.as_chunks::<16>().0.iter().zip(k.as_chunks::<16>().0) {
+                        s += x[0] as f64 * y[0] as f64 + x[1] as f64 * y[1] as f64 + x[2] as f64 * y[2] as f64 + x[3] as f64 * y[3] as f64 + x[4] as f64 * y[4] as f64 + x[5] as f64 * y[5] as f64 + x[6] as f64 * y[6] as f64 + x[7] as f64 * y[7] as f64 + x[8] as f64 * y[8] as f64 + x[9] as f64 * y[9] as f64 + x[10] as f64 * y[10] as f64 + x[11] as f64 * y[11] as f64 + x[12] as f64 * y[12] as f64 + x[13] as f64 * y[13] as f64 + x[14] as f64 * y[14] as f64 + x[15] as f64 * y[15] as f64;
                     }
                     *a = (s * scale) as f32;
                 }
@@ -288,8 +290,24 @@ impl Chat {
                 acc.resize(head, 0.0);
                 for (t, &a) in att.iter().enumerate() {
                     let vrow = &self.vc[loff + t * kv_dim + ko..loff + t * kv_dim + ko + head];
-                    for (o, &v) in acc.iter_mut().zip(vrow) {
-                        *o += a as f64 * v as f64;
+                    let a = a as f64;
+                    for (o, v) in acc.as_chunks_mut::<16>().0.iter_mut().zip(vrow.as_chunks::<16>().0) {
+                        o[0] += a * v[0] as f64;
+                        o[1] += a * v[1] as f64;
+                        o[2] += a * v[2] as f64;
+                        o[3] += a * v[3] as f64;
+                        o[4] += a * v[4] as f64;
+                        o[5] += a * v[5] as f64;
+                        o[6] += a * v[6] as f64;
+                        o[7] += a * v[7] as f64;
+                        o[8] += a * v[8] as f64;
+                        o[9] += a * v[9] as f64;
+                        o[10] += a * v[10] as f64;
+                        o[11] += a * v[11] as f64;
+                        o[12] += a * v[12] as f64;
+                        o[13] += a * v[13] as f64;
+                        o[14] += a * v[14] as f64;
+                        o[15] += a * v[15] as f64;
                     }
                 }
                 for (o, a) in xb.iter_mut().zip(acc) {
