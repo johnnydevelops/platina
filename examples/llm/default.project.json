@@ -1,0 +1,21 @@
+{
+  "name": "llm-chat",
+  "tree": {
+    "$className": "DataModel",
+    "Players": {
+      "$properties": { "CharacterAutoLoads": false }
+    },
+    "ServerStorage": {
+      "LLM": { "$path": "out/llm.luau" },
+      "Model": { "$path": "place/model" }
+    },
+    "ServerScriptService": {
+      "ChatServer": { "$path": "place/ChatServer.server.luau" }
+    },
+    "StarterPlayer": {
+      "StarterPlayerScripts": {
+        "ChatClient": { "$path": "place/ChatClient.client.luau" }
+      }
+    }
+  }
+}

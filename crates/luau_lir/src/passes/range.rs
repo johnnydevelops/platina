@@ -64,6 +64,7 @@ impl Ranges {
                         }
                     }
                     Bin::FloorDiv if x.0 >= 0.0 && y.0 >= 1.0 => Iv(0.0, x.1),
+                    Bin::Div if y.0 == y.1 && y.0 > 0.0 => Iv(x.0 / y.0, x.1 / y.0),
                     Bin::Mod if y.0 == y.1 && y.0 > 0.0 => Iv(0.0, y.0 - 1.0),
                     Bin::Mod if y.0 >= 1.0 => Iv(0.0, y.1 - 1.0),
                     Bin::FMod if y.0 >= 1.0 => Iv(-(y.1 - 1.0).min(x.mag()), (y.1 - 1.0).min(x.mag())),
@@ -261,6 +262,69 @@ fn analyze_flow(f: &Function, facts: &[Vec<(VarId, Iv)>]) -> Ranges {
             break;
         }
     }
+    // narrowing: widening jumps loop-carried vars to FULL even when an edge fact bounds them
+    // (`i + 1` under `i < n`). Re-evaluating every definition from the (sound) widened ranges
+    // gives a sound, tighter result.
+    // vars also defined by params/calls/GetSp: their non-Assign values aren't re-evaluated
+    let mut opaque = vec![false; n];
+    for p in &f.params {
+        opaque[*p as usize] = true;
+    }
+    for b in &f.blocks {
+        for s in &b.stmts {
+            if !matches!(s, Stmt::Assign(..)) {
+                for d in s.def() {
+                    opaque[d as usize] = true;
+                }
+            }
+        }
+    }
+    for _ in 0..2 {
+        let mut acc: Vec<Option<Iv>> = vec![None; n];
+        for (bi, b) in f.blocks.iter().enumerate() {
+            let mut local: Vec<(VarId, Iv)> = facts[bi].clone();
+            for s in &b.stmts {
+                if let Stmt::Assign(v, rv) = s {
+                    let saved: Vec<(VarId, Option<Iv>)> = local.iter().map(|(lv, _)| (*lv, r.iv[*lv as usize])).collect();
+                    for (lv, iv) in &local {
+                        let cur = r.iv[*lv as usize].unwrap_or(Iv::FULL);
+                        r.iv[*lv as usize] = Some(Iv(cur.0.max(iv.0), cur.1.min(iv.1)));
+                    }
+                    let mut x = r.rv(rv);
+                    for (lv, old) in saved {
+                        r.iv[lv as usize] = old;
+                    }
+                    local.retain(|(lv, _)| lv != v);
+                    if x.0.is_nan() || x.1.is_nan() {
+                        x = Iv::FULL;
+                    }
+                    let a = &mut acc[*v as usize];
+                    *a = Some(match *a {
+                        None => x,
+                        Some(c) => c.union(x),
+                    });
+                } else {
+                    for d in s.def() {
+                        local.retain(|(lv, _)| *lv != d);
+                    }
+                }
+            }
+        }
+        for v in 0..n {
+            if opaque[v] {
+                continue;
+            }
+            if let (Some(a), Some(cur)) = (acc[v], r.iv[v]) {
+                let mut nx = Iv(cur.0.max(a.0), cur.1.min(a.1));
+                if let Some(d) = declared[v] {
+                    nx = Iv(nx.0.max(d.0), nx.1.min(d.1));
+                }
+                if nx.0 <= nx.1 {
+                    r.iv[v] = Some(nx);
+                }
+            }
+        }
+    }
     r
 }
 
@@ -430,6 +494,47 @@ fn sink_wraps(f: &mut Function) -> bool {
             f.blocks[bi].stmts[si] = Stmt::Assign(t as VarId, Rv::Use(x));
             changed = true;
             r = analyze(f);
+        }
+    }
+    changed
+}
+
+/// `d = s` where `d` is a non-null var (declared range starting at 1: a reference, `NonNull`,
+/// `Box`...) and the copy is the only def of both, with `s` defined earlier in the same block:
+/// `s` is non-null too. Without this, copy propagation drops the fact (e.g. a slice iterator's
+/// `&T` is just `base + i` after inlining, and `Option<&T>`'s None test survives).
+/// Only the lower bound is transferred: integer ranges are not strict invariants of temps.
+pub fn transfer_copy_ranges(f: &mut Function) -> bool {
+    let mut defs = vec![0u32; f.vars.len()];
+    for p in &f.params {
+        defs[*p as usize] += 2;
+    }
+    for b in &f.blocks {
+        for s in &b.stmts {
+            for d in s.def() {
+                defs[d as usize] += 1;
+            }
+        }
+    }
+    let mut changed = false;
+    for bi in 0..f.blocks.len() {
+        let mut defined_here: Vec<VarId> = vec![];
+        for si in 0..f.blocks[bi].stmts.len() {
+            if let Stmt::Assign(d, Rv::Use(Operand::Var(s))) = &f.blocks[bi].stmts[si] {
+                let (d, s) = (*d as usize, *s as usize);
+                let nonnull = matches!(f.vars[d].range, Some((lo, _)) if lo >= 1.0);
+                if nonnull && defs[s] == 1 && defs[d] == 1 && defined_here.contains(&(s as VarId)) && f.vars[s].ty == f.vars[d].ty {
+                    let nr = match f.vars[s].range {
+                        None => (1.0, f64::INFINITY),
+                        Some((lo, hi)) => (lo.max(1.0), hi),
+                    };
+                    if nr.0 <= nr.1 && f.vars[s].range != Some(nr) {
+                        f.vars[s].range = Some(nr);
+                        changed = true;
+                    }
+                }
+            }
+            defined_here.extend(f.blocks[bi].stmts[si].def());
         }
     }
     changed

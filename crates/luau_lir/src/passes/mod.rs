@@ -284,6 +284,9 @@ fn simplify_inner(f: &mut Function) {
     for _ in 0..8 {
         let mut changed = false;
         changed |= cfg_simplify(f);
+        if enabled("range") {
+            range::transfer_copy_ranges(f);
+        }
         changed |= copy_prop(f);
         changed |= local_copy_prop(f);
         changed |= fold_consts(f);

@@ -2,6 +2,8 @@
 //! A from-scratch port of llama2.c's `run.c` (MIT, Andrej Karpathy). Dot products accumulate in
 //! f64: exact f32 products, near-exact sums, and no per-op f32 rounding in the Luau output.
 
+pub mod chat;
+
 use std::collections::BTreeMap;
 
 pub struct Config {

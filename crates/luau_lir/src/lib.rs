@@ -102,6 +102,10 @@ pub fn emit_program(p: &Program) -> Result<String, String> {
                 }
             }
         }
+        if std::env::var("LUAU_DUMP_LIR").is_ok_and(|filt| f.name.contains(&filt)) {
+            let r: Vec<String> = f.vars.iter().enumerate().filter_map(|(i, v)| v.range.map(|r| format!("{i}:{:?}", r))).collect();
+            eprintln!("ranges: {}", r.join(" "));
+        }
         let st = structure::structure(f).map_err(|_| format!("irreducible control flow in {}", f.name))?;
         writeln!(out, "\n-- {}", f.name.replace('\n', " ")).unwrap();
         let e = emit::FnEmitter::new(f, &names_cb);
