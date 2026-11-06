@@ -209,7 +209,7 @@ fn build(args: &[String]) -> Result<(), String> {
     }
     let src = std::fs::read_to_string(&artifact).map_err(|e| e.to_string())?;
     let src = if minify.unwrap_or(release) {
-        luau_lir::minify::minify_with(&src, luau_lir::minify::Options { strip_local_types: tiny })
+        luau_lir::minify::minify_with(&src, luau_lir::minify::Options { strip_local_types: tiny, alias_in_loops: true })
     } else {
         src
     };

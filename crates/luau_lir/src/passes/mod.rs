@@ -88,11 +88,24 @@ fn merge_blocks(f: &mut Function) -> bool {
         }
     }
     let local = |v: VarId| !multi[v as usize];
+    // blocks inside loops are left alone: sharing them can complicate hot-loop structure
+    let cfg = crate::structure::Cfg::new(f);
+    let mut in_loop = vec![false; f.blocks.len()];
+    for (_, body) in loops::natural_loops(f, &cfg) {
+        for b in body {
+            in_loop[b as usize] = true;
+        }
+    }
     let mut key_of: HashMap<String, BlockId> = HashMap::new();
     let mut redirect: Vec<BlockId> = (0..f.blocks.len() as u32).collect();
     let mut any = false;
     for (bi, b) in f.blocks.iter().enumerate() {
-        if (bi as u32) == f.entry || (b.stmts.is_empty() && b.term == Term::Unreachable) {
+        if (bi as u32) == f.entry || (b.stmts.is_empty() && b.term == Term::Unreachable) || in_loop[bi] {
+            continue;
+        }
+        // sharing a small exit block (return / trap / diverging call) saves little but makes the
+        // structured control flow around it worse; only merge big ones
+        if b.term.successors().is_empty() && b.stmts.len() < 8 {
             continue;
         }
         // canonical text with local vars numbered by first appearance
@@ -178,6 +191,14 @@ pub fn optimize(p: &mut Program) {
     if std::env::var("LUAU_NO_INLINE").is_err() {
         inline::inline_program(p);
         program_dce(p);
+    }
+    // size-only clean-ups once inlining decisions are made
+    if enabled("merge") {
+        for f in &mut p.funcs {
+            if merge_blocks(f) {
+                simplify(f);
+            }
+        }
     }
     while dedup_functions(p) {
         program_dce(p);
@@ -267,9 +288,6 @@ fn simplify_inner(f: &mut Function) {
         changed |= local_copy_prop(f);
         changed |= fold_consts(f);
         changed |= dce(f);
-        if enabled("merge") {
-            changed |= merge_blocks(f);
-        }
         if enabled("loops") {
             changed |= loops::remove_dead_loops(f);
         }

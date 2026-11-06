@@ -286,6 +286,55 @@ fn renameable(toks: &[Tok], decl: &HashSet<String>, strip: &mut Vec<bool>) -> Ve
     out
 }
 
+/// For each token: is it inside a `while`/`for`/`repeat` loop of the current function?
+fn loop_mask(toks: &[Tok]) -> Vec<bool> {
+    #[derive(PartialEq)]
+    enum K {
+        Func,
+        Loop,
+        Block,
+    }
+    let mut stack: Vec<K> = vec![];
+    let mut skip_do = false;
+    let mut out = vec![false; toks.len()];
+    let inside = |stack: &Vec<K>| {
+        for k in stack.iter().rev() {
+            match k {
+                K::Loop => return true,
+                K::Func => return false,
+                K::Block => {}
+            }
+        }
+        false
+    };
+    for (i, t) in toks.iter().enumerate() {
+        out[i] = inside(&stack);
+        if let Tok::Name(n) = t {
+            match n.as_str() {
+                "function" => stack.push(K::Func),
+                "while" | "for" => {
+                    stack.push(K::Loop);
+                    skip_do = true;
+                }
+                "repeat" => stack.push(K::Loop),
+                "do" => {
+                    if skip_do {
+                        skip_do = false;
+                    } else {
+                        stack.push(K::Block);
+                    }
+                }
+                "if" => stack.push(K::Block),
+                "end" | "until" => {
+                    stack.pop();
+                }
+                _ => {}
+            }
+        }
+    }
+    out
+}
+
 fn short_name(mut k: usize) -> String {
     const FIRST: &[u8] = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ_";
     const REST: &[u8] = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ_0123456789";
@@ -362,10 +411,13 @@ pub const MAX_ALIASES: usize = 24;
 pub struct Options {
     /// Drop type annotations on `local` declarations (smaller; can cost some native-code speed).
     pub strip_local_types: bool,
+    /// Also alias library functions inside loops. Measured to be speed-neutral in native code,
+    /// so `minify` enables it; `false` keeps loop bodies on direct `lib.fn` imports.
+    pub alias_in_loops: bool,
 }
 
 pub fn minify(src: &str) -> String {
-    minify_with(src, Options::default())
+    minify_with(src, Options { alias_in_loops: true, ..Options::default() })
 }
 
 pub fn minify_with(src: &str, opts: Options) -> String {
@@ -434,14 +486,15 @@ pub fn minify_with(src: &str, opts: Options) -> String {
         map.insert(n.clone(), next_name(&taken));
     }
 
-    // alias frequently used library members (`buffer.readu32` -> `q`); Luau still treats
-    // locals initialized from builtins as fastcall builtins
+    // optionally keep direct `buffer.readu32` imports inside loops
+    let in_loop = if opts.alias_in_loops { vec![false; toks.len()] } else { loop_mask(&toks) };
+    // alias frequently used library members (`buffer.readu32` -> `q`) elsewhere
     const LIBS: &[&str] = &["buffer", "bit32", "math", "string", "table"];
     let mut member_count: HashMap<(String, String), usize> = HashMap::new();
     for i in 0..toks.len().saturating_sub(2) {
         if let (Tok::Name(lib), Tok::Op(dot), Tok::Name(m)) = (&toks[i], &toks[i + 1], &toks[i + 2]) {
             let after_dot = i > 0 && matches!(&toks[i - 1], Tok::Op(o) if o == "." || o == ":");
-            if dot == "." && LIBS.contains(&lib.as_str()) && !ren[i] && !after_dot {
+            if dot == "." && LIBS.contains(&lib.as_str()) && !ren[i] && !after_dot && !in_loop[i] {
                 *member_count.entry((lib.clone(), m.clone())).or_default() += 1;
             }
         }
@@ -462,7 +515,7 @@ pub fn minify_with(src: &str, opts: Options) -> String {
         if i + 2 < toks.len() {
             if let (Tok::Name(lib), Tok::Op(dot), Tok::Name(m)) = (&toks[i], &toks[i + 1], &toks[i + 2]) {
                 let after_dot = i > 0 && matches!(&toks[i - 1], Tok::Op(o) if o == "." || o == ":");
-                if dot == "." && !ren[i] && !after_dot {
+                if dot == "." && !ren[i] && !after_dot && !in_loop[i] {
                     if let Some(a) = alias.get(&(lib.clone(), m.clone())) {
                         merged.push(Tok::Name(a.clone()));
                         merged_ren.push(false);

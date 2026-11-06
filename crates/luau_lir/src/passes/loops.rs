@@ -7,7 +7,7 @@ use crate::ir::*;
 use crate::structure::Cfg;
 
 /// Natural loops: (header, body blocks).
-pub fn natural_loops(f: &Function, cfg: &Cfg) -> Vec<(BlockId, BTreeSet<BlockId>)> {
+pub(crate) fn natural_loops(f: &Function, cfg: &Cfg) -> Vec<(BlockId, BTreeSet<BlockId>)> {
     let mut out: Vec<(BlockId, BTreeSet<BlockId>)> = vec![];
     for &n in &cfg.rpo {
         for s in crate::structure::succs_dedup(&f.blocks[n as usize].term) {

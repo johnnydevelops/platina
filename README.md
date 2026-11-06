@@ -29,7 +29,13 @@ Use `--no-minify` for readable output, or `--tiny` to also drop panic-message fo
 
 | crate | readable | minified (default) | `--tiny` |
 | --- | --- | --- | --- |
-| hello (HashMap + println) | 308 KB | 158 KB | 114 KB |
+| hello (HashMap + println) | 264 KB | 135 KB | 89 KB |
+| serde_json | | 475 KB | |
+| regex | | 2.3 MB | 2.0 MB |
+
+Beyond formatting, the backend avoids emitting code it doesn't need: the runtime prelude is
+tree-shaken, branches into `unreachable` are pruned (UB in Rust), identical match arms and
+identical functions are merged.
 
 Every `#[unsafe(no_mangle)] pub extern "C" fn` becomes a field of the returned module table:
 
