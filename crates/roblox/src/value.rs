@@ -120,6 +120,10 @@ impl Value {
         let m = module.into_value();
         unsafe { Value::from_raw(v_require(m.raw())) }
     }
+    /// A Luau string with these bytes (need not be UTF-8).
+    pub fn string_from_bytes(bytes: &[u8]) -> Value {
+        unsafe { Value::from_raw(v_str(bytes.as_ptr(), bytes.len())) }
+    }
     /// A new Luau `buffer` holding a copy of `bytes`.
     pub fn buffer_from(bytes: &[u8]) -> Value {
         unsafe { Value::from_raw(v_buffer_from(bytes.as_ptr(), bytes.len())) }
@@ -134,6 +138,12 @@ impl Value {
         let mut v = alloc::vec![0u8; n];
         unsafe { v_bytes_into(self.raw(), v.as_mut_ptr(), n) };
         v
+    }
+    /// Copy the bytes of a string or buffer value into `dst` (which must be at least as long).
+    pub fn read_into(&self, dst: &mut [u8]) {
+        let n = unsafe { v_byte_len(self.raw()) } as usize;
+        assert!(dst.len() >= n, "destination too small");
+        unsafe { v_bytes_into(self.raw(), dst.as_mut_ptr(), n) };
     }
     pub fn to_f64(&self) -> f64 {
         unsafe { v_to_num(self.raw()) }

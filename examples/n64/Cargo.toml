@@ -13,6 +13,10 @@ path = "src/native.rs"
 [dependencies]
 rustyn64-core = { path = "vendor/RustyN64/crates/rustyn64-core", default-features = false, features = ["fast-exec"] }
 
+# the in-game frontend (src/roblox_main.rs) is only built for Roblox
+[target.'cfg(target_vendor = "roblox")'.dependencies]
+roblox = { path = "../../crates/roblox" }
+
 [profile.release]
 debug = false
 panic = "abort"

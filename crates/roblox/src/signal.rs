@@ -91,6 +91,34 @@ pub trait SignalArgs: Sized {
     fn from_pack(pack: &Value) -> Self;
 }
 
+/// One event argument at position `i` of the packed arguments.
+pub trait FromPack: Sized {
+    fn from_pack_at(pack: &Value, i: u32) -> Self;
+}
+
+impl<T: FromValue> FromPack for T {
+    fn from_pack_at(pack: &Value, i: u32) -> Self {
+        T::from_value(pack.index(i + 1))
+    }
+}
+
+/// The remaining arguments of an event with variable arguments (`...`).
+#[derive(Clone, Debug, Default)]
+pub struct Varargs(pub Vec<Value>);
+
+impl core::ops::Deref for Varargs {
+    type Target = [Value];
+    fn deref(&self) -> &[Value] {
+        &self.0
+    }
+}
+
+impl FromPack for Varargs {
+    fn from_pack_at(pack: &Value, i: u32) -> Self {
+        Varargs((i + 1..=pack.len()).map(|k| pack.index(k)).collect())
+    }
+}
+
 /// A handler for a signal with arguments `A`: any `FnMut(T1, T2, ...)`.
 pub trait Handler<A>: 'static {
     fn call(&mut self, args: A);
@@ -98,10 +126,10 @@ pub trait Handler<A>: 'static {
 
 macro_rules! tuples {
     ($(($($t:ident $i:tt),*))*) => {$(
-        impl<$($t: FromValue),*> SignalArgs for ($($t,)*) {
+        impl<$($t: FromPack),*> SignalArgs for ($($t,)*) {
             #[allow(unused_variables)]
             fn from_pack(pack: &Value) -> Self {
-                ($($t::from_value(pack.index($i + 1)),)*)
+                ($($t::from_pack_at(pack, $i),)*)
             }
         }
         impl<Func: FnMut($($t),*) + 'static, $($t),*> Handler<($($t,)*)> for Func {

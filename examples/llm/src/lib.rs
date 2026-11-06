@@ -3,6 +3,8 @@
 //! f64: exact f32 products, near-exact sums, and no per-op f32 rounding in the Luau output.
 
 pub mod chat;
+#[cfg(target_vendor = "roblox")]
+mod roblox_main;
 
 use std::collections::BTreeMap;
 

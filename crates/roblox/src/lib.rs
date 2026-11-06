@@ -46,7 +46,7 @@ mod classes;
 
 pub use classes::*;
 pub use datatypes::*;
-pub use signal::{Connection, Signal, SignalArgs};
+pub use signal::{Connection, FromPack, Signal, SignalArgs, Varargs};
 pub use value::{FromValue, IntoValue, Value};
 
 /// Common imports: classes, datatypes, enums and signals.
@@ -54,7 +54,7 @@ pub mod prelude {
     pub use crate::classes::*;
     pub use crate::datatypes::*;
     pub use crate::enums;
-    pub use crate::signal::{Connection, Signal};
+    pub use crate::signal::{Connection, Signal, Varargs};
     pub use crate::task;
     pub use crate::value::{FromValue, IntoValue, Value};
     pub use crate::{Class, game};

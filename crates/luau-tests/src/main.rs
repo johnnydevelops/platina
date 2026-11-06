@@ -317,6 +317,32 @@ fn main() {
         let (e, g) = crate_test(&root, d, &name);
         compare(&format!("crates/{name}"), e, g, &mut pass, &mut fail);
     }
+    // Roblox bindings: tests/roblox under Lune's @lune/roblox, against a recorded expectation
+    if filters.is_empty() || filters.iter().any(|f| "roblox".contains(f.as_str())) {
+        let dir = root.join("tests/roblox");
+        let module = dir.join("out/roblox_test.luau");
+        let expected = std::fs::read_to_string(dir.join("expected.txt")).map_err(|e| e.to_string());
+        let got = sh(Command::new(root.join("target/debug/cargo-roblox")).args(["build", "--release", "-o"]).arg(&module).current_dir(&dir))
+            .and_then(|_| {
+                let mut all = String::new();
+                for export in ["run", "tasks"] {
+                    let out = Command::new("timeout")
+                        .args(["120", "lune", "run"])
+                        .arg(dir.join("runner.luau"))
+                        .arg(&module)
+                        .arg(export)
+                        .current_dir(&root)
+                        .output()
+                        .map_err(|e| e.to_string())?;
+                    if !out.status.success() {
+                        return Err(String::from_utf8_lossy(&out.stdout).to_string() + &String::from_utf8_lossy(&out.stderr));
+                    }
+                    all.push_str(&String::from_utf8_lossy(&out.stdout));
+                }
+                Ok(all)
+            });
+        compare("roblox", expected, got, &mut pass, &mut fail);
+    }
     println!("\n{pass} passed, {fail} failed");
     if fail > 0 {
         std::process::exit(1);

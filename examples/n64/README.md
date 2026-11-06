@@ -14,4 +14,11 @@ lune run examples/n64/run.luau sm64.z64 150 /tmp/frames 30   # from the repo roo
 python3 make_rom_modules.py sm64.z64 && rojo build default.project.json -o sm64.rbxl
 ```
 
+In the place, a one-line LocalScript calls `require(N64).main()`. Everything else is Rust, in
+[`src/roblox_main.rs`](src/roblox_main.rs) using the `roblox` crate:
+- loading and decoding the ROM chunks with `EncodingService`;
+- building the UI;
+- keyboard input;
+- the frame loop, which draws into an `EditableImage`.
+
 Studio controls: WASD stick, Space A, LeftShift B, Q Z, Enter Start, E R, arrows C buttons.

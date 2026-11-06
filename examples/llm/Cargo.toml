@@ -10,6 +10,10 @@ crate-type = ["rlib"]
 name = "llm-native"
 path = "src/native.rs"
 
+# the in-game server/client (src/roblox_main.rs) is only built for Roblox
+[target.'cfg(target_vendor = "roblox")'.dependencies]
+roblox = { path = "../../crates/roblox" }
+
 [profile.release]
 debug = false
 panic = "abort"

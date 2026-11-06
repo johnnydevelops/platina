@@ -101,11 +101,19 @@ pub struct RawStr {
 }
 
 impl RawStr {
-    pub fn into_string(self) -> String {
+    /// The bytes as a `Vec`.
+    pub fn into_bytes(self) -> alloc::vec::Vec<u8> {
         if self.len == 0 {
-            return String::new();
+            return alloc::vec::Vec::new();
         }
-        unsafe { String::from_raw_parts(self.ptr, self.len, self.len) }
+        unsafe { alloc::vec::Vec::from_raw_parts(self.ptr, self.len, self.len) }
+    }
+    /// As a `String`; Luau strings may hold any bytes, so invalid UTF-8 is replaced (U+FFFD).
+    pub fn into_string(self) -> String {
+        match String::from_utf8(self.into_bytes()) {
+            Ok(s) => s,
+            Err(e) => String::from_utf8_lossy(e.as_bytes()).into_owned(),
+        }
     }
 }
 

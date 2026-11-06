@@ -16,8 +16,9 @@ that run through it:
 
 | example | what it is |
 | --- | --- |
-| [`examples/llm`](examples/llm) | **SmolLM2-135M-Instruct** chatting in Roblox: a Llama implementation in Rust with int8 weights and a BPE tokenizer, about 6–7 tokens/s under Lune |
-| [`examples/n64`](examples/n64) | **[RustyN64](https://github.com/doublegate/RustyN64)**, a Nintendo 64 emulator, booting Super Mario 64 pixel-for-pixel identical to the native build |
+| [`examples/showcase`](examples/showcase) | a small Roblox experience written entirely in Rust: parts, physics, events, GUI |
+| [`examples/llm`](examples/llm) | **SmolLM2-135M-Instruct** chatting in Roblox: a Llama implementation in Rust with int8 weights and a BPE tokenizer, about 6–7 tokens/s under Lune; the chat UI, RemoteEvents and model loading are Rust too |
+| [`examples/n64`](examples/n64) | **[RustyN64](https://github.com/doublegate/RustyN64)**, a Nintendo 64 emulator, booting Super Mario 64 pixel-for-pixel identical to the native build; the in-game frontend (UI, input, `EditableImage` rendering) is Rust |
 | `tests/crates` | serde_json, regex, itertools, rand + rand_chacha, sha2, glam |
 
 ## Quick start
@@ -68,10 +69,31 @@ builds it as a `cdylib` for the `luau32-unknown-roblox` target.
 | `--no-minify` | readable output |
 | `--tiny` | also strip panic messages (`panic = immediate-abort`) |
 
+### The Roblox API
+
+The [`roblox`](crates/roblox) crate binds the whole scriptable Roblox API. It's generated from
+Roblox's API dump: every class, property, method, event and enum, with Rust datatypes and
+Rust closures as event handlers.
+
+```rust
+use roblox::prelude::*;
+
+#[unsafe(no_mangle)]
+pub extern "C" fn main() {
+    let part = Part::new();
+    part.set_color(Color3::from_rgb(255, 80, 0));
+    part.set_parent(Some(&Workspace::get()));
+    part.touched().connect(|other: Option<BasePart>| println!("touched: {:?}", other.map(|p| p.name())));
+}
+```
+
+The examples are written this way. The only Luau in each place is a one-line script such as
+`require(game.ServerScriptService.Showcase).main()`.
+
 ### Passing data
 
-The exported functions take and return numbers (all integer types up to 32 bits, `f32`, `f64`
-and `bool`). Larger data goes through the module's linear memory, which `memory()` returns:
+Exported functions take and return numbers (all integer types up to 32 bits, `f32`, `f64` and
+`bool`). Larger data goes through the module's linear memory, which `memory()` returns:
 
 ```lua
 local ptr = Rust.alloc(#s)                     -- an export of yours, e.g. returning Vec::leak
@@ -79,7 +101,15 @@ buffer.writestring(Rust.memory(), ptr, s)      -- call memory() again after any 
 Rust.process(ptr, #s)                          -- memory grows by replacing the buffer
 ```
 
-The examples show complete patterns, including streaming text out of Rust.
+Any crate can also call Luau directly. Declare an `extern "C"` function whose link name is the
+Luau code, and Platina emits that code wherever the function is called:
+
+```rust
+unsafe extern "C" {
+    #[link_name = "luau::function(x) return math.noise(x) end"]
+    fn noise(x: f64) -> f64;
+}
+```
 
 ## Performance
 
@@ -142,8 +172,8 @@ Use `cfg(target_vendor = "roblox")` to detect the target. The optional
 
 ## Limitations
 
-- **Pure computation only, for now.** There are no Roblox API bindings yet, so you call Rust
-  from Luau and pass numbers and buffers.
+- **Not every API type maps to a Rust type.** Members whose types have no Rust mapping take
+  and return a dynamic `Value`.
 - **Single-threaded.** Rust threads assume shared memory, and Roblox Actors don't share it.
 - **Pinned nightly toolchain.** Codegen backends rely on unstable compiler internals.
 - **32-bit pointers** (`usize` is 32 bits).
@@ -170,9 +200,11 @@ Use `cfg(target_vendor = "roblox")` to detect the target. The optional
 | `crates/rustc_codegen_luau` | the rustc backend (MIR → LIR) and the std platform layer |
 | `crates/luau_lir` | IR, optimization passes, structurer, emitter, minifier, runtime prelude |
 | `crates/cargo-roblox` | the `cargo roblox` subcommand |
+| `crates/roblox` | the Roblox API (generated bindings, datatypes, signals, tasks) |
 | `crates/luau_rt` | optional runtime helpers for programs |
 | `crates/luau-tests` | differential test runner (native rustc vs Luau) and benchmarks |
 | `tests/run`, `tests/std`, `tests/crates` | `no_std`, `std` and crates.io differential tests |
+| `tests/roblox` | Roblox bindings test, run under Lune's `@lune/roblox` |
 | `bench/` | benchmarks with handwritten Luau baselines |
 
 ## Development

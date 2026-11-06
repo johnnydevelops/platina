@@ -134,6 +134,8 @@ def spec_exact(t, setter=False):
     return None
 
 def event_type(t):
+    if isinstance(t, dict) and t["Category"] == "Group" and t["Name"] == "Tuple":
+        return "crate::signal::Varargs"
     s = spec(t)
     return s.ev if s else "Value"
 

@@ -3,18 +3,30 @@
   "tree": {
     "$className": "DataModel",
     "Players": {
-      "$properties": { "CharacterAutoLoads": false }
+      "$properties": {
+        "CharacterAutoLoads": false
+      }
     },
     "ServerStorage": {
-      "LLM": { "$path": "out/llm.luau" },
-      "Model": { "$path": "place/model" }
+      "Model": {
+        "$path": "place/model"
+      }
     },
     "ServerScriptService": {
-      "ChatServer": { "$path": "place/ChatServer.server.luau" }
+      "ChatServer": {
+        "$path": "place/ChatServer.server.luau"
+      }
     },
     "StarterPlayer": {
       "StarterPlayerScripts": {
-        "ChatClient": { "$path": "place/ChatClient.client.luau" }
+        "ChatClient": {
+          "$path": "place/ChatClient.client.luau"
+        }
+      }
+    },
+    "ReplicatedStorage": {
+      "LLM": {
+        "$path": "out/llm.luau"
       }
     }
   }

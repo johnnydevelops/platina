@@ -1,0 +1,25 @@
+{
+  "name": "showcase",
+  "tree": {
+    "$className": "DataModel",
+    "ServerScriptService": {
+      "Showcase": { "$path": "out/showcase.luau" },
+      "Main": { "$path": "place/Showcase.server.luau" }
+    },
+    "Workspace": {
+      "Baseplate": {
+        "$className": "Part",
+        "$properties": {
+          "Anchored": true,
+          "Size": [512, 1, 512],
+          "Position": [0, -0.5, 0],
+          "Color": [0.35, 0.35, 0.38]
+        }
+      },
+      "SpawnLocation": {
+        "$className": "SpawnLocation",
+        "$properties": { "Anchored": true, "Size": [6, 1, 6], "Position": [0, 0.5, 0] }
+      }
+    }
+  }
+}

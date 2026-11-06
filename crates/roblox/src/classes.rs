@@ -7623,7 +7623,7 @@ impl BindableEvent {
         unsafe { f(self.handle().id(), arguments.raw()) }
     }
     /// `BindableEvent.Event` event
-    pub fn event(&self) -> Signal<(Value,)> {
+    pub fn event(&self) -> Signal<(crate::signal::Varargs,)> {
         luau_fn! { fn e(h: u32) -> u32 = "function(h) return rt_href(rt_hget(h).Event) end"; }
         Signal::from_handle(unsafe { Handle::from_raw(e(self.handle().id())) })
     }
@@ -15675,7 +15675,7 @@ impl ExecutedRemoteCommand {
         unsafe { f(self.handle().id()) }
     }
     /// `ExecutedRemoteCommand.ReceivedUpdate` event
-    pub fn received_update(&self) -> Signal<(Value,)> {
+    pub fn received_update(&self) -> Signal<(crate::signal::Varargs,)> {
         luau_fn! { fn e(h: u32) -> u32 = "function(h) return rt_href(rt_hget(h).ReceivedUpdate) end"; }
         Signal::from_handle(unsafe { Handle::from_raw(e(self.handle().id())) })
     }
@@ -33015,12 +33015,12 @@ impl RemoteEvent {
         unsafe { f(self.handle().id(), arguments.raw()) }
     }
     /// `RemoteEvent.OnClientEvent` event
-    pub fn on_client_event(&self) -> Signal<(Value,)> {
+    pub fn on_client_event(&self) -> Signal<(crate::signal::Varargs,)> {
         luau_fn! { fn e(h: u32) -> u32 = "function(h) return rt_href(rt_hget(h).OnClientEvent) end"; }
         Signal::from_handle(unsafe { Handle::from_raw(e(self.handle().id())) })
     }
     /// `RemoteEvent.OnServerEvent` event
-    pub fn on_server_event(&self) -> Signal<(Option<Player>, Value)> {
+    pub fn on_server_event(&self) -> Signal<(Option<Player>, crate::signal::Varargs)> {
         luau_fn! { fn e(h: u32) -> u32 = "function(h) return rt_href(rt_hget(h).OnServerEvent) end"; }
         Signal::from_handle(unsafe { Handle::from_raw(e(self.handle().id())) })
     }
@@ -45379,12 +45379,12 @@ impl UnreliableRemoteEvent {
         unsafe { f(self.handle().id(), arguments.raw()) }
     }
     /// `UnreliableRemoteEvent.OnClientEvent` event
-    pub fn on_client_event(&self) -> Signal<(Value,)> {
+    pub fn on_client_event(&self) -> Signal<(crate::signal::Varargs,)> {
         luau_fn! { fn e(h: u32) -> u32 = "function(h) return rt_href(rt_hget(h).OnClientEvent) end"; }
         Signal::from_handle(unsafe { Handle::from_raw(e(self.handle().id())) })
     }
     /// `UnreliableRemoteEvent.OnServerEvent` event
-    pub fn on_server_event(&self) -> Signal<(Option<Player>, Value)> {
+    pub fn on_server_event(&self) -> Signal<(Option<Player>, crate::signal::Varargs)> {
         luau_fn! { fn e(h: u32) -> u32 = "function(h) return rt_href(rt_hget(h).OnServerEvent) end"; }
         Signal::from_handle(unsafe { Handle::from_raw(e(self.handle().id())) })
     }

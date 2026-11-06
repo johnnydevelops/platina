@@ -45,10 +45,15 @@ python3 make_place.py smol.q8 smol.tok           # zstd chunks -> place/model (~
 rojo build default.project.json -o chat.rbxl
 ```
 
-The model runs in a server Script, and the weights stay in `ServerStorage`. On startup the
-server decodes the chunks with `EncodingService` (`Base64Decode`, then zstd `DecompressBuffer`).
-Replies stream to a chat UI on the client. Open `chat.rbxl` in Studio, press Play, and type a
-message.
+The place's only Luau is `require(LLM).server()` in a Script and `require(LLM).client()` in a
+LocalScript. Everything else is Rust, in [`src/roblox_main.rs`](src/roblox_main.rs) using the
+`roblox` crate:
+- The model runs on the server, and the weights stay in `ServerStorage`.
+- On startup, the server decodes the chunks with `EncodingService` (`Base64Decode`, then zstd
+  `DecompressBuffer`) and creates the RemoteEvents.
+- Replies stream to a chat UI that the client builds.
+
+Open `chat.rbxl` in Studio, press Play, and type a message.
 
 ## Performance notes
 

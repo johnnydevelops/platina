@@ -1,6 +1,9 @@
 //! A tiny embedding of the RustyN64 core for Luau: load a ROM, run frames, read pixels.
 use rustyn64_core::System;
 
+#[cfg(target_vendor = "roblox")]
+mod roblox_main;
+
 pub const FB_W: usize = 640;
 pub const FB_H: usize = 625;
 
