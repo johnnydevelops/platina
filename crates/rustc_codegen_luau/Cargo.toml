@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 description = "rustc codegen backend targeting Luau"
-repository = "https://github.com/johnnydevelops/patina"
+repository = "https://github.com/johnnydevelops/platina"
 
 [lib]
 crate-type = ["dylib"]

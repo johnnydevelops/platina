@@ -3,7 +3,7 @@ name = "luau_rt"
 version = "0.1.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/johnnydevelops/patina"
+repository = "https://github.com/johnnydevelops/platina"
 description = "Runtime support for Rust compiled to Luau by rustc_codegen_luau"
 
 [dependencies]

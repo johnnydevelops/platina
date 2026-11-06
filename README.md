@@ -1,6 +1,6 @@
-# Patina
+# Platina
 
-Patina compiles Rust to **native Luau** for Roblox. It consists of a rustc codegen backend
+Platina compiles Rust to **native Luau** for Roblox. It consists of a rustc codegen backend
 (`rustc_codegen_luau`) and a cargo subcommand (`cargo roblox`).
 
 It is not a WebAssembly translator. The backend lowers rustc's MIR straight to Luau:
@@ -25,7 +25,7 @@ that run through it:
 You need [rustup](https://rustup.rs). Install the `cargo roblox` subcommand straight from GitHub:
 
 ```sh
-cargo install --git https://github.com/johnnydevelops/patina cargo-roblox
+cargo install --git https://github.com/johnnydevelops/platina cargo-roblox
 ```
 
 The first `cargo roblox build` installs the pinned nightly toolchain (with `rustc-dev`) through
@@ -178,7 +178,7 @@ Use `cfg(target_vendor = "roblox")` to detect the target. The optional
 ## Development
 
 ```sh
-git clone https://github.com/johnnydevelops/patina && cd patina
+git clone https://github.com/johnnydevelops/platina && cd platina
 aftman install                         # Lune + Rojo (or install them yourself)
 cargo build -p rustc_codegen_luau -p cargo-roblox
 cargo run -p luau-tests                # every test, run natively and in Luau, outputs compared
@@ -195,11 +195,11 @@ Debugging aids:
 
 ## License
 
-Patina is licensed under either of [MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE), at your
+Platina is licensed under either of [MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE), at your
 option.
 
-**The Luau that Patina generates is yours.** Under the [output exception](LICENSE-EXCEPTION),
-compiled modules, including the runtime Patina embeds in them, can be used in any game,
+**The Luau that Platina generates is yours.** Under the [output exception](LICENSE-EXCEPTION),
+compiled modules, including the runtime Platina embeds in them, can be used in any game,
 commercial or not. You don't need attribution, and you don't need to ship license text. The
 exception doesn't change the licenses of third-party code you compile in (for example crates
 you depend on), which keep their own terms.

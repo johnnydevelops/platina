@@ -1,17 +1,17 @@
-Patina Output Exception
+Platina Output Exception
 
-Patina is licensed under either of the MIT license (LICENSE-MIT) or the Apache License,
+Platina is licensed under either of the MIT license (LICENSE-MIT) or the Apache License,
 Version 2.0 (LICENSE-APACHE), at your option. As an additional permission, which applies
 under both licenses:
 
-Luau code produced by Patina when it compiles a program ("Output") may be used, copied,
+Luau code produced by Platina when it compiles a program ("Output") may be used, copied,
 modified, sold and distributed for any purpose, including commercially (for example in
 Roblox experiences), without attribution and without including or reproducing the license
-texts, copyright notices or this exception. This also covers the parts of Patina that are
+texts, copyright notices or this exception. This also covers the parts of Platina that are
 embedded in the Output, such as the runtime prelude, the platform layer and the luau_rt
 crate.
 
-This exception does not apply to Patina's source code itself, which remains under the
+This exception does not apply to Platina's source code itself, which remains under the
 licenses above when it is redistributed. It also does not change the licenses of
 third-party code compiled into the Output, such as the Rust standard library or crates
 your program depends on. Those keep their own terms.

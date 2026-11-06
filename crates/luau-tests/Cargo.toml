@@ -3,7 +3,7 @@ name = "luau-tests"
 version = "0.1.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/johnnydevelops/patina"
+repository = "https://github.com/johnnydevelops/platina"
 description = "Differential test runner: native rustc vs rustc_codegen_luau under Lune"
 
 [dependencies]
