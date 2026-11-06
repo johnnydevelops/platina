@@ -1,6 +1,7 @@
 //! `cargo roblox` — build Rust crates into Luau ModuleScripts for Roblox.
 //!
 //! ```text
+//! cargo roblox setup                 # install the pinned nightly + build the backend
 //! cargo roblox build [--release] [-o <file.luau>] [-p <package>] [--no-std] [-- <extra cargo args>]
 //! ```
 //!
@@ -21,6 +22,76 @@ const BACKEND_FILE: &str = if cfg!(target_os = "macos") {
     "librustc_codegen_luau.so"
 };
 
+/// The source tree this binary was built from: the repository checkout, or the copy that
+/// `cargo install --git` / `--path` built from. `setup` builds the backend from it.
+fn source_root() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")
+}
+
+/// Identifies the backend sources this binary expects (the checkout path is unique per
+/// installed revision).
+fn source_stamp() -> String {
+    format!("{} {}", env!("CARGO_PKG_VERSION"), env!("CARGO_MANIFEST_DIR"))
+}
+
+/// `<cargo home>/lib`, next to `<cargo home>/bin` where `cargo install` puts this binary.
+fn install_lib_dir() -> Option<PathBuf> {
+    let exe = env::current_exe().ok()?;
+    Some(exe.parent()?.join("../lib/rustc_codegen_luau"))
+}
+
+fn toolchain_components() -> Vec<String> {
+    TOOLCHAIN_TOML
+        .lines()
+        .find_map(|l| l.trim().strip_prefix("components = "))
+        .map(|v| v.trim_matches(|c| c == '[' || c == ']').split(',').map(|c| c.trim().trim_matches('"').to_string()).filter(|c| !c.is_empty()).collect())
+        .unwrap_or_default()
+}
+
+/// Install the pinned toolchain and build the codegen backend into `<cargo home>/lib`.
+fn setup() -> Result<PathBuf, String> {
+    let tc = toolchain();
+    let root = source_root();
+    if !root.join("crates/rustc_codegen_luau/Cargo.toml").exists() {
+        return Err(format!(
+            "backend sources not found at {} (reinstall with `cargo install --git https://github.com/johnnydevelops/rustc-codegen-luau cargo-roblox`)",
+            root.display()
+        ));
+    }
+    eprintln!("    Installing toolchain {tc} (rustc-dev, rust-src, llvm-tools)");
+    let status = Command::new("rustup")
+        .args(["toolchain", "install", &tc, "--profile", "minimal", "--no-self-update"])
+        .args(toolchain_components().iter().flat_map(|c| ["--component", c.as_str()]))
+        .status()
+        .map_err(|e| format!("failed to run rustup (is it installed? https://rustup.rs): {e}"))?;
+    if !status.success() {
+        return Err("rustup toolchain install failed".into());
+    }
+    let lib_dir = install_lib_dir().ok_or("cannot locate the install directory")?;
+    std::fs::create_dir_all(&lib_dir).map_err(|e| format!("create {}: {e}", lib_dir.display()))?;
+    let lib_dir = lib_dir.canonicalize().unwrap_or(lib_dir);
+    let target_dir = lib_dir.join("target");
+    eprintln!("    Building rustc_codegen_luau (takes a minute)");
+    let status = Command::new("cargo")
+        .arg(format!("+{tc}"))
+        .args(["build", "--release", "-p", "rustc_codegen_luau", "--manifest-path"])
+        .arg(root.join("Cargo.toml"))
+        .env("CARGO_TARGET_DIR", &target_dir)
+        .status()
+        .map_err(|e| format!("failed to run cargo: {e}"))?;
+    if !status.success() {
+        return Err("building the backend failed".into());
+    }
+    let built = target_dir.join("release").join(BACKEND_FILE);
+    let dest = lib_dir.join(BACKEND_FILE);
+    std::fs::copy(&built, &dest).map_err(|e| format!("copy {} -> {}: {e}", built.display(), dest.display()))?;
+    std::fs::write(lib_dir.join("stamp"), source_stamp()).map_err(|e| e.to_string())?;
+    // the intermediate build is large; keep only the backend
+    let _ = std::fs::remove_dir_all(&target_dir);
+    eprintln!("    Installed {}", dest.display());
+    Ok(dest)
+}
+
 fn toolchain() -> String {
     TOOLCHAIN_TOML
         .lines()
@@ -31,7 +102,7 @@ fn toolchain() -> String {
 fn usage() -> ExitCode {
     eprintln!(
         "cargo roblox — compile Rust to Luau for Roblox\n\n\
-         USAGE:\n    cargo roblox build [OPTIONS] [-- <cargo args>]\n\n\
+         USAGE:\n    cargo roblox build [OPTIONS] [-- <cargo args>]\n    cargo roblox setup    install the pinned nightly and build the backend\n\n\
          OPTIONS:\n\
          \x20   --release          build with optimizations (recommended)\n\
          \x20   -o, --out <FILE>   where to write the .luau module (default: out/<crate>.luau)\n\
@@ -50,16 +121,21 @@ fn find_backend() -> Option<PathBuf> {
         return Some(PathBuf::from(p));
     }
     let mut candidates = vec![];
+    // next to the binary (a build inside this repository: target/{debug,release})
     if let Ok(exe) = env::current_exe() {
         if let Some(dir) = exe.parent() {
             candidates.push(dir.join(BACKEND_FILE));
-            candidates.push(dir.join("../lib").join(BACKEND_FILE));
         }
     }
-    // when run from a checkout of this repository
-    let repo = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    // installed by `cargo roblox setup`, for this exact source revision
+    if let Some(lib) = install_lib_dir() {
+        if std::fs::read_to_string(lib.join("stamp")).ok().as_deref() == Some(source_stamp().as_str()) {
+            candidates.push(lib.join(BACKEND_FILE));
+        }
+    }
+    // a checkout of this repository with the backend already built
     for profile in ["release", "debug"] {
-        candidates.push(repo.join("target").join(profile).join(BACKEND_FILE));
+        candidates.push(source_root().join("target").join(profile).join(BACKEND_FILE));
     }
     candidates.into_iter().find(|p| p.exists()).map(|p| p.canonicalize().unwrap_or(p))
 }
@@ -139,9 +215,13 @@ fn build(args: &[String]) -> Result<(), String> {
         }
     }
     let tc = toolchain();
-    let backend = find_backend().ok_or_else(|| {
-        format!("could not find {BACKEND_FILE}; build it with `cargo build --release -p rustc_codegen_luau` or set LUAU_CODEGEN_BACKEND")
-    })?;
+    let backend = match find_backend() {
+        Some(b) => b,
+        None => {
+            eprintln!("    No codegen backend found for this version of cargo-roblox; running setup");
+            setup()?
+        }
+    };
     let (target_dir, name) = cargo_metadata(&tc, package.as_deref())?;
     // target spec next to the build output (rustc names the target after the file stem)
     let spec_dir = target_dir.join("luau");
@@ -228,6 +308,13 @@ fn main() -> ExitCode {
     match args.first().map(|s| s.as_str()) {
         Some("build") => match build(&args[1..]) {
             Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                eprintln!("error: {e}");
+                ExitCode::FAILURE
+            }
+        },
+        Some("setup") => match setup() {
+            Ok(_) => ExitCode::SUCCESS,
             Err(e) => {
                 eprintln!("error: {e}");
                 ExitCode::FAILURE

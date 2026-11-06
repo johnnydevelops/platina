@@ -2479,12 +2479,6 @@ impl<'a, 'tcx> FnLower<'a, 'tcx> {
     pub(crate) fn i_push(&mut self, s: Stmt) {
         self.push(s)
     }
-    pub(crate) fn i_term_trap(&mut self, parts: Vec<TrapPart>) {
-        self.term(Term::Trap(parts));
-        // following code (if any) is unreachable; continue in a fresh block
-        let b = self.f.new_block();
-        self.cur = b;
-    }
     pub(crate) fn i_assign(&mut self, ty: l::Ty, rv: Rv) -> Operand {
         self.assign(ty, rv)
     }
@@ -2496,9 +2490,6 @@ impl<'a, 'tcx> FnLower<'a, 'tcx> {
     }
     pub(crate) fn i_fatal(&self, msg: impl Into<String>) -> ! {
         self.fatal(msg)
-    }
-    pub(crate) fn i_monomorphize<T: ty::TypeFoldable<TyCtxt<'tcx>> + Copy>(&self, v: T) -> T {
-        self.monomorphize(v)
     }
     pub(crate) fn i_set_unreachable(&mut self) {
         self.term(Term::Unreachable);
@@ -2518,9 +2509,6 @@ impl<'a, 'tcx> FnLower<'a, 'tcx> {
     pub(crate) fn i_store(&mut self, addr: Operand, lay: TyAndLayout<'tcx>, v: Val) {
         let p = PlaceV::Mem { addr, off: 0, layout: lay, meta: None };
         self.write_place(&p, v)
-    }
-    pub(crate) fn i_fn_ptr(&mut self, inst: Instance<'tcx>) -> u32 {
-        self.cx.fn_ptr(inst)
     }
     pub(crate) fn i_call_fn(&mut self, inst: Instance<'tcx>, args: Vec<Operand>, nret: Vec<l::Ty>) -> Vec<Operand> {
         let id = self.cx.fn_id(inst);

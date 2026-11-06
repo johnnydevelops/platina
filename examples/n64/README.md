@@ -6,7 +6,7 @@ compiled to Luau with `cargo roblox`. Runs Super Mario 64 pixel-identical to the
 
 ```sh
 # native reference (dumps PPMs every 30 frames)
-cargo run --release --bin n64-native -- sm64.z64 300
+cargo run --release --bin n64-native -- sm64.z64 300 /tmp/frames
 # Luau build + headless run under Lune
 cargo roblox build --release -o out/n64.luau
 lune run examples/n64/run.luau sm64.z64 150 /tmp/frames 30   # from the repo root

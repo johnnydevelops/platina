@@ -1,3 +1,6 @@
 target/
-/out
+out/
+*.rbxl
+*.rbxl.lock
+*.rbxlx
 rustc-ice-*.txt

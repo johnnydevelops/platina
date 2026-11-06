@@ -4,7 +4,7 @@
 //! local per leaf (two for 64-bit integers). Everything else lives in linear memory and is
 //! handled by address.
 
-use rustc_abi::{BackendRepr, FieldIdx, Primitive, Scalar, Size, Variants};
+use rustc_abi::{BackendRepr, Primitive, Scalar, Variants};
 use rustc_middle::ty::layout::{
     FnAbiError, FnAbiOfHelpers, FnAbiRequest, HasTyCtxt, HasTypingEnv, LayoutError, LayoutOfHelpers, TyAndLayout,
 };
@@ -95,12 +95,6 @@ impl LeafKind {
             LeafKind::I128 { .. } => vec![(Mem::U32, 0), (Mem::U32, 4), (Mem::U32, 8), (Mem::U32, 12)],
             LeafKind::F32 => vec![(Mem::F32, 0)],
             LeafKind::F64 => vec![(Mem::F64, 0)],
-        }
-    }
-    pub fn int(self) -> Option<IntKind> {
-        match self {
-            LeafKind::Int(k) => Some(k),
-            _ => None,
         }
     }
 }
@@ -281,45 +275,6 @@ fn scalar_layout_inner<'tcx>(cx: LCx<'tcx>, layout: TyAndLayout<'tcx>, base: u64
             }
         }
         _ => false,
-    }
-}
-
-/// Leaf range (indices into a leaves vector) of field `i` of a register-represented value.
-/// Works for structs (flattened in field order) and for variant fields of scalar enums
-/// (matched by byte offset).
-pub fn field_leaf_range<'tcx>(
-    cx: LCx<'tcx>,
-    parent: TyAndLayout<'tcx>,
-    parent_leaves: &[Leaf],
-    variant: Option<rustc_abi::VariantIdx>,
-    field: FieldIdx,
-) -> (std::ops::Range<usize>, TyAndLayout<'tcx>) {
-    let vlayout = match variant {
-        Some(v) => parent.for_variant(&cx, v),
-        None => parent,
-    };
-    let f = vlayout.field(&cx, field.as_usize());
-    let off = vlayout.fields.offset(field.as_usize());
-    range_at(parent_leaves, off, f.size, f)
-}
-
-fn range_at<'tcx>(
-    leaves: &[Leaf],
-    off: Size,
-    size: Size,
-    f: TyAndLayout<'tcx>,
-) -> (std::ops::Range<usize>, TyAndLayout<'tcx>) {
-    let (lo, hi) = (off.bytes(), off.bytes() + size.bytes());
-    let start = leaves.iter().position(|l| l.off >= lo && l.off < hi);
-    match start {
-        None => (0..0, f),
-        Some(s) => {
-            let mut e = s;
-            while e < leaves.len() && leaves[e].off < hi {
-                e += 1;
-            }
-            (s..e, f)
-        }
     }
 }
 

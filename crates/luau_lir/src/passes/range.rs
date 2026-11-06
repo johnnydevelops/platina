@@ -436,7 +436,7 @@ fn lower_imul(f: &mut Function, r: &Ranges, mixed: &[bool]) -> bool {
             let (ia, ib) = (r.op(&a), r.op(&b));
             let exact = ia.0 >= 0.0 && ib.0 >= 0.0 && ia.1 * ib.1 < 9007199254740992.0;
             let mix = [a, b].iter().any(|o| matches!(o, Operand::Var(x) if mixed[*x as usize]));
-            let mut new = |f: &mut Function| {
+            let new = |f: &mut Function| {
                 f.vars.push(VarInfo { ty: Ty::Num, name: None, range: None });
                 (f.vars.len() - 1) as VarId
             };

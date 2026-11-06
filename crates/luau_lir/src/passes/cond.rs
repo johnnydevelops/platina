@@ -124,7 +124,6 @@ pub fn thread(f: &mut Function) -> bool {
                     Operand::Num(k) => Av::C(*k),
                     Operand::Bool(k) => Av::B(*k),
                     Operand::Var(v) => env.iter().rev().find(|(x, _)| x == v).map(|e| e.1).unwrap_or_else(|| at_end(f, *v)),
-                    _ => Av::U,
                 }
             };
             for s in &f.blocks[bi].stmts {

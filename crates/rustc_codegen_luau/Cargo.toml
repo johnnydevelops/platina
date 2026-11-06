@@ -2,6 +2,8 @@
 name = "rustc_codegen_luau"
 version = "0.1.0"
 edition = "2024"
+description = "rustc codegen backend targeting Luau"
+repository = "https://github.com/johnnydevelops/rustc-codegen-luau"
 
 [lib]
 crate-type = ["dylib"]

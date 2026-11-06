@@ -2,5 +2,7 @@
 name = "luau_lir"
 version = "0.1.0"
 edition = "2024"
+description = "Luau IR, optimizer, structurer and emitter for rustc_codegen_luau"
+repository = "https://github.com/johnnydevelops/rustc-codegen-luau"
 
 [dependencies]

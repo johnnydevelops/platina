@@ -744,7 +744,7 @@ impl<'a> FnEmitter<'a> {
         if v == i {
             return false;
         }
-        let mut k = 1;
+        let mut k;
         let mut tmp = None;
         match st.get(1) {
             Some(Stmt::Assign(d, Rv::Bin(Bin::Add, Operand::Var(x), Operand::Num(one)))) if *x == i && *one == 1.0 => {

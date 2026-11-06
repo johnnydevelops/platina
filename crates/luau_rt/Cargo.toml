@@ -2,6 +2,7 @@
 name = "luau_rt"
 version = "0.1.0"
 edition = "2024"
+repository = "https://github.com/johnnydevelops/rustc-codegen-luau"
 description = "Runtime support for Rust compiled to Luau by rustc_codegen_luau"
 
 [dependencies]
