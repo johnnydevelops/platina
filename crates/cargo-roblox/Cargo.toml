@@ -2,8 +2,9 @@
 name = "cargo-roblox"
 version = "0.1.0"
 edition = "2024"
+license = "MIT OR Apache-2.0"
 description = "Compile Rust crates to native Luau ModuleScripts for Roblox"
-repository = "https://github.com/johnnydevelops/rustc-codegen-luau"
+repository = "https://github.com/johnnydevelops/patina"
 
 [dependencies]
 serde_json = "1"

@@ -2,7 +2,8 @@
 name = "luau_lir"
 version = "0.1.0"
 edition = "2024"
+license = "MIT OR Apache-2.0"
 description = "Luau IR, optimizer, structurer and emitter for rustc_codegen_luau"
-repository = "https://github.com/johnnydevelops/rustc-codegen-luau"
+repository = "https://github.com/johnnydevelops/patina"
 
 [dependencies]

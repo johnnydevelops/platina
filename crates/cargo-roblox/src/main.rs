@@ -54,7 +54,7 @@ fn setup() -> Result<PathBuf, String> {
     let root = source_root();
     if !root.join("crates/rustc_codegen_luau/Cargo.toml").exists() {
         return Err(format!(
-            "backend sources not found at {} (reinstall with `cargo install --git https://github.com/johnnydevelops/rustc-codegen-luau cargo-roblox`)",
+            "backend sources not found at {} (reinstall with `cargo install --git https://github.com/johnnydevelops/patina cargo-roblox`)",
             root.display()
         ));
     }

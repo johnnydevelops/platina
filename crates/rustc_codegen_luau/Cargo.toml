@@ -2,8 +2,9 @@
 name = "rustc_codegen_luau"
 version = "0.1.0"
 edition = "2024"
+license = "MIT OR Apache-2.0"
 description = "rustc codegen backend targeting Luau"
-repository = "https://github.com/johnnydevelops/rustc-codegen-luau"
+repository = "https://github.com/johnnydevelops/patina"
 
 [lib]
 crate-type = ["dylib"]
