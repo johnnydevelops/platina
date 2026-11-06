@@ -9,13 +9,16 @@ use crate::rt::{luau_fn, Handle};
 use crate::value::{FromValue, Value};
 
 luau_fn! {
-    fn sig_connect(sig: u32, slot: u32, id: u32) -> u32 = "function(sig, slot, id)
-        local f = FN[slot]
+    fn sig_connect(sig: u32, slot: u32, abort: u32, id: u32) -> u32 = "function(sig, slot, abort, id)
+        local f, a = FN[slot], FN[abort]
         return rt_href(rt_hget(sig):Connect(function(...)
             local sp = SP
             local ok, err = pcall(f, id, rt_href(table.pack(...)))
             SP = sp
-            if not ok then error(err, 0) end
+            if not ok then
+                a(id)
+                error(err, 0)
+            end
         end))
     end";
     fn sig_wait(sig: u32) -> u32 = "function(sig) local s = rt_hget(sig) return rt_href(table.pack(rt_yield(s.Wait, s))) end";
@@ -25,27 +28,29 @@ luau_fn! {
 
 type Callback = Box<dyn FnMut(Value)>;
 
-enum Slot {
-    Free,
-    /// taken out by `dispatch` while it runs; `removed` if unregistered meanwhile
-    Busy { removed: bool },
-    Cb { f: Callback, once: bool },
+struct Slot {
+    /// the closure, boxed so its address is stable while the slab grows
+    f: *mut dyn FnMut(Value),
+    once: bool,
+    running: bool,
+    /// unregistered while running: free it when the call ends
+    removed: bool,
 }
 
 /// Rust closures called from Luau, by id.
-struct Callbacks(UnsafeCell<Vec<Slot>>);
+struct Callbacks(UnsafeCell<Vec<Option<Slot>>>);
 unsafe impl Sync for Callbacks {}
 static CALLBACKS: Callbacks = Callbacks(UnsafeCell::new(Vec::new()));
 
-fn slots() -> &'static mut Vec<Slot> {
+fn slots() -> &'static mut Vec<Option<Slot>> {
     unsafe { &mut *CALLBACKS.0.get() }
 }
 
 /// Register a closure; `once` closures are released after their first call.
 pub(crate) fn register(f: Callback, once: bool) -> u32 {
     let v = slots();
-    let slot = Slot::Cb { f, once };
-    if let Some(i) = v.iter().position(|s| matches!(s, Slot::Free)) {
+    let slot = Some(Slot { f: Box::into_raw(f), once, running: false, removed: false });
+    if let Some(i) = v.iter().position(|s| s.is_none()) {
         v[i] = slot;
         i as u32 + 1
     } else {
@@ -54,31 +59,55 @@ pub(crate) fn register(f: Callback, once: bool) -> u32 {
     }
 }
 
+fn free(i: usize) {
+    if let Some(s) = slots()[i].take() {
+        drop(unsafe { Box::from_raw(s.f) });
+    }
+}
+
 pub(crate) fn unregister(id: u32) {
-    if let Some(s) = slots().get_mut(id as usize - 1) {
-        match s {
-            Slot::Busy { removed } => *removed = true,
-            _ => *s = Slot::Free,
+    let i = id as usize - 1;
+    match slots().get_mut(i) {
+        Some(Some(s)) if s.running => s.removed = true,
+        Some(Some(_)) => free(i),
+        _ => {}
+    }
+}
+
+/// End of a call (normal or aborted by a Luau error).
+fn finish(i: usize) {
+    if let Some(Some(s)) = slots().get_mut(i) {
+        s.running = false;
+        if s.once || s.removed {
+            free(i);
         }
     }
 }
 
-/// Called from Luau with a callback id and a handle to the packed arguments. The closure is
-/// taken out while it runs, so handlers may fire re-entrantly or disconnect themselves.
+/// Called from Luau with a callback id and a handle to the packed arguments. A handler that is
+/// already running (its event fired re-entrantly) is skipped.
 pub(crate) extern "C" fn dispatch(id: u32, args: u32) {
     let args = unsafe { Value::from_raw(args) };
     let i = id as usize - 1;
-    let Some(s) = slots().get_mut(i) else { return };
-    if !matches!(s, Slot::Cb { .. }) {
-        return; // unregistered, or already running (a handler can't re-enter itself)
-    }
-    let Slot::Cb { mut f, once } = core::mem::replace(s, Slot::Busy { removed: false }) else { unreachable!() };
-    f(args);
-    let s = &mut slots()[i];
-    *s = match s {
-        Slot::Busy { removed: false } if !once => Slot::Cb { f, once },
-        _ => Slot::Free,
+    let f = match slots().get_mut(i) {
+        Some(Some(s)) if !s.running => {
+            s.running = true;
+            s.f
+        }
+        _ => return,
     };
+    unsafe { (*f)(args) };
+    finish(i);
+}
+
+/// Called from Luau when a handler raised an error: the Rust frames were abandoned, so mark the
+/// handler idle again (it keeps receiving events).
+pub(crate) extern "C" fn dispatch_abort(id: u32) {
+    finish(id as usize - 1);
+}
+
+pub(crate) fn abort_slot() -> u32 {
+    dispatch_abort as extern "C" fn(u32) as usize as u32
 }
 
 /// The function-table slot of `dispatch`, for glue code (`FN[slot](id, args)`).
@@ -163,11 +192,16 @@ impl<A: SignalArgs + 'static> Signal<A> {
     pub fn from_handle(h: Handle) -> Self {
         Signal { h, _a: PhantomData }
     }
+    /// A signal obtained dynamically (any value with `:Connect` / `:Wait`), e.g.
+    /// `Signal::<(f64,)>::from_value(obj.get("Changed"))`. `None` for nil.
+    pub fn from_value(v: Value) -> Option<Self> {
+        v.into_handle().map(Signal::from_handle)
+    }
     /// Run `f` every time the event fires. The handler stays connected until
     /// `Connection::disconnect` (dropping the `Connection` does not disconnect).
     pub fn connect<F: Handler<A>>(&self, mut f: F) -> Connection {
         let id = register(Box::new(move |args: Value| f.call(A::from_pack(&args))), false);
-        let c = unsafe { sig_connect(self.h.id(), dispatch_slot(), id) };
+        let c = unsafe { sig_connect(self.h.id(), dispatch_slot(), abort_slot(), id) };
         Connection { h: unsafe { Handle::from_raw(c) }, id }
     }
     /// Yield until the event fires, returning its arguments.

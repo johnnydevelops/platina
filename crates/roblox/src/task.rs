@@ -4,18 +4,21 @@
 use alloc::boxed::Box;
 
 use crate::rt::luau_fn;
-use crate::signal::{dispatch_slot, register};
+use crate::signal::{abort_slot, dispatch_slot, register};
 use crate::value::Value;
 
 luau_fn! {
     fn t_wait(s: f64) -> f64 = "function(s) return rt_yield(task.wait, s) end";
-    fn t_run(how: u32, s: f64, slot: u32, id: u32) = "function(how, s, slot, id)
-        local f = FN[slot]
+    fn t_run(how: u32, s: f64, slot: u32, abort: u32, id: u32) = "function(how, s, slot, abort, id)
+        local f, a = FN[slot], FN[abort]
         local function run()
             local sp = SP
             local ok, err = pcall(f, id, 0)
             SP = sp
-            if not ok then error(err, 0) end
+            if not ok then
+                a(id)
+                error(err, 0)
+            end
         end
         if how == 0 then task.spawn(run) elseif how == 1 then task.delay(s, run) else task.defer(run) end
     end";
@@ -37,7 +40,7 @@ fn run(how: u32, seconds: f64, f: impl FnOnce() + 'static) {
         }),
         true,
     );
-    unsafe { t_run(how, seconds, dispatch_slot(), id) }
+    unsafe { t_run(how, seconds, dispatch_slot(), abort_slot(), id) }
 }
 
 /// Run `f` now in a new thread, until it first yields.

@@ -762,3 +762,4 @@ pub extern "C" fn chat_reset() {
 const fn kv_dim_of(head: usize, n_kv: usize) -> usize {
     head * n_kv
 }
+

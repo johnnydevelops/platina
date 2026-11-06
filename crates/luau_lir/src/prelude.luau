@@ -413,7 +413,7 @@ local function rt_hget(id: number): any
 	return rt_H[id]
 end
 local function rt_hdrop(id: number)
-	if id ~= 0 then
+	if id ~= 0 and rt_H[id] ~= nil then
 		rt_H[id] = nil
 		table.insert(rt_Hfree, id)
 	end
@@ -442,16 +442,36 @@ local function rt_str_out(s: string): (number, number)
 	buffer.writestring(MEM, p, s)
 	return p, n
 end
--- call a function that may yield (task.wait, :Wait(), ...) from Rust: while this coroutine is
--- suspended, Rust code entered from elsewhere runs on a separate shadow-stack segment
+-- call a function that may yield (task.wait, :Wait(), ...) from Rust. While this coroutine is
+-- suspended, Rust code entered from elsewhere runs on a pooled shadow-stack segment that holds
+-- no suspended frames, so it cannot overwrite them.
+local rt_segs: { number } = {}
+local rt_susp: { [any]: number } = {}
+local function rt_seg_busy(s: number, own: number): boolean
+	if own > s and own <= s + 65536 then return true end
+	for _, q in rt_susp do
+		if q > s and q <= s + 65536 then return true end
+	end
+	return false
+end
 local function rt_yield(f: (...any) -> ...any, ...: any): ...any
 	local sp = SP
-	local seg = rt_alloc(65536, 16)
+	local seg = nil
+	for _, s in rt_segs do
+		if not rt_seg_busy(s, sp) then
+			seg = s
+			break
+		end
+	end
+	if not seg then
+		seg = rt_alloc(65536, 16)
+		table.insert(rt_segs, seg)
+	end
+	local key = {}
+	rt_susp[key] = sp
 	SP = seg + 65536
 	local r = table.pack(f(...))
-	if SP == seg + 65536 then
-		rt_dealloc(seg, 65536, 16)
-	end
+	rt_susp[key] = nil
 	SP = sp
 	return table.unpack(r, 1, r.n)
 end

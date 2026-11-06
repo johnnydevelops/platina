@@ -35,7 +35,9 @@ luau_fn! {
     fn v_call_method(h: u32, p: *const u8, n: usize, args: u32) -> u32 = "function(h, p, n, a) local o = rt_hget(h) local t = rt_hget(a) return rt_href(table.pack(o[rt_str(p, n)](o, table.unpack(t, 1, t.n)))) end";
     fn v_call_method_yield(h: u32, p: *const u8, n: usize, args: u32) -> u32 = "function(h, p, n, a) local o = rt_hget(h) local t = rt_hget(a) return rt_href(table.pack(rt_yield(o[rt_str(p, n)], o, table.unpack(t, 1, t.n)))) end";
     fn v_pack(n: u32) -> u32 = "function(n) return rt_href({n = n}) end";
-    fn v_global(p: *const u8, n: usize) -> u32 = "function(p, n) local name = rt_str(p, n) local v = _G[name] if v == nil then v = getfenv()[name] end return rt_href(v) end";
+    // Known globals are captured by name: `getfenv` would mark the module's environment unsafe and
+    // disable Luau's builtin optimizations (fastcalls, imports) for every function in it.
+    fn v_global(p: *const u8, n: usize) -> u32 = "(function() local G = {game = game, workspace = workspace, script = script, plugin = plugin, shared = shared, Enum = Enum, Instance = Instance, Vector3 = Vector3, Vector2 = Vector2, Vector3int16 = Vector3int16, Vector2int16 = Vector2int16, CFrame = CFrame, Color3 = Color3, BrickColor = BrickColor, UDim = UDim, UDim2 = UDim2, Rect = Rect, NumberRange = NumberRange, NumberSequence = NumberSequence, NumberSequenceKeypoint = NumberSequenceKeypoint, ColorSequence = ColorSequence, ColorSequenceKeypoint = ColorSequenceKeypoint, Ray = Ray, Region3 = Region3, Region3int16 = Region3int16, RaycastParams = RaycastParams, OverlapParams = OverlapParams, PhysicalProperties = PhysicalProperties, TweenInfo = TweenInfo, DateTime = DateTime, Random = Random, Font = Font, Content = Content, Faces = Faces, Axes = Axes, PathWaypoint = PathWaypoint, Path2DControlPoint = Path2DControlPoint, SharedTable = SharedTable, CatalogSearchParams = CatalogSearchParams, FloatCurveKey = FloatCurveKey, RotationCurveKey = RotationCurveKey, SecurityCapabilities = SecurityCapabilities, buffer = buffer, math = math, string = string, table = table, task = task, os = os, bit32 = bit32, utf8 = utf8, coroutine = coroutine, debug = debug, vector = vector, print = print, warn = warn, error = error, require = require, typeof = typeof, type = type, tostring = tostring, tonumber = tonumber, pairs = pairs, ipairs = ipairs, select = select, next = next, pcall = pcall, xpcall = xpcall, tick = tick, time = time, elapsedTime = elapsedTime, delay = delay, spawn = spawn, wait = wait, unpack = unpack, rawget = rawget, rawset = rawset, rawequal = rawequal, rawlen = rawlen, setmetatable = setmetatable, getmetatable = getmetatable, newproxy = newproxy, gcinfo = gcinfo, collectgarbage = collectgarbage, assert = assert} return function(p, n) local name = rt_str(p, n) local v = G[name] if v == nil then v = _G[name] end return rt_href(v) end end)()";
     fn v_require(h: u32) -> u32 = "function(h) return rt_href(require(rt_hget(h))) end";
     fn v_buffer_from(p: *const u8, n: usize) -> u32 = "function(p, n) local b = buffer.create(n) buffer.copy(b, 0, MEM, p, n) return rt_href(b) end";
     fn v_copy_to(h: u32, at: u32, p: *const u8, n: usize) = "function(h, at, p, n) buffer.copy(rt_hget(h), at, MEM, p, n) end";
@@ -57,6 +59,9 @@ impl Value {
     #[doc(hidden)]
     pub fn raw(&self) -> u32 {
         self.0.as_ref().map_or(0, |h| h.id())
+    }
+    pub(crate) fn into_handle(self) -> Option<Handle> {
+        self.0
     }
     pub fn is_nil(&self) -> bool {
         self.0.is_none()

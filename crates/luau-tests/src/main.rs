@@ -325,12 +325,13 @@ fn main() {
         let got = sh(Command::new(root.join("target/debug/cargo-roblox")).args(["build", "--release", "-o"]).arg(&module).current_dir(&dir))
             .and_then(|_| {
                 let mut all = String::new();
-                for export in ["run", "tasks"] {
+                let runs: [&[&str]; 5] = [&["run"], &["tasks"], &["signals"], &["touch"], &["stress_setup", "stress", "stress_report"]];
+                for args in runs {
                     let out = Command::new("timeout")
                         .args(["120", "lune", "run"])
                         .arg(dir.join("runner.luau"))
                         .arg(&module)
-                        .arg(export)
+                        .args(args)
                         .current_dir(&root)
                         .output()
                         .map_err(|e| e.to_string())?;

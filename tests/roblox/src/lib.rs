@@ -91,3 +91,110 @@ pub extern "C" fn tasks() {
         println!("{line}");
     }
 }
+
+/// Signals with Rust closures, against a Luau signal object (`TestSignal` in the runner).
+#[unsafe(no_mangle)]
+pub extern "C" fn signals() {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+    let sig_v = Value::global("TestSignal");
+    let sig: Signal<(f64, String, Option<Part>)> = Signal::from_value(sig_v.clone()).expect("TestSignal");
+    let log = Rc::new(RefCell::new(Vec::<String>::new()));
+    let l = log.clone();
+    let conn = sig.connect(move |n: f64, s: String, p: Option<Part>| {
+        l.borrow_mut().push(format!("got {n} {s} {:?}", p.map(|p| p.name())));
+    });
+    let part = Part::new();
+    part.set_name("Hit");
+    sig_v.call_method("Fire", &[1.5.into_value(), "a".into_value(), part.into_value()]);
+    sig_v.call_method("Fire", &[2.0.into_value(), "b".into_value(), Value::NIL]);
+    println!("connected: {}", conn.is_connected());
+    conn.disconnect();
+    sig_v.call_method("Fire", &[3.0.into_value(), "c".into_value(), Value::NIL]);
+    for line in log.borrow().iter() {
+        println!("{line}");
+    }
+}
+
+/// The showcase's touch-pad handler, fired repeatedly by a character's part.
+#[unsafe(no_mangle)]
+pub extern "C" fn touch() {
+    use std::cell::Cell;
+    use std::rc::Rc;
+    let pad = Part::new();
+    pad.set_name("Pad");
+    let character = Model::new();
+    Humanoid::new().set_parent(Some(&character));
+    let leg = Part::new();
+    leg.set_name("LeftLeg");
+    leg.set_parent(Some(&character));
+    let sig_v = Value::global("TestSignal");
+    let touched: Signal<(Option<BasePart>,)> = Signal::from_value(sig_v.clone()).unwrap();
+    let n = Rc::new(Cell::new(0u32));
+    let (p, c) = (pad.clone(), n.clone());
+    touched.connect(move |other: Option<BasePart>| {
+        let Some(other) = other else { return };
+        if other.parent().and_then(|m| m.find_first_child_which_is_a("Humanoid", false)).is_none() {
+            return;
+        }
+        c.set(c.get() + 1);
+        p.set_color(Color3::from_hsv((c.get() as f64 * 0.137) % 1.0, 0.9, 1.0));
+    });
+    for _ in 0..3 {
+        sig_v.call_method("Fire", &[leg.into_value()]);
+    }
+    println!("touches {} color {:?}", n.get(), pad.color());
+}
+
+thread_local! {
+    static STOP: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static STRESS: std::cell::RefCell<(u32, u32, u32, Vec<String>)> = Default::default();
+}
+
+/// Events firing between the yields of running Rust tasks (see the runner's `stress` mode).
+#[unsafe(no_mangle)]
+pub extern "C" fn stress_setup() {
+    let sig_v = Value::global("TestSignal");
+    let sig: Signal<(f64, Option<BasePart>)> = Signal::from_value(sig_v).unwrap();
+    let pad = Part::new();
+    sig.connect(move |i: f64, other: Option<BasePart>| {
+        let mut buf = [0u8; 256]; // stack data in the handler's frame
+        buf[(i as usize) % 256] = 1;
+        pad.set_color(Color3::from_hsv((i * 0.137) % 1.0, 0.9, 1.0));
+        let ok = other.is_some() && buf.iter().map(|&b| b as u32).sum::<u32>() == 1;
+        STRESS.with(|s| {
+            let mut s = s.borrow_mut();
+            s.0 += 1;
+            if !ok {
+                s.3.push(format!("bad event {i}"));
+            }
+        });
+    });
+    for k in 0..2u32 {
+        task::spawn(move || {
+            let mut frame = [k; 128];
+            while !STOP.with(|s| s.get()) {
+                let before: u32 = frame.iter().sum();
+                task::wait(0.0);
+                frame[0] = frame[0].wrapping_add(0);
+                let after: u32 = frame.iter().sum();
+                STRESS.with(|s| {
+                    let mut s = s.borrow_mut();
+                    if k == 0 { s.1 += 1 } else { s.2 += 1 }
+                    if before != after {
+                        s.3.push(format!("task {k} frame corrupted"));
+                    }
+                });
+            }
+        });
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn stress_report() {
+    STOP.with(|s| s.set(true));
+    STRESS.with(|s| {
+        let s = s.borrow();
+        println!("events {} task0 resumes>50 {} task1 resumes>50 {} errors {:?}", s.0, s.1 > 50, s.2 > 50, s.3);
+    });
+}
