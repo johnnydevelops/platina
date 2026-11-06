@@ -5,29 +5,12 @@
 local MEM: buffer = buffer.create(1125264)
 local SP: number = 1048592
 local HEAP_BASE: number = 1059728
-local SCR: buffer = buffer.create(8)
-local function f32(x: number): number
-	buffer.writef32(SCR, 0, x)
-	return buffer.readf32(SCR, 0)
-end
 local function imul32(a: number, b: number): number
 	a = a % 0x100000000
 	b = b % 0x100000000
 	local al = a % 65536
 	local bl = b % 65536
 	return (al * bl + ((((a - al) / 65536) * bl + al * ((b - bl) / 65536)) % 65536) * 65536) % 0x100000000
-end
-local function trunc(x: number): number
-	if x >= 0 then return math.floor(x) else return math.ceil(x) end
-end
-local function idivt(a: number, b: number): number
-	local q = a / b
-	if q >= 0 then return math.floor(q) else return math.ceil(q) end
-end
-local function ftoi(x: number, lo: number, hi: number): number
-	if x ~= x then return 0 end
-	if x >= 0 then x = math.floor(x) else x = math.ceil(x) end
-	if x < lo then return lo elseif x > hi then return hi else return x end
 end
 local function popcnt(x: number): number
 	x = x - bit32.band(bit32.rshift(x, 1), 0x55555555)
@@ -41,36 +24,6 @@ end
 local function trap(msg: string, file: string, line: number, col: number)
 	error(string.format("%s at %s:%d:%d", msg, file, line, col), 0)
 end
-local function unreachable()
-	error("entered unreachable code", 0)
-end
-local function bitrev32(x: number): number
-	local r = 0
-	for _ = 1, 32 do
-		r = r * 2 + bit32.band(x, 1)
-		x = bit32.rshift(x, 1)
-	end
-	return r
-end
-local function roundaway(x: number): number
-	-- round half away from zero, exact for all doubles
-	local t = trunc(x)
-	if math.abs(x - t) >= 0.5 then
-		if x > 0 then return t + 1 else return t - 1 end
-	end
-	return t
-end
-local function fmin(a: number, b: number): number
-	if a ~= a then return b elseif b ~= b then return a elseif a < b then return a else return b end
-end
-local function fmax(a: number, b: number): number
-	if a ~= a then return b elseif b ~= b then return a elseif a > b then return a else return b end
-end
-local function copysign(a: number, b: number): number
-	local neg = b < 0 or (b == 0 and 1 / b < 0)
-	a = math.abs(a)
-	if neg then return -a else return a end
-end
 local function memcmp(a: number, b: number, n: number): number
 	for i = 0, n - 1 do
 		local x = buffer.readu8(MEM, a + i)
@@ -82,7 +35,6 @@ local function memcmp(a: number, b: number, n: number): number
 	return 0
 end
 
--- 64-bit integers as (lo, hi) pairs of u32
 local function add64(al: number, ah: number, bl: number, bh: number): (number, number)
 	local lo = al + bl
 	local c = 0
@@ -95,10 +47,6 @@ local function sub64(al: number, ah: number, bl: number, bh: number): (number, n
 	if lo < 0 then lo += 0x100000000; b = 1 end
 	return lo, (ah - bh - b) % 0x100000000
 end
-local function neg64(lo: number, hi: number): (number, number)
-	return sub64(0, 0, lo, hi)
-end
--- full 64-bit product of two u32 values
 local function mulu32(a: number, b: number): (number, number)
 	local a0 = a % 65536
 	local a1 = (a - a0) / 65536
@@ -127,20 +75,12 @@ local function shr64(lo: number, hi: number, n: number): (number, number)
 	if n >= 32 then return bit32.rshift(hi, n - 32), 0 end
 	return bit32.bor(bit32.rshift(lo, n), bit32.lshift(hi, 32 - n)), bit32.rshift(hi, n)
 end
-local function sar64(lo: number, hi: number, n: number): (number, number)
-	if n == 0 then return lo, hi end
-	if n >= 32 then return bit32.arshift(hi, n - 32), bit32.arshift(hi, 31) end
-	return bit32.bor(bit32.rshift(lo, n), bit32.lshift(hi, 32 - n)), bit32.arshift(hi, n)
-end
 local function rotl64(lo: number, hi: number, n: number): (number, number)
 	n = n % 64
 	local al, ah = shl64(lo, hi, n)
 	local bl, bh = shr64(lo, hi, (64 - n) % 64)
 	if n == 0 then return lo, hi end
 	return bit32.bor(al, bl), bit32.bor(ah, bh)
-end
-local function rotr64(lo: number, hi: number, n: number): (number, number)
-	return rotl64(lo, hi, (64 - n % 64) % 64)
 end
 local function lt64u(al: number, ah: number, bl: number, bh: number): boolean
 	return ah < bh or (ah == bh and al < bl)
@@ -182,23 +122,6 @@ local function urem64(al: number, ah: number, bl: number, bh: number): (number, 
 	local _, _, rl, rh = udivmod64(al, ah, bl, bh)
 	return rl, rh
 end
-local function idiv64(al: number, ah: number, bl: number, bh: number): (number, number)
-	local na = ah >= 0x80000000
-	local nb = bh >= 0x80000000
-	if na then al, ah = neg64(al, ah) end
-	if nb then bl, bh = neg64(bl, bh) end
-	local ql, qh = udivmod64(al, ah, bl, bh)
-	if na ~= nb then return neg64(ql, qh) end
-	return ql, qh
-end
-local function irem64(al: number, ah: number, bl: number, bh: number): (number, number)
-	local na = ah >= 0x80000000
-	if na then al, ah = neg64(al, ah) end
-	if bh >= 0x80000000 then bl, bh = neg64(bl, bh) end
-	local _, _, rl, rh = udivmod64(al, ah, bl, bh)
-	if na then return neg64(rl, rh) end
-	return rl, rh
-end
 local function addo64(al: number, ah: number, bl: number, bh: number, signed: boolean): (number, number, number)
 	local lo, hi = add64(al, ah, bl, bh)
 	local o
@@ -210,71 +133,8 @@ local function addo64(al: number, ah: number, bl: number, bh: number, signed: bo
 	end
 	return lo, hi, if o then 1 else 0
 end
-local function subo64(al: number, ah: number, bl: number, bh: number, signed: boolean): (number, number, number)
-	local lo, hi = sub64(al, ah, bl, bh)
-	local o
-	if signed then
-		local sa, sb, sr = ah >= 0x80000000, bh >= 0x80000000, hi >= 0x80000000
-		o = sa ~= sb and sr ~= sa
-	else
-		o = lt64u(al, ah, bl, bh)
-	end
-	return lo, hi, if o then 1 else 0
-end
-local function umulhi_ov(al: number, ah: number, bl: number, bh: number): boolean
-	if ah ~= 0 and bh ~= 0 then return true end
-	local _, h = mulu32(al, bl)
-	local t = h + al * bh + ah * bl
-	return t >= 0x100000000
-end
-local function mulo64(al: number, ah: number, bl: number, bh: number, signed: boolean): (number, number, number)
-	local lo, hi = mul64(al, ah, bl, bh)
-	local o
-	if signed then
-		local na, nb = ah >= 0x80000000, bh >= 0x80000000
-		local xl, xh, yl, yh = al, ah, bl, bh
-		if na then xl, xh = neg64(xl, xh) end
-		if nb then yl, yh = neg64(yl, yh) end
-		o = umulhi_ov(xl, xh, yl, yh)
-		if not o then
-			local _, mh = mul64(xl, xh, yl, yh)
-			if na ~= nb then
-				local ml, _ = mul64(xl, xh, yl, yh)
-				o = mh > 0x80000000 or (mh == 0x80000000 and ml ~= 0)
-			else
-				o = mh >= 0x80000000
-			end
-		end
-	else
-		o = umulhi_ov(al, ah, bl, bh)
-	end
-	return lo, hi, if o then 1 else 0
-end
 local function u64tof(lo: number, hi: number): number
 	return hi * 0x100000000 + lo
-end
-local function i64tof(lo: number, hi: number): number
-	if hi >= 0x80000000 then hi -= 0x100000000 end
-	return hi * 0x100000000 + lo
-end
-local function ftoi64(x: number): (number, number)
-	if x ~= x then return 0, 0 end
-	x = trunc(x)
-	if x >= 9223372036854775807 then return 0xFFFFFFFF, 0x7FFFFFFF end
-	if x <= -9223372036854775808 then return 0, 0x80000000 end
-	local hi = math.floor(x / 0x100000000)
-	local lo = x - hi * 0x100000000
-	return lo, hi % 0x100000000
-end
-local function ftou64(x: number): (number, number)
-	if x ~= x or x <= 0 then return 0, 0 end
-	x = trunc(x)
-	if x >= 18446744073709551615 then return 0xFFFFFFFF, 0xFFFFFFFF end
-	local hi = math.floor(x / 0x100000000)
-	return x - hi * 0x100000000, hi
-end
-local function popcnt64(lo: number, hi: number): number
-	return popcnt(lo) + popcnt(hi)
 end
 local function clz64(lo: number, hi: number): number
 	if hi ~= 0 then return bit32.countlz(hi) end
@@ -285,9 +145,7 @@ local function ctz64(lo: number, hi: number): number
 	return 32 + bit32.countrz(hi)
 end
 
--- runtime imports (extern "C" fn __luau_NAME) and the std platform layer
 
--- heap: power-of-two size classes with free lists, bump allocation, growable buffer
 local HEAP_TOP: number = HEAP_BASE
 local FREE: { number } = table.create(20, 0)
 local function heap_grow(need: number)
@@ -347,7 +205,6 @@ local function rt_realloc(p: number, size: number, align: number, newsize: numbe
 	return q
 end
 
--- stdio: line buffered; stdout -> print, stderr -> warn (recent stderr kept for abort)
 local LINEBUF: { string } = { "", "" }
 local RECENT_ERR: { string } = {}
 local warn_ = (warn :: any) or function(...) print(...) end
@@ -378,7 +235,6 @@ local function rt_abort()
 	error(if msg == "" then "aborted" else msg, 0)
 end
 
--- std panic hook: message (ptr,len; ptr 0 = non-string payload) and &Location field offsets
 local function rt_panic_msg(mp: number, ml: number, loc: number, fo: number, lo: number, co: number)
 	local msg = if mp ~= 0 then buffer.readstring(MEM, mp, ml) else "Box<dyn Any>"
 	local where_ = ""
@@ -389,269 +245,6 @@ local function rt_panic_msg(mp: number, ml: number, loc: number, fo: number, lo:
 	end
 	table.insert(RECENT_ERR, "panicked" .. where_ .. ":\n" .. msg)
 end
-local function rt_print(p: number, n: number)
-	print(buffer.readstring(MEM, p, n))
-end
-local function rt_trap(p: number, n: number)
-	error(buffer.readstring(MEM, p, n), 0)
-end
-local function rt_mem_size(): number
-	return buffer.len(MEM)
-end
-local function rt_mem_grow(n: number): number
-	local old = buffer.len(MEM)
-	heap_grow(old + n)
-	return old
-end
-local function rt_clock(): number
-	return os.clock()
-end
-local function rt_heap_base(): number
-	return HEAP_BASE
-end
--- time as (secs lo, secs hi, nanos)
-local function rt_instant(): (number, number, number)
-	local t = os.clock()
-	local secs = math.floor(t)
-	return secs, 0, math.floor((t - secs) * 1e9)
-end
-local function rt_systime(): (number, number, number)
-	local dt = (DateTime :: any)
-	local ms = if dt then dt.now().UnixTimestampMillis else os.time() * 1000
-	local secs = ms // 1000
-	return secs % 0x100000000, secs // 0x100000000, (ms % 1000) * 1000000
-end
-
--- 128-bit integers as four u32 limbs (least significant first)
-local function add128(a0: number, a1: number, a2: number, a3: number, b0: number, b1: number, b2: number, b3: number): (number, number, number, number)
-	local r0 = a0 + b0
-	local c = if r0 >= 0x100000000 then 1 else 0
-	r0 -= c * 0x100000000
-	local r1 = a1 + b1 + c
-	c = if r1 >= 0x100000000 then 1 else 0
-	r1 -= c * 0x100000000
-	local r2 = a2 + b2 + c
-	c = if r2 >= 0x100000000 then 1 else 0
-	r2 -= c * 0x100000000
-	return r0, r1, r2, (a3 + b3 + c) % 0x100000000
-end
-local function sub128(a0: number, a1: number, a2: number, a3: number, b0: number, b1: number, b2: number, b3: number): (number, number, number, number)
-	local r0 = a0 - b0
-	local c = if r0 < 0 then 1 else 0
-	r0 += c * 0x100000000
-	local r1 = a1 - b1 - c
-	c = if r1 < 0 then 1 else 0
-	r1 += c * 0x100000000
-	local r2 = a2 - b2 - c
-	c = if r2 < 0 then 1 else 0
-	r2 += c * 0x100000000
-	return r0, r1, r2, (a3 - b3 - c) % 0x100000000
-end
-local function neg128(a0: number, a1: number, a2: number, a3: number): (number, number, number, number)
-	return sub128(0, 0, 0, 0, a0, a1, a2, a3)
-end
--- full product limbs (n result limbs)
-local function mulwide(a: { number }, b: { number }, n: number): { number }
-	local r = table.create(n, 0)
-	for i = 1, 4 do
-		if a[i] ~= 0 then
-			for j = 1, 4 do
-				local k = i + j - 1
-				if k > n then break end
-				local lo, hi = mulu32(a[i], b[j])
-				local add = lo
-				local kk = k
-				while add ~= 0 and kk <= n do
-					local t = r[kk] + add
-					r[kk] = t % 0x100000000
-					add = (t - r[kk]) / 0x100000000
-					kk += 1
-				end
-				add = hi
-				kk = k + 1
-				while add ~= 0 and kk <= n do
-					local t = r[kk] + add
-					r[kk] = t % 0x100000000
-					add = (t - r[kk]) / 0x100000000
-					kk += 1
-				end
-			end
-		end
-	end
-	return r
-end
-local function mul128(a0: number, a1: number, a2: number, a3: number, b0: number, b1: number, b2: number, b3: number): (number, number, number, number)
-	if a1 == 0 and a2 == 0 and a3 == 0 and b1 == 0 and b2 == 0 and b3 == 0 then
-		local lo, hi = mulu32(a0, b0)
-		return lo, hi, 0, 0
-	end
-	local r = mulwide({ a0, a1, a2, a3 }, { b0, b1, b2, b3 }, 4)
-	return r[1], r[2], r[3], r[4]
-end
-local function cmpu128(a0: number, a1: number, a2: number, a3: number, b0: number, b1: number, b2: number, b3: number): number
-	if a3 ~= b3 then return if a3 < b3 then -1 else 1 end
-	if a2 ~= b2 then return if a2 < b2 then -1 else 1 end
-	if a1 ~= b1 then return if a1 < b1 then -1 else 1 end
-	if a0 ~= b0 then return if a0 < b0 then -1 else 1 end
-	return 0
-end
-local function cmp128(a0: number, a1: number, a2: number, a3: number, b0: number, b1: number, b2: number, b3: number, signed: boolean): number
-	if signed then
-		local na, nb = a3 >= 0x80000000, b3 >= 0x80000000
-		if na ~= nb then return if na then -1 else 1 end
-	end
-	return cmpu128(a0, a1, a2, a3, b0, b1, b2, b3)
-end
-local function shl128(a0: number, a1: number, a2: number, a3: number, n: number): (number, number, number, number)
-	local a = { a0, a1, a2, a3 }
-	local w = n // 32
-	local s = n % 32
-	local r = { 0, 0, 0, 0 }
-	for i = 4, 1, -1 do
-		local src = i - w
-		if src >= 1 then
-			local v = bit32.lshift(a[src], s)
-			if s > 0 and src - 1 >= 1 then v = bit32.bor(v, bit32.rshift(a[src - 1], 32 - s)) end
-			r[i] = v
-		end
-	end
-	return r[1], r[2], r[3], r[4]
-end
-local function shr128x(a0: number, a1: number, a2: number, a3: number, n: number, fill: number): (number, number, number, number)
-	local a = { a0, a1, a2, a3 }
-	local w = n // 32
-	local s = n % 32
-	local r = { fill, fill, fill, fill }
-	for i = 1, 4 do
-		local src = i + w
-		if src <= 4 then
-			local hiword = if src + 1 <= 4 then a[src + 1] else fill
-			local v = bit32.rshift(a[src], s)
-			if s > 0 then v = bit32.bor(v, bit32.lshift(hiword, 32 - s)) end
-			r[i] = v
-		end
-	end
-	return r[1], r[2], r[3], r[4]
-end
-local function shr128(a0: number, a1: number, a2: number, a3: number, n: number): (number, number, number, number)
-	return shr128x(a0, a1, a2, a3, n, 0)
-end
-local function sar128(a0: number, a1: number, a2: number, a3: number, n: number): (number, number, number, number)
-	return shr128x(a0, a1, a2, a3, n, if a3 >= 0x80000000 then 0xFFFFFFFF else 0)
-end
-local function udivmod128(a0: number, a1: number, a2: number, a3: number, b0: number, b1: number, b2: number, b3: number): (number, number, number, number, number, number, number, number)
-	if a2 == 0 and a3 == 0 and b2 == 0 and b3 == 0 then
-		local ql, qh, rl, rh = udivmod64(a0, a1, b0, b1)
-		return ql, qh, 0, 0, rl, rh, 0, 0
-	end
-	local q = { 0, 0, 0, 0 }
-	local r0, r1, r2, r3 = 0, 0, 0, 0
-	local a = { a0, a1, a2, a3 }
-	for i = 127, 0, -1 do
-		r0, r1, r2, r3 = shl128(r0, r1, r2, r3, 1)
-		r0 = bit32.bor(r0, bit32.extract(a[i // 32 + 1], i % 32))
-		if cmpu128(r0, r1, r2, r3, b0, b1, b2, b3) >= 0 then
-			r0, r1, r2, r3 = sub128(r0, r1, r2, r3, b0, b1, b2, b3)
-			q[i // 32 + 1] = bit32.replace(q[i // 32 + 1], 1, i % 32)
-		end
-	end
-	return q[1], q[2], q[3], q[4], r0, r1, r2, r3
-end
-local function udiv128(a0: number, a1: number, a2: number, a3: number, b0: number, b1: number, b2: number, b3: number): (number, number, number, number)
-	local q0, q1, q2, q3 = udivmod128(a0, a1, a2, a3, b0, b1, b2, b3)
-	return q0, q1, q2, q3
-end
-local function urem128(a0: number, a1: number, a2: number, a3: number, b0: number, b1: number, b2: number, b3: number): (number, number, number, number)
-	local _, _, _, _, r0, r1, r2, r3 = udivmod128(a0, a1, a2, a3, b0, b1, b2, b3)
-	return r0, r1, r2, r3
-end
-local function idiv128(a0: number, a1: number, a2: number, a3: number, b0: number, b1: number, b2: number, b3: number): (number, number, number, number)
-	local na, nb = a3 >= 0x80000000, b3 >= 0x80000000
-	if na then a0, a1, a2, a3 = neg128(a0, a1, a2, a3) end
-	if nb then b0, b1, b2, b3 = neg128(b0, b1, b2, b3) end
-	local q0, q1, q2, q3 = udivmod128(a0, a1, a2, a3, b0, b1, b2, b3)
-	if na ~= nb then return neg128(q0, q1, q2, q3) end
-	return q0, q1, q2, q3
-end
-local function irem128(a0: number, a1: number, a2: number, a3: number, b0: number, b1: number, b2: number, b3: number): (number, number, number, number)
-	local na = a3 >= 0x80000000
-	if na then a0, a1, a2, a3 = neg128(a0, a1, a2, a3) end
-	if b3 >= 0x80000000 then b0, b1, b2, b3 = neg128(b0, b1, b2, b3) end
-	local _, _, _, _, r0, r1, r2, r3 = udivmod128(a0, a1, a2, a3, b0, b1, b2, b3)
-	if na then return neg128(r0, r1, r2, r3) end
-	return r0, r1, r2, r3
-end
-local function addo128(a0: number, a1: number, a2: number, a3: number, b0: number, b1: number, b2: number, b3: number, signed: boolean): (number, number, number, number, number)
-	local r0, r1, r2, r3 = add128(a0, a1, a2, a3, b0, b1, b2, b3)
-	local o
-	if signed then
-		local sa, sb, sr = a3 >= 0x80000000, b3 >= 0x80000000, r3 >= 0x80000000
-		o = sa == sb and sr ~= sa
-	else
-		o = cmpu128(r0, r1, r2, r3, a0, a1, a2, a3) < 0
-	end
-	return r0, r1, r2, r3, if o then 1 else 0
-end
-local function subo128(a0: number, a1: number, a2: number, a3: number, b0: number, b1: number, b2: number, b3: number, signed: boolean): (number, number, number, number, number)
-	local r0, r1, r2, r3 = sub128(a0, a1, a2, a3, b0, b1, b2, b3)
-	local o
-	if signed then
-		local sa, sb, sr = a3 >= 0x80000000, b3 >= 0x80000000, r3 >= 0x80000000
-		o = sa ~= sb and sr ~= sa
-	else
-		o = cmpu128(a0, a1, a2, a3, b0, b1, b2, b3) < 0
-	end
-	return r0, r1, r2, r3, if o then 1 else 0
-end
-local function mulo128(a0: number, a1: number, a2: number, a3: number, b0: number, b1: number, b2: number, b3: number, signed: boolean): (number, number, number, number, number)
-	local na, nb = false, false
-	if signed then
-		na, nb = a3 >= 0x80000000, b3 >= 0x80000000
-		if na then a0, a1, a2, a3 = neg128(a0, a1, a2, a3) end
-		if nb then b0, b1, b2, b3 = neg128(b0, b1, b2, b3) end
-	end
-	local r = mulwide({ a0, a1, a2, a3 }, { b0, b1, b2, b3 }, 8)
-	local o = r[5] ~= 0 or r[6] ~= 0 or r[7] ~= 0 or r[8] ~= 0
-	local r0, r1, r2, r3 = r[1], r[2], r[3], r[4]
-	if signed then
-		if na ~= nb then
-			o = o or r3 > 0x80000000 or (r3 == 0x80000000 and (r0 ~= 0 or r1 ~= 0 or r2 ~= 0))
-			r0, r1, r2, r3 = neg128(r0, r1, r2, r3)
-		else
-			o = o or r3 >= 0x80000000
-		end
-	end
-	return r0, r1, r2, r3, if o then 1 else 0
-end
-local function i128tof(a0: number, a1: number, a2: number, a3: number, signed: boolean): number
-	local neg = signed and a3 >= 0x80000000
-	if neg then a0, a1, a2, a3 = neg128(a0, a1, a2, a3) end
-	local v = ((a3 * 0x100000000 + a2) * 0x100000000 + a1) * 0x100000000 + a0
-	return if neg then -v else v
-end
-local function ftoi128(x: number, signed: boolean): (number, number, number, number)
-	if x ~= x then return 0, 0, 0, 0 end
-	x = trunc(x)
-	local neg = x < 0
-	if neg and not signed then return 0, 0, 0, 0 end
-	local m = math.abs(x)
-	local limit = if signed then 2 ^ 127 else 2 ^ 128
-	if m >= limit then
-		if not signed then return 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF end
-		if neg then return 0, 0, 0, 0x80000000 end
-		return 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0x7FFFFFFF
-	end
-	local r = {}
-	for i = 1, 4 do
-		local q = math.floor(m / 0x100000000)
-		r[i] = m - q * 0x100000000
-		m = q
-	end
-	if neg then return neg128(r[1], r[2], r[3], r[4]) end
-	return r[1], r[2], r[3], r[4]
-end
-
--- static data decoder (base64, no padding)
 local function b64write(at: number, s: string)
 	local dec = table.create(256, 0)
 	local abc = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
@@ -677,14 +270,14 @@ local function b64write(at: number, s: string)
 	end
 end
 b64write(1048592, "JAAAAAAAAAD//////////2hlbGxvIGZyb20gcnVzdB5oZWxsbyBmcm9tIFJ1c3QhIHRvcCBsZXR0ZXJzOiDAAQoAAADvHBAACgAAABUAAAA2AAAA0RwQAB0AAACtAQAAGQAAAAAAAAAIAAAABAAAACIAAAAjAAAAAHN0ZG91dBJyYW5nZSBzdGFydCBpbmRleCDAIiBvdXQgb2YgcmFuZ2UgZm9yIHNsaWNlIG9mIGxlbmd0aCDAABByYW5nZSBlbmQgaW5kZXggwCIgb3V0IG9mIHJhbmdlIGZvciBzbGljZSBvZiBsZW5ndGggwAAWc2xpY2UgaW5kZXggc3RhcnRzIGF0IMANIGJ1dCBlbmRzIGF0IMAASGNhbm5vdCBhY2Nlc3MgYSBUaHJlYWQgTG9jYWwgU3RvcmFnZSB2YWx1ZSBkdXJpbmcgb3IgYWZ0ZXIgZGVzdHJ1Y3Rpb246IMAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAGYcEAApAAAAQAAAACIAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAE2ZhaWxlZCBwcmludGluZyB0byDAAjogwAAAABIaEAAZAAAAjgQAAAkAAAAAAAAAAAAAAAAAAEFjY2Vzc0Vycm9yAACvHBAAIQAAADAAAAAkAAAArxwQACEAAAA3AAAAKAAAAK8cEAAhAAAAPwAAACwAAAAAAAAABAAAAAQAAAAgAAAAIQAAACEAAABjYXBhY2l0eSBvdmVyZmxvdwAAAJAcEAAeAAAAHAAAAAUAAABmHBAAKQAAALgAAAAYAAAAZhwQACkAAAANAQAAIwAAAGYcEAApAAAA8gAAABIAAABmHBAAKQAAAP8AAAAZAAAAZhwQACkAAADOAAAAJAAAAGYcEAApAAAA0QAAACQAAABdAAAAAAAAAAQAAAAEAAAAHwAAAAAAAAAeAAAAAcALIChvcyBlcnJvciDAASkAfSB9dW5zYWZlIHByZWNvbmRpdGlvbihzKSB2aW9sYXRlZDogaGludDo6dW5yZWFjaGFibGVfdW5jaGVja2VkIG11c3QgbmV2ZXIgYmUgcmVhY2hlZAoKVGhpcyBpbmRpY2F0ZXMgYSBidWcgaW4gdGhlIHByb2dyYW0uIFRoaXMgVW5kZWZpbmVkIEJlaGF2aW9yIGNoZWNrIGlzIG9wdGlvbmFsLCBhbmQgY2Fubm90IGJlIHJlbGllZCBvbiBmb3Igc2FmZXR5LmFyZ3VtZW50IG9mIGludGVnZXIgbG9nYXJpdGhtIG11c3QgYmUgcG9zaXRpdmUAADgcEAAtAAAATQAAAB0AAAA4HBAALQAAAEcAAAAXAAAA5RgQABsAAAD1AwAAGgAAAOUYEAAbAAAA9gMAABoAAABbdGhlcmUgaXMgbm8gc3VjaCB0aGluZyBhcyBhbiBhY3F1aXJlLXJlbGVhc2UgbG9hZAAAjRgQAB0AAAA/DwAAFwAAAHRoZXJlIGlzIG5vIHN1Y2ggdGhpbmcgYXMgYSByZWxlYXNlIGxvYWSNGBAAHQAAAD4PAAAYAAAAAAAAAAAAAAAAAG9wZXJhdGlvbiBzdWNjZXNzZnVsAABwGxAAwgIAAEkSgAFtFsAzFh+AOLYkAEUALOBNBTAgTgA04FLATeBVjaQAVg2mQFak18BWAPlAYW764GE+/QBigALBZDcH4WngHsFvmiMhmJAvgZkwNCGa+0OBmkdGAZsAYUGbAGhhmzlqoZtAbcGb1oyhnfCvQaAjseGg/LLBoQC8AaMA1CGjptZhpADfAamQ4uGr0OThrgDuYa8w8eGyAAAiu+Cm4rseuAK8rs5CvOHrgrxe7sK8APgCvR76Ir0AAEO9SxNjvXo0g716NNS9qgEKAQQBBRcBHwEABAwOBQcBAQFWAR0SAQICBAEBBgEBAwEBARQBUwGLCKYBJgIBBiknDgEBAQIBAgEBCBsEBB0LBTgBBw5mAQgECAQDCgMCARAwDWUYIQkCBAEFGAITExkHCwUYAQcHAQgqCgwDBwZMARABAwQPDRMBCAICAhYBBwEBAwQDCAICAgIBAQgBBAIBBQwCCgEEAwEGBAICFgEHAQIBAgECBAUEAgICBAEHBAEBEQYLAwEJAQMBFgEHAQIBBQMJAQMBAgMBDwQVBAQDAQgCAgIWAQcBAgEFAwgCAgICCQIEAgEFDQEQAgEGAwMBBAMCAQEBAgMCAwMDDAQFAwMBAwMBBgEoDQEDARcBEAMIAQMBAwgCAQMBAgIEHAQBCAEDARcBCgEFAwgBAwEDCAIFAwEEDQMMDQEDASkCCAEDAQMBAQUEBwUWBgEDARIDGAEJAQECBwgGAQEBCBICDToFBwYBMwIBAQEFARgBAQETAQMCBQEBBgEOBCABPwgBJAQTBBABJEM3AQECBRBACgQCJgEBBQECKwEAAQQCBwEBAQQCKQEEAiEBBAIHAQEBBAIPATkBBAJDJRAQVgIGAwACEQEaBUsDCwcUCxUMFAwNAQMBAgw0AhMOAQQBQ1kHKwVGCh8BDAQJFx4CBQssBBo2HAQ/AhQyARcCCwMxNAEPAQgzKgIECiwBCw43FgMKJAILBSsCAykEAQYBAgMBBcATIgsAAgYCJgIGAggBAQEBAQEBHwI1AQcBAQMDAQcDBAIGBA0FAwEHdAENARANZQEEAQIKAQEDBQYBAQEBAQEEAQsCBAUFBAERKQA0AOUGBAMCDCYBAQUBAjgHARAXCQcBBwEHAQcBBwEHAQcBBwEgLwEAAxkJBwUCBQRWBgMBWgEEBSsBXhEgMBAAAEAAQy4CAAMQCgIULwUIA3EnCQJnAlIUFQEhGDQMRAEBLAYDAQEDCiEFIw0dAzMBDA8BEBAKBQE3CQ4SFwNFAQEBARgDAhACBAsGAgYCBgkHAQcBKwEOBnsVAAwXBDEAAAJqJgcMBQUMAQ0BBQEBAQIBAgFsIQASQAI2KAx0BQGHJBoGGgtZAwYCBgIGAgMjDAEaARMBAgEPAg4ie0U1AB0DMS8gDR4FKwUeAiQECAEFKp4SJAQkBCgINAwLAQ8BBwECAQsBDwEHAQIDNAwACRYKCBgGASoBCUUGAgEBLAECAwECFwoXCR9BEwECChYKGgYaJjgGAkAEAQIFCAEDAR0qHQMdIwgBHBs2ChYKEw0Sbkk3Mw0zDSgiHAMBBRf6KgECAwIQBjIDAx0KAQgWKhIuFRsXCUYrBQo5CQENGRczEQQIIwMBCUABBAkCCgEBASMSASICAQYEPgcBAQEEAQ8BCgc5FwQBCAICAhYBBwECAQUDCAICAgIDAQYBBQccCgEBAgEBJgEKAQECAQEEAQIDAQEBLEIBAwEEFAMeQgICAQG4NgIHGQYiPwEBAwE7NgIBRxsCDhUHuTlnQB8IAgECCAECAR4BAgICAgRdCAIuAgYBAQECGzMCChFIBQESSWcIWCEfCQEtAQcBATEeAhYBDkkHAQIBLAMBAQIBAwEBAgIYBgECASUBAgEEAQEXLAAXCREBKQMDbwFPAGZvEcQAYQ8AEQYZAAUAAC8AAAcfEU8RHhIwEAQfFQUTAC3TQCAZAhksSwQ5BxFAAgEBDAcJACkgYXMABAEHAQIBAA8BHQMCAQ4ECAAAawUNAwkHCgQBAFUBRwECAgECAgIEAQwBAQEHAUEBBAIIAQcBHAEEAQUBAQMHAQACGQEZAR8BGQEfARkBHwEZAR8BGQEIAB8GBtUHARECBwECAQUFPiEBcC0KBxABAB4SLAAc5B4CAc8fARYIAuAHAQQBAgEPAcU7RAMBAwEABAEbAQIBAQIBAQoBBAEBAQEGAQQBAQEBAQEDAQIBAQIBAQEBAQEBAQEBAgEBAgQBBwEEAQQBAQEKAREFAwEFAREAGgYaBhoAACAAAgACAA8AAAAAAAUAAEhhc2ggdGFibGUgY2FwYWNpdHkgb3ZlcmZsb3cATBsQACMAAAAkAAAAKAAAAGFzc2VydGlvbiBmYWlsZWQ6IDAgPCBwb2ludGVlX3NpemUgJiYgcG9pbnRlZV9zaXplIDw9IGlzaXplOjpNQVggYXMgdXNpemUAAAAiGxAAKQAAACMAAAAtAAAAIhsQACkAAAAlAAAANgAAAG1pZCA+IGxlbgAAAHsaEAAgAAAAFAoAAA4AAADeGRAAGgAAAOIAAAAJAAAA7xoQABgAAACaAAAAMAAAAAgbEAAZAAAAuwYAAFAAAAAIGxAAGQAAAMMGAABMAAAA7xoQABgAAACaAAAAMAAAAHdyaXRlIHplcm9vcGVyYXRpb24gd291bGQgYmxvY2t1bnN1cHBvcnRlZHVuZXhwZWN0ZWQgZW5kIG9mIGZpbGV1bmNhdGVnb3JpemVkIGVycm9ydG9vIG1hbnkgb3BlbiBmaWxlc3RvbyBtYW55IGxpbmtzdGltZWQgb3V0bm8gc3RvcmFnZSBzcGFjZXN0YWxlIG5ldHdvcmsgZmlsZSBoYW5kbGVyZXNvdXJjZSBidXN5cmVhZC1vbmx5IGZpbGVzeXN0ZW0gb3Igc3RvcmFnZSBtZWRpdW1xdW90YSBleGNlZWRlZHBlcm1pc3Npb24gZGVuaWVkb3V0IG9mIG1lbW9yeW90aGVyIGVycm9yc2VlayBvbiB1bnNlZWthYmxlIGZpbGVlbnRpdHkgbm90IGZvdW5kbm90IGNvbm5lY3RlZG5vdCBhIGRpcmVjdG9yeW5ldHdvcmsgdW5yZWFjaGFibGVuZXR3b3JrIGRvd25pcyBhIGRpcmVjdG9yeWludmFsaWQgaW5wdXQgcGFyYW1ldGVyaW52YWxpZCBmaWxlbmFtZWludmFsaWQgZGF0YW9wZXJhdGlvbiBpbnRlcnJ1cHRlZGluIHByb2dyZXNzaG9zdCB1bnJlYWNoYWJsZWZpbGVzeXN0ZW0gbG9vcCBvciBpbmRpcmVjdGlvbiBsaW1pdCAoZS5nLiBzeW1saW5rIGxvb3ApZmlsZSB0b28gbGFyZ2VleGVjdXRhYmxlIGZpbGUgYnVzeWRpcmVjdG9yeSBub3QgZW1wdHlkZWFkbG9ja2Nyb3NzLWRldmljZSBsaW5rIG9yIHJlbmFtZWNvbm5lY3Rpb24gcmVzZXRjb25uZWN0aW9uIHJlZnVzZWRjb25uZWN0aW9uIGFib3J0ZWRicm9rZW4gcGlwZWFyZ3VtZW50IGxpc3QgdG9vIGxvbmdlbnRpdHkgYWxyZWFkeSBleGlzdHNhZGRyZXNzIG5vdCBhdmFpbGFibGVhZGRyZXNzIGluIHVzZdMaEAAbAAAAUAAAACwAAAC2GhAAHAAAAOQFAAAeAAAAGgAAAAwAAAAEAAAAGwAAABwAAAAdAAAAAAAAAAAAAAABAAAAGQAAAGEgRGlzcGxheSBpbXBsZW1lbnRhdGlvbiByZXR1cm5lZCBhbiBlcnJvciB1bmV4cGVjdGVkbHkAnBoQABkAAAB/CwAADgAAAHsaEAAgAAAAFAoAAA4AAABRGhAAKQAAAJIAAAAgAAAACiwgLApvbmUtdGltZSBpbml0aWFsaXphdGlvbiBtYXkgbm90IGJlIHBlcmZvcm1lZCByZWN1cnNpdmVseU9uY2UgaW5zdGFuY2UgaGFzIHByZXZpb3VzbHkgYmVlbiBwb2lzb25lZGxvY2sgY291bnQgb3ZlcmZsb3cgaW4gcmVlbnRyYW50IG11dGV4AAAALBoQACQAAAAjAQAALQAAAGNhbm5vdCByZWN1cnNpdmVseSBhY3F1aXJlIG11dGV4AAAAALMZEAAqAAAAEwAAAAkAAAAVAAAADAAAAAQAAAAWAAAAFwAAABgAAABhIGZvcm1hdHRpbmcgdHJhaXQgaW1wbGVtZW50YXRpb24gcmV0dXJuZWQgYW4gZXJyb3Igd2hlbiB0aGUgdW5kZXJseWluZyBzdHJlYW0gZGlkIG5vdAAAQRkQABcAAAB4AgAAEQAAABIaEAAZAAAAXQMAABQAAAAAAAAA5RgQABsAAACmEQAAIAAAAGNodW5rIHNpemUgbXVzdCBiZSBub24temVyb8ACOiDAAAAAAAAAAAD5GRAAGAAAALwGAAAgAAAAAAAAAAwAAAAEAAAAEgAAABMAAAAUAAAA3hkQABoAAADiAAAAMQAAALMZEAAqAAAAEwAAAAkAAAAAAAAAAAAAAI0YEAAdAAAAPw8AABcAAACNGBAAHQAAAD4PAAAYAAAAwAB0aGVyZSBpcyBubyBzdWNoIHRoaW5nIGFzIGFuIGFjcXVpcmUtcmVsZWFzZSBzdG9yZY0YEAAdAAAAMA8AABcAAAB0aGVyZSBpcyBubyBzdWNoIHRoaW5nIGFzIGFuIGFjcXVpcmUgc3RvcmUAAI0YEAAdAAAALw8AABgAAAAAAAAABAAAAAQAAAARAAAAhxkQACsAAAAyAQAAJQAAAMYYEAAeAAAAdgMAACAAAADGGBAAHgAAAHYDAAAgAAAAjRgQAB0AAAA/DwAAFwAAAI0YEAAdAAAAPg8AABgAAAAAdXNlci1wcm92aWRlZCBjb21wYXJpc29uIGZ1bmN0aW9uIGRvZXMgbm90IGNvcnJlY3RseSBpbXBsZW1lbnQgYSB0b3RhbCBvcmRlcgAAAFkZEAAtAAAAVgMAAAUAAABjYWxsZWQgYE9wdGlvbjo6dW53cmFwKClgIG9uIGEgYE5vbmVgIHZhbHVlAA0AAAAMAAAABAAAAA4AAAAPAAAAEAAAAEEZEAAXAAAAeAIAABEAAAAAAAAAbWF0Y2hlcyE9PT0QYXNzZXJ0aW9uIGBsZWZ0IMAXIHJpZ2h0YCBmYWlsZWQKICBsZWZ0OiDACQogcmlnaHQ6IMAAEGFzc2VydGlvbiBgbGVmdCDAECByaWdodGAgZmFpbGVkOiDACQogIGxlZnQ6IMAJCiByaWdodDogwABSZWZDZWxsIGFscmVhZHkgYm9ycm93ZWQAAAAiGRAAHgAAAIQAAAAeAAAAIhkQAB4AAACgAAAACQAAAAEZEAAhAAAAFwAAAAELDQcJAwUPAAAAAAAAAAAAAAAAqxgQABoAAAA2AAAAQwAAAAAAAADlGBAAGwAAAKYRAAAgAAAAxhgQAB4AAAB2AwAAIAAAAMYYEAAeAAAAdgMAACAAAABmGBAAJgAAANcAAAAdAAAAYXNzZXJ0aW9uIGZhaWxlZDogMCA8IHBvaW50ZWVfc2l6ZSAmJiBwb2ludGVlX3NpemUgPD0gaXNpemU6Ok1BWCBhcyB1c2l6ZQAAAMYYEAAeAAAAdgMAACAAAAB0aGVyZSBpcyBubyBzdWNoIHRoaW5nIGFzIGEgcmVsYXhlZCBmZW5jZQAAAI0YEAAdAAAAJBEAABgAAABmYWlsZWQgdG8gZ2VuZXJhdGUgdW5pcXVlIHRocmVhZCBJRDogYml0c3BhY2UgZXhoYXVzdGVkAKsYEAAaAAAAJgAAAA0AAAB0aGVyZSBpcyBubyBzdWNoIHRoaW5nIGFzIGEgcmVsZWFzZSBmYWlsdXJlIG9yZGVyaW5njRgQAB0AAAD1DwAAHQAAAHRoZXJlIGlzIG5vIHN1Y2ggdGhpbmcgYXMgYW4gYWNxdWlyZS1yZWxlYXNlIGZhaWx1cmUgb3JkZXJpbmcAAACNGBAAHQAAAPQPAAAcAAAAZhgQACYAAADuAAAAFQAAAGRlc3QgaXMgb3V0IG9mIGJvdW5kcwAAAEgYEAAdAAAA6QMAADQAAABIGBAAHQAAAO0DAAAzAAAASBgQAB0AAAD0AwAAOAAAAEgYEAAdAAAA+AMAADcAAAAvcnVzdC9jb3JlL3NyYy9zbGljZS9pbmRleC5ycwAvcnVzdC9zdGQvc3JjL2lvL2J1ZmZlcmVkL2J1ZndyaXRlci5ycwAvcnVzdC9jb3JlL3NyYy9zeW5jL2F0b21pYy5ycwAvcnVzdC9zdGQvc3JjL3RocmVhZC9pZC5ycwAvcnVzdC9jb3JlL3NyYy9wdHIvbm9uX251bGwucnMAL3J1c3QvY29yZS9zcmMvc2xpY2UvbW9kLnJzAGZhaWxlZCB0byB3cml0ZSB0aGUgYnVmZmVyZWQgZGF0YS9ydXN0L2NvcmUvc3JjL3NsaWNlL21lbWNoci5ycwAvcnVzdC9zdGQvc3JjL2lvL21vZC5ycwAvcnVzdC9jb3JlL3NyYy9zbGljZS9zb3J0L3NoYXJlZC9zbWFsbHNvcnQucnMAL3J1c3Qvc3RkL3NyYy9pby9idWZmZXJlZC9saW5ld3JpdGVyc2hpbS5ycwAvcnVzdC9zdGQvc3JjL3N5cy9zeW5jL211dGV4L25vX3RocmVhZHMucnMAL3J1c3Qvc3RkL3NyYy9zeW5jL29uY2UucnMAL3J1c3QvY29yZS9zcmMvb3B0aW9uLnJzAC9ydXN0L3N0ZC9zcmMvaW8vc3RkaW8ucnMAL3J1c3Qvc3RkL3NyYy9zeW5jL3JlZW50cmFudF9sb2NrLnJzAC9ydXN0L2NvcmUvc3JjL3NsaWNlL3NvcnQvc3RhYmxlL21lcmdlLnJzAC9ydXN0L2NvcmUvc3JjL2ludHJpbnNpY3MvbW9kLnJzAC9ydXN0L2FsbG9jL3NyYy9zdHJpbmcucnMAL3J1c3QvY29yZS9zcmMvc2xpY2UvaXRlci5ycwAvcnVzdC9jb3JlL3NyYy9zdHIvY291bnQucnMAL3J1c3QvY29yZS9zcmMvZm10L3J0LnJzAC9ydXN0L2NvcmUvc3JjL2ZtdC9tb2QucnMAL3J1c3QvY29yZS9zcmMvc2xpY2Uvc29ydC9zaGFyZWQvcGl2b3QucnMAL2NyYXRlcy9oYXNoYnJvd24tMC4xNy4xL3NyYy9yYXcucnMAMDAwMTAyMDMwNDA1MDYwNzA4MDkxMDExMTIxMzE0MTUxNjE3MTgxOTIwMjEyMjIzMjQyNTI2MjcyODI5MzAzMTMyMzMzNDM1MzYzNzM4Mzk0MDQxNDI0MzQ0NDU0NjQ3NDg0OTUwNTE1MjUzNTQ1NTU2NTc1ODU5NjA2MTYyNjM2NDY1NjY2NzY4Njk3MDcxNzI3Mzc0NzU3Njc3Nzg3OTgwODE4MjgzODQ4NTg2ODc4ODg5OTA5MTkyOTM5NDk1OTY5Nzk4OTkvcnVzdC9jb3JlL3NyYy9zbGljZS9zb3J0L3N0YWJsZS9xdWlja3NvcnQucnMAL3J1c3QvY29yZS9zcmMvc2xpY2Uvc29ydC9zdGFibGUvZHJpZnQucnMAL3J1c3QvYWxsb2Mvc3JjL3Jhd192ZWMvbW9kLnJzAC9ydXN0L2NvcmUvc3JjL3N0ci92YWxpZGF0aW9ucy5ycwAvcnVzdC9zdGQvc3JjL3RocmVhZC9sb2NhbC5ycwBzcmMvbGliLnJzACAgICBFcnJvcgAnHxAAHgAAALMJAAAJAAAAAAAAAAEAAAABAAAAKAAAAGNoYXIgbGVuIHNob3VsZCBiZSBsZXNzIHRoYW4gMjU1CR8QAB0AAAA8AgAADgAAAOUYEAAbAAAAZAoAACIAAAAAAAAAAAAAAAQAAAAEAAAAJwAAAAAAAAAEAAAABAAAACYAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAASZW5jb2RlX3V0Zjg6IG5lZWQgwBMgYnl0ZXMgdG8gZW5jb2RlIFUrwyAAAGkEABUgYnV0IGJ1ZmZlciBoYXMganVzdCDAAHRydWVmYWxzZQkfEAAdAAAAzwEAADcAAABBdHRlbXB0ZWQgdG8gaW5pdGlhbGl6ZSB0aHJlYWQtbG9jYWwgd2hpbGUgaXQgaXMgYmVpbmcgZHJvcHBlZAAA3B4QACwAAABrAAAADQAAAAAAAAAAAAAAMDEyMzQ1Njc4OUFCQ0RFRjB4LCkoCigAIhkQAB4AAABJAAAAIgAAAGFsaWduX29mZnNldDogYWxpZ24gaXMgbm90IGEgcG93ZXItb2YtdHdvAAAAvB4QAB8AAAABBQAADQAAAC9ydXN0L2NvcmUvc3JjL3B0ci9jb25zdF9wdHIucnMAL3J1c3Qvc3RkL3NyYy9zeXMvdGhyZWFkX2xvY2FsL25vX3RocmVhZHMucnMAL3J1c3QvY29yZS9zcmMvc3RyL3BhdHRlcm4ucnMAL3J1c3QvY29yZS9zcmMvY2hhci9tZXRob2RzLnJzAAAAAAAAAAQAAAAEAAAAKQAAAFRyeUZyb21JbnRFcnJvcgAAAAAAAAAAMDEyMzQ1Njc4OWFiY2RlZgAAAAAAAAAAMDEyMzQ1Njc4OWFiY2RlZgICAgICAgICAgICAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACAgAAAAAAAgAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAgAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAMAAIMEIACRBWAAXROgABIXIB8MIGAf7yxgKyow4CtvpqAsAqggLR77IC4A/mA2nv+gNv0BITcBCmE3JA0hOKsOoTkvGCE68x4hS0A0oVMeYeFU8GphVU9v4VWdvGFWAM9hV2XRoVcA2iFYAOChWa7iIVvs5OFc0OhhXSAA7l7wAX9fAHAABwAtAQEBAgECAQFICzAVEAFlBwIGAgIBBCMBHhtbCzoJCQEYBAEJAQMBBSsDOwkqGAEgNwEBAQQIBAEDBwoCHQE6AQEBAgQIAQkBCgIaAQICOQEEAgQCAgMDAR4CAwELAjkBBAUBAgQBFAIWBgEBOgEBAgEECAEHAwoCHgE7AQEBDAEJASgBAwE3AQEDBQMBBAcCCwIdAToBAgIBAQMDAQQHAgsCHAI5AgEBAgQIAQkBCgIdAUgBBAECAwEBCAFRAQIHDAhiAQIJCwdJAhsBAQEBATcOAQUBAgULASQJAWYEAQYBAgICGQIEAxAEDQECAgYBDwEAAwAEHAMdAh4CQAIBBwgBAgsJAS0DAQF1AiIBdgMEAgkBBgPbAgIBOgEBBwEBAQECCAYKAgEwLgIMFAQwCgQDJgkMAiAEAgY4AQECAwEBBTgIAgKYAwENAQcEAQYBAwLGQAABwyEAA40BYCAABmkCAAQBCiACUAIAAQMBBAEZAgUBlwIaEg0BJggZCwEBLAMwAQIEAgICASQBQwYCAgICDAEIAS8BMwEBAwICBQIBASoCCAHuAQIBBAEAAQAQEBAAAgAB4gGVBQADAQIFBCgDBAGlAgAEQQUAAk0GRgsxBHsBNg8pAQICCgMxBAICBwE9AyQFAQg+AQwCNAkBAQgEAgFfAwIEBgECAZ0BAwgVAjkCAQEBAQwBCQEOBwMFQwECBgEBAgEBAwQDAQEOAlUIAgMBARcBUQECBgEBAgEBAgEC6wECBAYCAQIbAlUIAgEBAmoBAQECCGUBAQECBAEFAAkBAvUBCgQEAZAEAgIEASAKKAYCBAgBCQYCAy4NAQLGAQEDAQHJBwEGAQFSFgIHAQIBAnoGAwEBAgEHAQFIAgMBAQEAAgsCNAUFAxcBAAEGDwAMAwMABTsHAAE/BFEBCwIAAgAuAhcABQMGCAgCBx4ElAMANwQyCAEOARYFAQ8ABwERAgcBAgEFZAGgBwABPQQABP4C8wECAQcCBQEAB20HAGCA8AAATwMAABwGYABfEaAAtBfgAAsgIAFkMaABAP5gAqC8oQJz0aEDAADuAwAQLgQAEF8ErQEAAQABAAIAAlUFAAUaBTEQAAEAEO8BoAFPCQAEAAgAAAAAAAYAAJAIYAAOGGABCyDgAf/+IAK9ECEDMDShA6C8IQRz0WEEAQCuBIAA/wStAQAGFgHAATEBAAJQAQABAAUaBTEFAQoAAfkDAAEPAQAQAAQACAABHmAAAHgDAAAwBSAADgdgAUkSIAOdFqAoFh+gLSokoDd0K2A99CzgPY2kID4spqBEpNcgRW76oEvQ/WBMNwehTpoj4VuQL2GFVjRBhvtDoYZHRuGGAGEhhwBoQYc5aoGHQG2hh9aMgYrwr+GMI7GBjfyyYY4AvKGPAMzBj7TOAZGm1mGRzNdhmYzaoZkA3+GZkOKBmtDkwZ1x7IGeAPBBotn2QatY+mGuAADiseCmgrQeuKK0rs7itOHrIrVe7mK1APiitR76wrUAAOO1SxMDtno0I7b+/2O2/v+UtgACBgQHAQEBFAEAASYCMgIDATcIGwQGCwABPAJlDjsCMQIPARwCAQELBSIF7QEIAgICFgEHAQEDBAIJAgICBAgBBAIBBQIZAgMBBgQCAhYBBwECAQIBAgIBAQUEAgIDAwEHBAEBBxEKAwEJAQMBFgEHAQIBBQIKAQMBAwIBDwQCDAcHAQMBCAICAhYBBwECAQUCCQICAgMHAwQCAQUCEgoCAQYDAwEEAwIBAQECAwIDAwMMBAUDAwEEAgEGAQ4VBQ0BAwEXARACCQEDAQQHAgEDAQICBAIKBxYBAwEXAQoBBQIJAQMBBAcCBQMBBAIKAQMMDQEDATMBAwEGBBACGgEDARIDGAEJAQECBwMBBAYBAQEIBgoCAww6BB0lAgEBAQUBGAEBARcCBQEBAQcBCgIEIEgBJAQnASQBDwENJcYBAQUBAgABBAIHAQEBBAIpAQQCIQEEAgcBAQEEAg8BOQEEAkMCIAMaBlYCBgIAA1kHFgkYCRQMDQEDAQIMXgIKBgoGGgZZBysFRgofAQwEDAQBAyoCBQssBBoGCwM+AkEBHQILBgoGDgIuAgwUTQGmCDwDDwM+BSsCCwgrBQACBgImAgYCCAEBAQEBAQEfAjUBDwEOAgYBEwIDAQkBZQEMAhsBDQMiDiEPjAQAFgsVAAIABS0BAQUBAjgHAg4YCQcBBwEHAQcBBwEHAQcBBwF+IhoBWQzWGlABVgJnBSsBXgFWCTABAAM3CQAUuAjdFDwDCgY4CEYIDAZ0Cx4DTgELBCEBNwkOAgoCZxgcCgYCBgIGCQcBBwE8BH4CCgYADBcEMQQAAmomBwwFBRoBBQEBAQIBAgEAICoGMwETAQQEBQGHAgEBvgMGAgYCBgIDAwcBBwoFAgwBGgETAQIBDwIOInsFAwQtA1gBDQMBLy6CHQMxDxwEJAkeBSsFHgElBA4qngIKBiQEJAQoCDQLDAEPAQcBAgELAQ8BBwECAzQMAAkWCggYBgEqAQlFBgIBASwBAgMBAhcBSAgJMBMBAgUhAxsFGyY4BBQCMgECBQgBAwEdAgMECgcJB0AgJwQMCTYDHQIbBRoHBAwHUEk3Mw0zBy4ICgYmAx0IAtAfASoBAwICEAYICSEuCCoWGiYcFBcJTgQkCUQKAQIZBwoGNQESCCcJYAEUCxIBLz4HAQEBBAEPAQsGOwUKBgQBCAICAhYBBwECAQUBCgICAgMCAQYBBQcCBwMFCwoBAQIBASYBCgEBAgEBBAEKAQIIAh1cAQUeSAgKpjYCJiJFCwoGDRM6BgoGFBwbAg8EF7k8ZFMMCAIBAggBAgEeAQICDAkKRggCLgILG0gIUw1JBwpWCFgiDgoGCQEtAQ4KHQMgAhYBDkkHAQIBLAMBAQIBCQgKBgYBAgElAQIBBgcKBiwECvYZBxEBKQMdVQEPMg0AZm8BBQvEAGMNAAoABQAAOgAABx8BCgRRAQoGHgIGCkYKCgEHARUFEwA6xlsFGQIZLEsEOQcRQAULBwkAKSBhcwAEAQcBAgEADwEdAwIBDgQIAABrBQ0DCQcKAggA/QMABhcPEQ8uAhcJdDz2CicCwhVGehQMFAxXCRmHVQFHAQICAQICAgQBDAEBAQcBQQEEAggBBwEcAQQBBQEBAwcBAAIAAgAPBQEPAB8GBtUHARECBwECAQUFPiEBcC0DDgIKBAIAHxE6BQEAKtYrBAHAHwEWCALgBwEEAQIBDwHFAhApTAQKBAIAREw9wgQBGwECAQECAQEKAQQBAQEBBgEEAQEBAQEBAwECAQECAQEBAQEBAQEBAQIBAQIEAQcBBAEEAQEBCgERBQMBBQERNAIALARkDA8CDwEPASUKrjgdDSwECQcCDgaaAAMRAw0D2gYMBAEPDAQ4CAoGKAgeAgwEAg4JJwAIDgINAwsDOQEBBBACDAQKB5MBZwAAIAACAAIADwAAAAAABQAAAE5vdEFQb3dlck9mVHdvWmVyb05lZ092ZXJmbG93UG9zT3ZlcmZsb3dJbnZhbGlkRGlnaXRFbXB0eQ")
-local F2, F3, F4, F6, F7, F8, F9, F10, F12, F14, F16, F17, F18, F19, F22, F23, F24, F25, F26, F27, F31, F32, F33, F34, F35, F36, F37, F38, F39, F40, F41, F42
-local F43, F44, F45, F46, F47, F48, F49, F50, F51, F52, F53, F54, F55, F56, F57, F58, F59, F62, F64, F65, F66, F67, F69, F70, F71, F95, F96, F97, F98, F100, F101, F105
-local F106, F107, F108, F109, F110
-local FT = table.create(113)
+local F0, F2, F3, F4, F6, F7, F8, F9, F10, F12, F14, F16, F17, F18, F19, F22, F23, F24, F25, F26, F27, F31, F32, F33, F34, F35, F36, F37, F38, F39, F40, F41
+local F42, F43, F44, F45, F46, F47, F48, F49, F50, F51, F52, F53, F54, F55, F56, F57, F58, F61, F63, F64, F65, F66, F68, F69, F92, F93, F94, F95, F97, F98, F102, F103
+local F104, F105, F106, F107, F108
+local FT = table.create(110)
 local FN = table.create(42)
 
 -- fib
-FT[0] = function(v5: number)
+function F0(v5: number)
 	local r0: number, r1: number, r2: number, r3: number, r4: number = 0, 0, 0, 0, 0
 	r0 = 0
 	r1 = 0
@@ -711,20 +304,20 @@ end
 FT[1] = function()
 	local r0: number, r1: number, r2: number, r3: number, r4: number, r5: number, r6: number, r7: number, r8: number, r9: number, r10: number, r11: number, r12: number, r13: number, r14: number, r15: boolean = 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, false
 	local lbl = 0
-	r3 = 0
 	r2 = 0
 	r1 = 0
+	r3 = 0
+	r3 = 0
 	r4 = 0
 	r5 = 0
-	r3 = 0
 	r0 = SP
 	r1 = r0 - 264
 	SP = r1
 	r3 = 0
 	r4 = 0
+	r7 = 0
 	r5 = 0
 	r6 = 0
-	r7 = 0
 	r7 = FN[buffer.readu32(MEM, 1048592)](0)
 	if r7 == 0 then
 		r7 = 1
@@ -743,32 +336,28 @@ FT[1] = function()
 		buffer.writeu32(MEM, r7 + 4, v49)
 		buffer.writeu32(MEM, r7 + 8, v42)
 		buffer.writeu32(MEM, r7 + 12, v43)
-		r4 = v40
-		r3 = v41
-		r6 = v42
-		r5 = v43
+		r3 = v40
+		r6 = v41
+		r5 = v42
+		r4 = v43
 		r7 = 0
 	end
 	if r7 ~= 0 then
-		if r7 ~= 1 then
-			unreachable()
-		end
 		local v51 = SP
 		local fp_50 = v51 - 24
 		SP = fp_50
 		buffer.writeu32(MEM, v51 + -24, fp_50)
 		buffer.writeu32(MEM, v51 + -20, 4)
 		F14(1048871, fp_50, 1048676)
-		unreachable()
 	end
 	buffer.writeu32(MEM, r0 + -264, 1048600)
 	buffer.writeu32(MEM, r0 + -260, 0)
 	buffer.writeu32(MEM, r0 + -256, 0)
 	buffer.writeu32(MEM, r0 + -252, 0)
-	buffer.writeu32(MEM, r0 + -248, r4)
-	buffer.writeu32(MEM, r0 + -244, r3)
-	buffer.writeu32(MEM, r0 + -240, r6)
-	buffer.writeu32(MEM, r0 + -236, r5)
+	buffer.writeu32(MEM, r0 + -248, r3)
+	buffer.writeu32(MEM, r0 + -244, r6)
+	buffer.writeu32(MEM, r0 + -240, r5)
+	buffer.writeu32(MEM, r0 + -236, r4)
 	buffer.writeu32(MEM, r0 + -232, 1048608)
 	buffer.writeu32(MEM, r0 + -228, 1048623)
 	while true do
@@ -780,303 +369,256 @@ FT[1] = function()
 			if v68 == 0 then
 				r5 = 0xFFFFFFFF
 			else
-				if v68 ~= 1 then
-					unreachable()
-				end
 				r5 = r5
 			end
-			repeat
-				r4 = r5
-				local v60 = if r5 == 0xFFFFFFFF then 0 else 1
-				if v60 == 1 then
+			r4 = r5
+			local v60 = if r5 == 0xFFFFFFFF then 0 else 1
+			if v60 == 1 then
+				repeat
 					repeat
+						r5 = 0
+						r5 = r4
+						if 97 <= r4 then
+							if r4 <= 122 then
+								break
+							end
+						end
+						if 65 <= r4 then
+							if r4 <= 90 then
+								break
+							end
+						end
 						repeat
-							r5 = 0
-							r5 = r4
-							if 97 <= r4 then
-								if r4 <= 122 then
-									break
-								end
-							end
-							if 65 <= r4 then
-								if r4 <= 90 then
-									break
-								end
-							end
 							if 0 <= r4 then
 								if r4 <= 169 then
-									r15 = false
-									lbl = 1
 									break
 								end
 							end
 							if 170 <= r4 then
 								local v78 = F44(r4, 1050152, 1050356)
 								r15 = v78
-								lbl = 2
+								lbl = 1
 								break
 							end
-							r15 = false
-							lbl = 3
-							break
 						until true
 						if lbl ~= 0 then
-							if lbl == 1 then
-								lbl = 0
-								break
-							end
-							if lbl == 2 then
-								lbl = 0
-								break
-							end
-							if lbl == 3 then
-								lbl = 0
-								break
-							end
+							break
 						end
-						r15 = true
+						r15 = false
+						lbl = 2
+						break
 					until true
-					if r15 then
-						r5 = r5
-					else
-						r5 = 0xFFFFFFFF
-					end
-					r4 = r5
-					local v82 = if r5 == 0xFFFFFFFF then 0 else 1
-					if v82 == 0 then
-						r5 = 0xFFFFFFFF
-					else
-						if v82 ~= 1 then
-							unreachable()
+					if lbl ~= 0 then
+						if lbl == 1 then
+							lbl = 0
+							break
 						end
-						r5 = r4
+						if lbl == 2 then
+							lbl = 0
+							break
+						end
 					end
-					r4 = r5
-					local v64 = if r5 == 0xFFFFFFFF then 0 else 1
-					if v64 == 0 then
-						lbl = 4
-						break
-					end
-					if v64 == 1 then
-						r4 = r4
-						break
-					end
-				elseif v60 == 0 then
-					r4 = 0xFFFFFFFF
-					break
+					r15 = true
+				until true
+				if r15 then
+					r5 = r5
+				else
+					r5 = 0xFFFFFFFF
 				end
-				unreachable()
-			until true
-			if lbl ~= 0 then
-				if lbl == 4 then
-					lbl = 0
+				r4 = r5
+				local v82 = if r5 == 0xFFFFFFFF then 0 else 1
+				if v82 == 0 then
+					r5 = 0xFFFFFFFF
+				else
+					r5 = r4
+				end
+				r4 = r5
+				local v64 = if r5 == 0xFFFFFFFF then 0 else 1
+				if v64 == 0 then
 					continue
 				end
+				r4 = r4
+			else
+				r4 = 0xFFFFFFFF
 			end
-			repeat
-				r3 = r4
-				local v8 = if r4 == 0xFFFFFFFF then 0 else 1
-				if v8 == 0 then
-					r2 = buffer.readu32(MEM, r0 + -264)
-					r12 = buffer.readu32(MEM, r0 + -260)
-					r3 = buffer.readu32(MEM, r0 + -252)
-					r13 = 0
-					r14 = 0
-					r10 = 0
-					r4 = SP
-					local fp_83 = r4 - 24
-					SP = fp_83
-					local v86 = r12 + 1
-					if v86 > 0xFFFFFFFF then v86 -= 0x100000000 end
-					r5 = r2 + v86
-					local v89 = buffer.readu32(MEM, r2 + 4)
-					local v88 = buffer.readu32(MEM, r2)
-					buffer.fill(MEM, fp_83, 128, 8)
-					r6 = bit32.bxor(bit32.band(v88, buffer.readu32(MEM, r4 + -24)), 2155905152)
-					r7 = bit32.bxor(bit32.band(v89, buffer.readu32(MEM, r4 + -20)), 2155905152)
-					r8 = r2 + 8
-					r9 = 0
-					r10 = 0
-					r11 = 0
-					if r12 == 0 then
-						r10 = 0
-					else
-						r11 = r12 + 1
-						if r11 > 0xFFFFFFFF then r11 -= 0x100000000 end
-						r12 = imul32(8, r11)
-						if r12 ~= 8 * r11 then
-							r11 = 0
-						else
-							local v106 = r12 + 7
-							local v107 = v106
-							if v107 > 0xFFFFFFFF then v107 -= 0x100000000 end
-							if v107 ~= v106 then
-								r11 = 0
-							else
-								r12 = bit32.band(r12 + 7, 4294967288)
-								r11 = r11 + 8
-								if r11 > 0xFFFFFFFF then r11 -= 0x100000000 end
-								local v113 = r12 + r11
-								if bit32.bor(v113, 0) ~= v113 then
-									r11 = 0
-								else
-									r13 = r12 + r11
-									if 2147483640 < r13 then
-										r11 = 0
-									else
-										r11 = 8
-										r9 = r13
-										r10 = r12
-									end
+			r3 = r4
+			local v8 = if r4 == 0xFFFFFFFF then 0 else 1
+			if v8 ~= 0 then
+				F2(r1 + 128, r1, r3)
+				local v15 = if buffer.readu32(MEM, r0 + -124) == 0xFFFFFFFF then 0 else 1
+				if v15 == 0 then
+					r4 = buffer.readu32(MEM, r0 + -136)
+					r3 = buffer.readu32(MEM, r0 + -132)
+					r5 = 0xFFFFFFFF
+				else
+					r4 = buffer.readu32(MEM, r0 + -136)
+					r3 = buffer.readu32(MEM, r0 + -132)
+					r2 = buffer.readu32(MEM, r0 + -128)
+					r5 = buffer.readu32(MEM, r0 + -124)
+				end
+				local v126 = if r5 == 0xFFFFFFFF then 0 else 1
+				if v126 == 0 then
+					r3 = r4 + -8 + 4
+				else
+					local v131 = F17(r2, r4, r3)
+					local v132 = buffer.readu32(MEM, r2)
+					local v138 = bit32.band(bit32.bor(bit32.rshift(r4, 25), bit32.lshift(r3, 7)), 127)
+					local v140 = v131 - 8
+					if v140 < 0 then v140 += 0x100000000 end
+					local v134 = buffer.readu8(MEM, v132 + v131)
+					local v144 = bit32.bor(bit32.band(v140, buffer.readu32(MEM, r2 + 4)) + 8, 0)
+					buffer.writeu8(MEM, v132 + v131, v138)
+					buffer.writeu8(MEM, buffer.readu32(MEM, r2) + v144, v138)
+					local v155 = v131
+					if v155 > 0x7FFFFFFF then v155 -= 0x100000000 end
+					local v158 = buffer.readu32(MEM, r2) + (0 - v155) * 8
+					local v154 = buffer.readu32(MEM, r2 + 8) - (if bit32.band(v134, 1) ~= 0 then 1 else 0)
+					if v154 < 0 then v154 += 0x100000000 end
+					buffer.writeu32(MEM, r2 + 8, v154)
+					buffer.writeu32(MEM, v158 + -8, r5)
+					buffer.writeu32(MEM, v158 + -4, 0)
+					local v161 = buffer.readu32(MEM, r2 + 12) + 1
+					if v161 > 0xFFFFFFFF then v161 -= 0x100000000 end
+					buffer.writeu32(MEM, r2 + 12, v161)
+					r3 = v158 + -8 + 4
+				end
+				local v6 = buffer.readu32(MEM, r3) + 1
+				if v6 > 0xFFFFFFFF then v6 -= 0x100000000 end
+				buffer.writeu32(MEM, r3, v6)
+				break
+			end
+			r2 = buffer.readu32(MEM, r0 + -264)
+			r12 = buffer.readu32(MEM, r0 + -260)
+			r3 = buffer.readu32(MEM, r0 + -252)
+			r13 = 0
+			r10 = 0
+			r14 = 0
+			r4 = SP
+			local fp_83 = r4 - 24
+			SP = fp_83
+			local v86 = r12 + 1
+			if v86 > 0xFFFFFFFF then v86 -= 0x100000000 end
+			r5 = r2 + v86
+			local v88 = buffer.readu32(MEM, r2)
+			local v89 = buffer.readu32(MEM, r2 + 4)
+			buffer.fill(MEM, fp_83, 128, 8)
+			r6 = bit32.bxor(bit32.band(v88, buffer.readu32(MEM, r4 + -24)), 2155905152)
+			r7 = bit32.bxor(bit32.band(v89, buffer.readu32(MEM, r4 + -20)), 2155905152)
+			r8 = r2 + 8
+			r11 = 0
+			r10 = 0
+			r9 = 0
+			if r12 == 0 then
+				r10 = 0
+			else
+				repeat
+					r11 = r12 + 1
+					if r11 > 0xFFFFFFFF then r11 -= 0x100000000 end
+					r12 = imul32(8, r11)
+					if r12 == 8 * r11 then
+						local v106 = r12 + 7
+						local v107 = v106
+						if v107 > 0xFFFFFFFF then v107 -= 0x100000000 end
+						if v107 == v106 then
+							r12 = bit32.band(r12 + 7, 4294967288)
+							r11 = r11 + 8
+							if r11 > 0xFFFFFFFF then r11 -= 0x100000000 end
+							local v113 = r12 + r11
+							if bit32.bor(v113, 0) == v113 then
+								r13 = r12 + r11
+								if not (2147483640 < r13) then
+									r11 = 8
+									r9 = r13
+									r10 = r12
+									break
 								end
 							end
 						end
-						local v100 = r10
-						if v100 > 0x7FFFFFFF then v100 -= 0x100000000 end
-						r10 = r11
-						r13 = r9
-						r14 = r2 + (0 - v100)
 					end
-					buffer.writeu32(MEM, r0 + -72, r6)
-					buffer.writeu32(MEM, r0 + -68, r7)
-					buffer.writeu32(MEM, r0 + -64, r8)
-					buffer.writeu32(MEM, r0 + -60, r5)
-					buffer.writeu32(MEM, r0 + -56, r2)
-					buffer.writeu32(MEM, r0 + -48, r3)
-					buffer.writeu32(MEM, r0 + -40, r10)
-					buffer.writeu32(MEM, r0 + -36, r13)
-					buffer.writeu32(MEM, r0 + -32, r14)
-					SP = r4
-					buffer.copy(MEM, r1 + 144, MEM, r1 + 192, 48)
-					buffer.copy(MEM, r1 + 56, MEM, r1 + 144, 48)
-					r2, r4, r3 = F3(r1 + 56)
-					buffer.writeu32(MEM, r0 + -24, r1 + 104)
-					r5 = r1 + 240
-					if not (r3 < 2) then
-						if r3 <= 20 then
-							if r3 < 1 then
-								rt_abort()
-								unreachable()
-							end
-							r7 = r4 + r3 * 8
-							r6 = r4 + 8
-							while r6 ~= r7 do
-								F9(r4, r6, r5)
-								r6 = r6 + 8
-							end
-						else
-							F4(r4, r3, r5)
-						end
+					r11 = 0
+				until true
+				local v100 = r10
+				if v100 > 0x7FFFFFFF then v100 -= 0x100000000 end
+				r10 = r11
+				r13 = r9
+				r14 = r2 + (0 - v100)
+			end
+			buffer.writeu32(MEM, r0 + -72, r6)
+			buffer.writeu32(MEM, r0 + -68, r7)
+			buffer.writeu32(MEM, r0 + -64, r8)
+			buffer.writeu32(MEM, r0 + -60, r5)
+			buffer.writeu32(MEM, r0 + -56, r2)
+			buffer.writeu32(MEM, r0 + -48, r3)
+			buffer.writeu32(MEM, r0 + -40, r10)
+			buffer.writeu32(MEM, r0 + -36, r13)
+			buffer.writeu32(MEM, r0 + -32, r14)
+			SP = r4
+			buffer.copy(MEM, r1 + 144, MEM, r1 + 192, 48)
+			buffer.copy(MEM, r1 + 56, MEM, r1 + 144, 48)
+			r2, r4, r3 = F3(r1 + 56)
+			buffer.writeu32(MEM, r0 + -24, r1 + 104)
+			r5 = r1 + 240
+			if not (r3 < 2) then
+				if r3 <= 20 then
+					if r3 < 1 then
+						rt_abort()
 					end
-					if 3 <= r3 then
-						buffer.writeu32(MEM, r0 + -160, r4)
-						buffer.writeu32(MEM, r0 + -156, 3)
-						buffer.writeu32(MEM, r0 + -152, r1 + 104)
-						buffer.writeu32(MEM, r0 + -148, 1)
-						F12(1048623, r1 + 112, 2, 1048713, 6)
-						r3 = r2
-						r1 = r4
-						if r2 ~= 0 then
-							r2 = 8 * r3
-							r1 = r1
-							if r2 ~= 0 then
-								rt_dealloc(r1, r2, 4)
-							end
-						end
-						SP = r0
-						return
+					r7 = r4 + r3 * 8
+					r6 = r4 + 8
+					while r6 ~= r7 do
+						F9(r4, r6, r5)
+						r6 = r6 + 8
 					end
-					r1 = SP
-					r0 = r1 - 224
-					SP = r0
-					if r3 < 0 then
-						buffer.writeu32(MEM, r1 + -224, 0)
-						buffer.writeu32(MEM, r1 + -220, r3)
-						buffer.writeu32(MEM, r1 + -192, r0)
-						buffer.writeu32(MEM, r1 + -188, 3)
-						buffer.writeu32(MEM, r1 + -184, r0 + 4)
-						buffer.writeu32(MEM, r1 + -180, 3)
-						F14(1048719, r0 + 32, 1048660)
-						unreachable()
-					end
-					if r3 < 3 then
-						buffer.writeu32(MEM, r1 + -216, 3)
-						buffer.writeu32(MEM, r1 + -212, r3)
-						buffer.writeu32(MEM, r1 + -144, r0 + 8)
-						buffer.writeu32(MEM, r1 + -140, 3)
-						buffer.writeu32(MEM, r1 + -136, r0 + 12)
-						buffer.writeu32(MEM, r1 + -132, 3)
-						F14(1048776, r0 + 80, 1048660)
-						unreachable()
-					end
-					buffer.writeu32(MEM, r1 + -200, 3)
-					buffer.writeu32(MEM, r1 + -196, r3)
-					buffer.writeu32(MEM, r1 + -48, r0 + 24)
-					buffer.writeu32(MEM, r1 + -44, 3)
-					buffer.writeu32(MEM, r1 + -40, r0 + 28)
-					buffer.writeu32(MEM, r1 + -36, 3)
-					F14(1048776, r0 + 176, 1048660)
-					unreachable()
-				end
-				if v8 == 1 then
-					F2(r1 + 128, r1, r3)
-					local v15 = if buffer.readu32(MEM, r0 + -124) == 0xFFFFFFFF then 0 else 1
-					if v15 == 0 then
-						r5 = buffer.readu32(MEM, r0 + -136)
-						r3 = buffer.readu32(MEM, r0 + -132)
-						r4 = 0xFFFFFFFF
-					else
-						if v15 ~= 1 then
-							break
-						end
-						r5 = buffer.readu32(MEM, r0 + -136)
-						r3 = buffer.readu32(MEM, r0 + -132)
-						r2 = buffer.readu32(MEM, r0 + -128)
-						r4 = buffer.readu32(MEM, r0 + -124)
-					end
-					local v126 = if r4 == 0xFFFFFFFF then 0 else 1
-					if v126 == 0 then
-						r3 = r5 + -8 + 4
-					else
-						if v126 ~= 1 then
-							unreachable()
-						end
-						local v131 = F17(r2, r5, r3)
-						local v132 = buffer.readu32(MEM, r2)
-						local v138 = bit32.band(bit32.bor(bit32.rshift(r5, 25), bit32.lshift(r3, 7)), 127)
-						local v140 = v131 - 8
-						if v140 < 0 then v140 += 0x100000000 end
-						local v134 = buffer.readu8(MEM, v132 + v131)
-						local v144 = bit32.bor(bit32.band(v140, buffer.readu32(MEM, r2 + 4)) + 8, 0)
-						buffer.writeu8(MEM, v132 + v131, v138)
-						buffer.writeu8(MEM, buffer.readu32(MEM, r2) + v144, v138)
-						local v155 = v131
-						if v155 > 0x7FFFFFFF then v155 -= 0x100000000 end
-						local v158 = buffer.readu32(MEM, r2) + (0 - v155) * 8
-						local v154 = buffer.readu32(MEM, r2 + 8) - (if bit32.band(v134, 1) ~= 0 then 1 else 0)
-						if v154 < 0 then v154 += 0x100000000 end
-						buffer.writeu32(MEM, r2 + 8, v154)
-						buffer.writeu32(MEM, v158 + -8, r4)
-						buffer.writeu32(MEM, v158 + -4, 0)
-						local v161 = buffer.readu32(MEM, r2 + 12) + 1
-						if v161 > 0xFFFFFFFF then v161 -= 0x100000000 end
-						buffer.writeu32(MEM, r2 + 12, v161)
-						r3 = v158 + -8 + 4
-					end
-					local v6 = buffer.readu32(MEM, r3) + 1
-					if v6 > 0xFFFFFFFF then v6 -= 0x100000000 end
-					buffer.writeu32(MEM, r3, v6)
-					lbl = 5
-					break
-				end
-			until true
-			if lbl ~= 0 then
-				if lbl == 5 then
-					lbl = 0
-					break
+				else
+					F4(r4, r3, r5)
 				end
 			end
-			unreachable()
+			if 3 <= r3 then
+				buffer.writeu32(MEM, r0 + -160, r4)
+				buffer.writeu32(MEM, r0 + -156, 3)
+				buffer.writeu32(MEM, r0 + -152, r1 + 104)
+				buffer.writeu32(MEM, r0 + -148, 1)
+				F12(1048623, r1 + 112, 2, 1048713, 6)
+				r1 = r2
+				r3 = r4
+				if r2 ~= 0 then
+					r1 = 8 * r1
+					r2 = r3
+					if r1 ~= 0 then
+						rt_dealloc(r2, r1, 4)
+					end
+				end
+				SP = r0
+				return
+			end
+			r1 = SP
+			r0 = r1 - 224
+			SP = r0
+			if r3 < 0 then
+				buffer.writeu32(MEM, r1 + -224, 0)
+				buffer.writeu32(MEM, r1 + -220, r3)
+				buffer.writeu32(MEM, r1 + -192, r0)
+				buffer.writeu32(MEM, r1 + -188, 3)
+				buffer.writeu32(MEM, r1 + -184, r0 + 4)
+				buffer.writeu32(MEM, r1 + -180, 3)
+				F14(1048719, r0 + 32, 1048660)
+			end
+			if r3 < 3 then
+				buffer.writeu32(MEM, r1 + -216, 3)
+				buffer.writeu32(MEM, r1 + -212, r3)
+				buffer.writeu32(MEM, r1 + -144, r0 + 8)
+				buffer.writeu32(MEM, r1 + -140, 3)
+				buffer.writeu32(MEM, r1 + -136, r0 + 12)
+				buffer.writeu32(MEM, r1 + -132, 3)
+				F14(1048776, r0 + 80, 1048660)
+			end
+			buffer.writeu32(MEM, r1 + -200, 3)
+			buffer.writeu32(MEM, r1 + -196, r3)
+			buffer.writeu32(MEM, r1 + -48, r0 + 24)
+			buffer.writeu32(MEM, r1 + -44, 3)
+			buffer.writeu32(MEM, r1 + -40, r0 + 28)
+			buffer.writeu32(MEM, r1 + -36, 3)
+			F14(1048776, r0 + 176, 1048660)
 		end
 	end
 end
@@ -1135,9 +677,6 @@ function F2(ret_2: number, v3: number, v4: number)
 				r5 = r15
 				r4 = 1
 			else
-				if v65 ~= 0 then
-					unreachable()
-				end
 				if (if bit32.band(bit32.band(r14, bit32.bor(bit32.lshift(r14, 1), bit32.rshift(r13, 31))), r12) == 0 then bit32.band(bit32.band(r13, bit32.lshift(r13, 1)), r11) else -1) == 0 then
 					local v95 = bit32.bor(r9 + 8, 0)
 					r9 = v95
@@ -1167,7 +706,6 @@ function F2(ret_2: number, v3: number, v4: number)
 					if v111 > 0xFFFFFFFF then v111 -= 0x100000000 end
 					if v111 ~= v110 then
 						F14(1051875, 57, 1051904)
-						unreachable()
 					end
 					r6 = r6 + 1
 					local v117 = buffer.readu32(MEM, v3 + 4)
@@ -1194,9 +732,6 @@ function F2(ret_2: number, v3: number, v4: number)
 				buffer.writeu32(MEM, ret_2 + 8, v3)
 				buffer.writeu32(MEM, ret_2 + 12, v17)
 			else
-				if r4 ~= 1 then
-					unreachable()
-				end
 				local v13 = r3
 				if v13 > 0x7FFFFFFF then v13 -= 0x100000000 end
 				buffer.writeu32(MEM, ret_2, buffer.readu32(MEM, v3) + (0 - v13) * 8)
@@ -1212,127 +747,98 @@ end
 -- <std::vec::Vec<(char, usize)> as std::vec::spec_from_iter_nested::SpecFromIterNested<(char, usize), std::collections::hash_map::IntoIter<char, usize>>>::from_iter
 function F3(v6: number)
 	local r0: number, r1: number, r2: number, r3: number, r4: number, r5: number, r6: number, r7: number = 0, 0, 0, 0, 0, 0, 0, 0
-	local lbl = 0
-	repeat
-		r0 = SP
-		r1 = r0 - 80
-		SP = r1
-		r3, r4 = F7(v6)
-		local v10 = if r3 == 0xFFFFFFFF then 0 else 1
-		if v10 == 0 then
-			r1 = 0
-			r2 = 4
-			r3 = 0
-			local v30 = if buffer.readu32(MEM, v6 + 32) == 0 then 0 else 1
-			if v30 ~= 1 then
-				if v30 == 0 then
-					break
-				end
-				unreachable()
-			end
+	r0 = SP
+	r1 = r0 - 80
+	SP = r1
+	r3, r4 = F7(v6)
+	local v10 = if r3 == 0xFFFFFFFF then 0 else 1
+	if v10 == 0 then
+		r1 = 0
+		r2 = 4
+		r3 = 0
+		local v30 = if buffer.readu32(MEM, v6 + 32) == 0 then 0 else 1
+		if v30 == 1 then
 			r4 = buffer.readu32(MEM, v6 + 40)
 			r5 = buffer.readu32(MEM, v6 + 32)
 			r6 = buffer.readu32(MEM, v6 + 36)
-			if r6 == 0 then
+			if r6 ~= 0 then
+				rt_dealloc(r4, r6, r5)
+			end
+		end
+	else
+		local v13 = math.min(math.max(buffer.readu32(MEM, v6 + 24) + 1, 0), 0xFFFFFFFF)
+		r2 = v13
+		if v13 < 4 then
+			r2 = 4
+		end
+		F8(r1 + 64, r2, 0, 4, 8)
+		local v20 = buffer.readu32(MEM, r0 + -16)
+		if v20 > 0x7FFFFFFF then v20 -= 0x100000000 end
+		if v20 ~= 0 then
+			r2 = buffer.readu32(MEM, r0 + -12)
+			r3 = buffer.readu32(MEM, r0 + -8)
+			local v36 = if r2 == 0 then 0 else 1
+			if v36 == 0 then
+				F14(1049500, 35, 1049520)
+			end
+			r0 = 0
+			r1 = 0
+			r1 = r2
+			r0 = r3
+			r2 = buffer.readu32(MEM, 1053492)
+			if r2 == 0 then
+				r2 = 10
+			else
+				r2 = r2
+			end
+			FN[r2](r1, r0)
+			rt_abort()
+		end
+		local v24 = buffer.readu32(MEM, r0 + -8)
+		local v23 = buffer.readu32(MEM, r0 + -12)
+		buffer.writeu32(MEM, v24, r3)
+		buffer.writeu32(MEM, v24 + 4, r4)
+		buffer.writeu32(MEM, r0 + -80, v23)
+		buffer.writeu32(MEM, r0 + -76, v24)
+		buffer.writeu32(MEM, r0 + -72, 1)
+		buffer.copy(MEM, r1 + 16, MEM, v6, 48)
+		r2 = r1 + 16
+		while true do
+			r3, r4 = F7(r2)
+			local v45 = if r3 == 0xFFFFFFFF then 0 else 1
+			if v45 ~= 1 then
+				local v60 = if buffer.readu32(MEM, r0 + -32) == 0 then 0 else 1
+				if v60 == 1 then
+					r1 = buffer.readu32(MEM, r0 + -24)
+					r2 = buffer.readu32(MEM, r0 + -32)
+					r3 = buffer.readu32(MEM, r0 + -28)
+					if r3 ~= 0 then
+						rt_dealloc(r1, r3, r2)
+					end
+				end
+				r1 = buffer.readu32(MEM, r0 + -80)
+				r2 = buffer.readu32(MEM, r0 + -76)
+				r3 = buffer.readu32(MEM, r0 + -72)
 				break
 			end
-			rt_dealloc(r4, r6, r5)
-			break
-		end
-		if v10 == 1 then
-			local v13 = math.min(math.max(buffer.readu32(MEM, v6 + 24) + 1, 0), 0xFFFFFFFF)
-			r2 = v13
-			if v13 < 4 then
-				r2 = 4
+			r5 = buffer.readu32(MEM, r0 + -72)
+			if r5 == buffer.readu32(MEM, r0 + -80) then
+				r6 = math.min(math.max(buffer.readu32(MEM, r0 + -40) + 1, 0), 0xFFFFFFFF)
+				r7 = buffer.readu32(MEM, r0 + -72)
+				local v67 = buffer.readu32(MEM, r0 + -80) - r7
+				if v67 < 0 then v67 += 0x100000000 end
+				if v67 < r6 then
+					F36(r1, r7, r6, 4, 8)
+				end
 			end
-			F8(r1 + 64, r2, 0, 4, 8)
-			local v20 = buffer.readu32(MEM, r0 + -16)
-			if v20 > 0x7FFFFFFF then v20 -= 0x100000000 end
-			if v20 == 0 then
-				local v24 = buffer.readu32(MEM, r0 + -8)
-				local v23 = buffer.readu32(MEM, r0 + -12)
-				buffer.writeu32(MEM, v24, r3)
-				buffer.writeu32(MEM, v24 + 4, r4)
-				buffer.writeu32(MEM, r0 + -80, v23)
-				buffer.writeu32(MEM, r0 + -76, v24)
-				buffer.writeu32(MEM, r0 + -72, 1)
-				buffer.copy(MEM, r1 + 16, MEM, v6, 48)
-				r2 = r1 + 16
-				while true do
-					r3, r4 = F7(r2)
-					local v45 = if r3 == 0xFFFFFFFF then 0 else 1
-					if v45 ~= 1 then
-						if v45 ~= 0 then
-							unreachable()
-						end
-						local v60 = if buffer.readu32(MEM, r0 + -32) == 0 then 0 else 1
-						if v60 == 1 then
-							r1 = buffer.readu32(MEM, r0 + -24)
-							r2 = buffer.readu32(MEM, r0 + -32)
-							r3 = buffer.readu32(MEM, r0 + -28)
-							if r3 ~= 0 then
-								rt_dealloc(r1, r3, r2)
-							end
-						elseif v60 ~= 0 then
-							unreachable()
-						end
-						r1 = buffer.readu32(MEM, r0 + -80)
-						r2 = buffer.readu32(MEM, r0 + -76)
-						r3 = buffer.readu32(MEM, r0 + -72)
-						lbl = 1
-						break
-					end
-					r5 = buffer.readu32(MEM, r0 + -72)
-					if r5 == buffer.readu32(MEM, r0 + -80) then
-						r6 = math.min(math.max(buffer.readu32(MEM, r0 + -40) + 1, 0), 0xFFFFFFFF)
-						r7 = buffer.readu32(MEM, r0 + -72)
-						local v67 = buffer.readu32(MEM, r0 + -80) - r7
-						if v67 < 0 then v67 += 0x100000000 end
-						if v67 < r6 then
-							F36(r1, r7, r6, 4, 8)
-						end
-					end
-					local v52 = buffer.readu32(MEM, r0 + -76) + r5 * 8
-					buffer.writeu32(MEM, v52, r3)
-					buffer.writeu32(MEM, v52 + 4, r4)
-					local v54 = r5 + 1
-					if v54 > 0xFFFFFFFF then v54 -= 0x100000000 end
-					buffer.writeu32(MEM, r0 + -72, v54)
-				end
-				if lbl ~= 0 then
-					if lbl == 1 then
-						lbl = 0
-						break
-					end
-				end
-			elseif v20 == 1 then
-				r2 = buffer.readu32(MEM, r0 + -12)
-				r3 = buffer.readu32(MEM, r0 + -8)
-				local v36 = if r2 == 0 then 0 else 1
-				if v36 == 0 then
-					F14(1049500, 35, 1049520)
-					unreachable()
-				end
-				if v36 ~= 1 then
-					unreachable()
-				end
-				r0 = 0
-				r1 = 0
-				r0 = r2
-				r1 = r3
-				r2 = buffer.readu32(MEM, 1053492)
-				if r2 == 0 then
-					r2 = 10
-				else
-					r2 = r2
-				end
-				FN[r2](r0, r1)
-				rt_abort()
-				unreachable()
-			end
+			local v52 = buffer.readu32(MEM, r0 + -76) + r5 * 8
+			buffer.writeu32(MEM, v52, r3)
+			buffer.writeu32(MEM, v52 + 4, r4)
+			local v54 = r5 + 1
+			if v54 > 0xFFFFFFFF then v54 -= 0x100000000 end
+			buffer.writeu32(MEM, r0 + -72, v54)
 		end
-		unreachable()
-	until true
+	end
 	SP = r0
 	return r1, r2, r3
 end
@@ -1374,32 +880,24 @@ function F4(v6: number, v7: number, v8: number)
 				local v26 = buffer.readu32(MEM, r3 + -16)
 				if v26 > 0x7FFFFFFF then v26 -= 0x100000000 end
 				if v26 ~= 0 then
-					if v26 ~= 1 then
-						unreachable()
-					end
 					r2 = buffer.readu32(MEM, r3 + -12)
 					r3 = buffer.readu32(MEM, r3 + -8)
 					local v32 = if r2 == 0 then 0 else 1
 					if v32 == 0 then
 						F14(1049500, 35, 1049520)
-						unreachable()
-					end
-					if v32 ~= 1 then
-						unreachable()
 					end
 					r0 = 0
 					r1 = 0
-					r0 = r2
-					r1 = r3
+					r1 = r2
+					r0 = r3
 					r2 = buffer.readu32(MEM, 1053492)
 					if r2 == 0 then
 						r2 = 10
 					else
 						r2 = r2
 					end
-					FN[r2](r0, r1)
+					FN[r2](r1, r0)
 					rt_abort()
-					unreachable()
 				end
 				local v29 = buffer.readu32(MEM, r3 + -12)
 				local v30 = buffer.readu32(MEM, r3 + -8)
@@ -1442,14 +940,14 @@ FT[5] = function(v0: number, v1: number)
 	r3 = SP
 	r2 = r3 - 16
 	SP = r2
-	r4 = v2
-	r5 = v2 + v3 * 8
+	r5 = v2
+	r4 = v2 + v3 * 8
 	while true do
-		r6 = r4
-		if r4 == r5 then
+		r6 = r5
+		if r5 == r4 then
 			r7 = 0
 		else
-			r4 = r6 + 8
+			r5 = r6 + 8
 			r7 = r6
 		end
 		r6 = r7
@@ -1462,18 +960,12 @@ FT[5] = function(v0: number, v1: number)
 				local v31 = FN[buffer.readu32(MEM, buffer.readu32(MEM, r1 + 4) + 12)](buffer.readu32(MEM, r1), 1049632, 1)
 				r1 = v31
 			else
-				if v25 ~= 1 then
-					unreachable()
-				end
 				r1 = 1
 			end
 			buffer.writeu8(MEM, r0 + -4, r1)
 			local v27 = buffer.readu8(MEM, r0 + -4)
 			SP = r0
 			return v27
-		end
-		if v16 ~= 1 then
-			unreachable()
 		end
 		buffer.writeu32(MEM, r3 + -8, r6)
 		F39(r1, r2 + 8, 1049636)
@@ -1510,17 +1002,17 @@ function F6(v2: number, v3: number)
 	local v17 = buffer.readu32(MEM, v3)
 	SP = fp_18
 	buffer.writeu32(MEM, v19 + -8, v17)
-	F52(fp_0 + 8, fp_18, 4)
+	F51(fp_0 + 8, fp_18, 4)
 	SP = v19
 	local v21 = SP
 	local fp_20 = v21 - 32
 	SP = fp_20
 	local v28 = buffer.readu32(MEM, v1 + -40)
 	local v29 = buffer.readu32(MEM, v1 + -36)
-	local v25 = buffer.readu32(MEM, v1 + -52)
-	local v24 = buffer.readu32(MEM, v1 + -56)
 	local v23 = buffer.readu32(MEM, v1 + -60)
+	local v25 = buffer.readu32(MEM, v1 + -52)
 	local v27 = buffer.readu32(MEM, v1 + -44)
+	local v24 = buffer.readu32(MEM, v1 + -56)
 	local v26 = buffer.readu32(MEM, v1 + -48)
 	buffer.writeu32(MEM, v21 + -32, buffer.readu32(MEM, v1 + -64))
 	buffer.writeu32(MEM, v21 + -28, v23)
@@ -1584,20 +1076,14 @@ function F7(v0: number)
 					if v8 == 0 then
 						break
 					end
-					if v8 ~= 1 then
-						unreachable()
-					end
 					r0 = buffer.readu32(MEM, r2 + -4)
 					r1 = buffer.readu32(MEM, r2 + -8)
 					lbl = 1
 					break
 				end
-				if v20 ~= 0 then
-					unreachable()
-				end
 				local v21 = buffer.readu32(MEM, v0 + 8)
-				local v23 = buffer.readu32(MEM, v21 + 4)
 				local v22 = buffer.readu32(MEM, v21)
+				local v23 = buffer.readu32(MEM, v21 + 4)
 				buffer.fill(MEM, r2, 128, 8)
 				local v29 = bit32.bxor(bit32.band(v23, buffer.readu32(MEM, r1 + -4)), 2155905152)
 				buffer.writeu32(MEM, v0, bit32.bxor(bit32.band(v22, buffer.readu32(MEM, r1 + -8)), 2155905152))
@@ -1620,7 +1106,6 @@ end
 -- alloc::raw_vec::RawVecInner::try_allocate_in
 function F8(ret_0: number, v2: number, v3: number, v4: number, v5: number)
 	local r0: number, r1: number = 0, 0
-	local lbl = 0
 	repeat
 		r0 = imul32(v5, v2)
 		if r0 == v5 * v2 then
@@ -1631,62 +1116,42 @@ function F8(ret_0: number, v2: number, v3: number, v4: number, v5: number)
 					buffer.writeu32(MEM, ret_0, 0)
 					break
 				end
-				repeat
-					if v3 == 0 then
-						if r0 == 0 then
-							r1 = v4
-						else
-							r1 = rt_alloc(r0, v4)
-							if r1 == 0 then
-								r1 = 0
-							else
-								r1 = r1
-							end
-						end
-						r1 = r1
+				if v3 == 0 then
+					if r0 == 0 then
+						r1 = v4
 					else
-						if v3 ~= 1 then
-							break
-						end
-						if r0 == 0 then
-							r1 = v4
+						r1 = rt_alloc(r0, v4)
+						if r1 == 0 then
+							r1 = 0
 						else
-							r1 = rt_alloc_zeroed(r0, v4)
-							if r1 == 0 then
-								r1 = 0
-							else
-								r1 = r1
-							end
+							r1 = r1
 						end
-						r1 = r1
 					end
-					local v10 = if r1 == 0 then 1 else 0
-					if v10 == 0 then
-						buffer.writeu32(MEM, ret_0 + 4, v2)
-						buffer.writeu32(MEM, ret_0 + 8, r1)
-						buffer.writeu32(MEM, ret_0, 0)
-						lbl = 1
-						break
+					r1 = r1
+				else
+					if r0 == 0 then
+						r1 = v4
+					else
+						r1 = rt_alloc_zeroed(r0, v4)
+						if r1 == 0 then
+							r1 = 0
+						else
+							r1 = r1
+						end
 					end
-					if v10 == 1 then
-						buffer.writeu32(MEM, ret_0 + 4, v4)
-						buffer.writeu32(MEM, ret_0 + 8, r0)
-						buffer.writeu32(MEM, ret_0, 1)
-						lbl = 2
-						break
-					end
-				until true
-				if lbl ~= 0 then
-					if lbl == 1 then
-						lbl = 0
-						break
-					end
-					if lbl == 2 then
-						lbl = 0
-						break
-					end
+					r1 = r1
 				end
-				unreachable()
+				local v10 = if r1 == 0 then 1 else 0
+				if v10 == 0 then
+					buffer.writeu32(MEM, ret_0 + 4, v2)
+					buffer.writeu32(MEM, ret_0 + 8, r1)
+					buffer.writeu32(MEM, ret_0, 0)
+					break
+				end
+				buffer.writeu32(MEM, ret_0 + 4, v4)
+				buffer.writeu32(MEM, ret_0 + 8, r0)
+				buffer.writeu32(MEM, ret_0, 1)
+				break
 			end
 		end
 		buffer.writeu32(MEM, ret_0 + 4, 0)
@@ -1713,8 +1178,8 @@ function F9(v2: number, v3: number, v4: number)
 		r1 = r2
 	end
 	if r1 == -1 then
-		r4 = buffer.readu32(MEM, v3)
-		r5 = buffer.readu32(MEM, v3 + 4)
+		r5 = buffer.readu32(MEM, v3)
+		r4 = buffer.readu32(MEM, v3 + 4)
 		r1 = v3
 		while true do
 			local v11 = buffer.readu32(MEM, r0 + 4)
@@ -1725,10 +1190,10 @@ function F9(v2: number, v3: number, v4: number)
 				local v9 = r0 + -8
 				r0 = v9
 				local v29 = buffer.readu32(MEM, v9 + 4)
-				local v33 = if v29 < r5 then -1 else if r5 < v29 then 1 else 0
+				local v33 = if v29 < r4 then -1 else if r4 < v29 then 1 else 0
 				r2 = v33
 				local v34 = buffer.readu32(MEM, v9)
-				r3 = if r4 < v34 then -1 else if v34 < r4 then 1 else 0
+				r3 = if r5 < v34 then -1 else if v34 < r5 then 1 else 0
 				if v33 == 0 then
 					r2 = r3
 				end
@@ -1736,8 +1201,8 @@ function F9(v2: number, v3: number, v4: number)
 					continue
 				end
 			end
-			buffer.writeu32(MEM, r1, r4)
-			buffer.writeu32(MEM, r1 + 4, r5)
+			buffer.writeu32(MEM, r1, r5)
+			buffer.writeu32(MEM, r1 + 4, r4)
 			break
 		end
 	end
@@ -1779,10 +1244,6 @@ function F10(v10: number, v11: number, v12: number, v13: number, v14: boolean, v
 				local v100 = if r4 == 0 then 0 else 1
 				if v100 == 0 then
 					F14(1049880, 93, 1049536)
-					unreachable()
-				end
-				if v100 ~= 1 then
-					unreachable()
 				end
 				local v103 = 31 - bit32.countlz(r4)
 				if v103 < 0 then v103 += 0x100000000 end
@@ -1816,7 +1277,6 @@ function F10(v10: number, v11: number, v12: number, v13: number, v14: boolean, v
 							buffer.writeu32(MEM, r1 + -184, r0 + 4)
 							buffer.writeu32(MEM, r1 + -180, 3)
 							F14(1048719, r0 + 32, 1049292)
-							unreachable()
 						end
 						if v11 < v11 then
 							buffer.writeu32(MEM, r1 + -216, v11)
@@ -1826,7 +1286,6 @@ function F10(v10: number, v11: number, v12: number, v13: number, v14: boolean, v
 							buffer.writeu32(MEM, r1 + -136, r0 + 12)
 							buffer.writeu32(MEM, r1 + -132, 3)
 							F14(1048776, r0 + 80, 1049292)
-							unreachable()
 						end
 						if v11 < r9 then
 							buffer.writeu32(MEM, r1 + -208, r9)
@@ -1836,7 +1295,6 @@ function F10(v10: number, v11: number, v12: number, v13: number, v14: boolean, v
 							buffer.writeu32(MEM, r1 + -88, r0 + 20)
 							buffer.writeu32(MEM, r1 + -84, 3)
 							F14(1048831, r0 + 128, 1049292)
-							unreachable()
 						end
 						buffer.writeu32(MEM, r1 + -200, v11)
 						buffer.writeu32(MEM, r1 + -196, v11)
@@ -1845,7 +1303,6 @@ function F10(v10: number, v11: number, v12: number, v13: number, v14: boolean, v
 						buffer.writeu32(MEM, r1 + -40, r0 + 28)
 						buffer.writeu32(MEM, r1 + -36, 3)
 						F14(1048776, r0 + 176, 1049292)
-						unreachable()
 					end
 					local v92 = F18(v10 + r9 * 8, v11 - r9, v12, v13, r4, v14, v15)
 					r9 = v92
@@ -1896,10 +1353,6 @@ function F10(v10: number, v11: number, v12: number, v13: number, v14: boolean, v
 					local v117 = if r1 == 0 then 0 else 1
 					if v117 == 0 then
 						F14(1049880, 93, 1049552)
-						unreachable()
-					end
-					if v117 ~= 1 then
-						unreachable()
 					end
 					local v120 = 31 - bit32.countlz(r1)
 					if v120 < 0 then v120 += 0x100000000 end
@@ -1929,9 +1382,7 @@ end
 -- std::io::stdout
 FT[11] = function()
 	local r0: number, r1: number, r2: number, r3: number, r4: number = 0, 0, 0, 0, 0
-	if buffer.readu8(MEM, 1049352) == 3 then
-		r0 = 1049312
-	else
+	if buffer.readu8(MEM, 1049352) ~= 3 then
 		r1 = SP
 		r0 = SP
 		r2 = r0 - 16
@@ -1949,23 +1400,16 @@ FT[11] = function()
 				buffer.writeu8(MEM, 1049352, 2)
 				buffer.writeu8(MEM, r3 + -16, if r4 == 1 then 1 else 0)
 				buffer.writeu8(MEM, r3 + -15, 3)
-				F57(r1, r2)
+				F56(r1, r2)
 				buffer.writeu8(MEM, 1049352, buffer.readu8(MEM, r3 + -15))
-			else
-				if r4 == 2 then
-					F14(1053085, 113, 1052056)
-					unreachable()
-				end
-				if r4 ~= 3 then
-					unreachable()
-				end
+			elseif r4 == 2 then
+				F14(1053085, 113, 1052056)
 			end
 			SP = r3
 		end
 		SP = r0
-		r0 = 1049312
 	end
-	return r0
+	return 1049312
 end
 
 -- std::io::stdio::print_to::<std::io::Stdout>
@@ -1995,9 +1439,6 @@ function F12(v2: number, v3: number, v4: number, v5: number, v6: number)
 			if v29 == 0 then
 				r3 = 0
 			else
-				if v29 ~= 1 then
-					unreachable()
-				end
 				F49(r3, r4, r5)
 				r3 = 1
 			end
@@ -2007,29 +1448,18 @@ function F12(v2: number, v3: number, v4: number, v5: number, v6: number)
 		if (if r3 == 2 then 1 else 0) == (if buffer.readu8(MEM, 1049660) == 2 then 1 else 0) then
 			local v38 = if r4 == 2 then 1 else 0
 			if v38 == 0 then
-				repeat
-					if r4 == 0 then
-						r6 = buffer.readu8(MEM, 1049660) == 0
-						break
+				if r4 == 0 then
+					r6 = buffer.readu8(MEM, 1049660) == 0
+				else
+					local v40 = buffer.readu8(MEM, 1049660)
+					if v40 == 0 then
+						r6 = false
+					else
+						r6 = true
 					end
-					if r4 == 1 then
-						local v40 = buffer.readu8(MEM, 1049660)
-						if v40 == 0 then
-							r6 = false
-							break
-						end
-						if v40 == 1 then
-							r6 = true
-							break
-						end
-					end
-					unreachable()
-				until true
+				end
 				r6 = r6
 			else
-				if v38 ~= 1 then
-					unreachable()
-				end
 				r6 = true
 			end
 		else
@@ -2057,10 +1487,6 @@ function F12(v2: number, v3: number, v4: number, v5: number, v6: number)
 			buffer.writeu32(MEM, r1 + -44, r0 + 20)
 			buffer.writeu32(MEM, r1 + -40, 6)
 			F14(1049360, r0 + 28, 1049388)
-			unreachable()
-		end
-		if v12 ~= 0 then
-			unreachable()
 		end
 	end
 	SP = r1
@@ -2095,7 +1521,6 @@ function F14(v2: number, v3: number, v4: number)
 	buffer.writeu8(MEM, v1 + -8, 1)
 	buffer.writeu8(MEM, v1 + -7, 0)
 	F23(fp_0 + 8)
-	unreachable()
 end
 
 -- <std::thread::AccessError as std::fmt::Debug>::fmt
@@ -2107,7 +1532,6 @@ end
 -- core::str::validations::next_code_point::<'_, std::slice::Iter<'_, u8>>
 function F16(v3: number)
 	local r0: number, r1: number, r2: number, r3: number, r4: number = 0, 0, 0, 0, 0
-	local lbl = 0
 	r0 = buffer.readu32(MEM, v3)
 	if r0 == buffer.readu32(MEM, v3 + 4) then
 		r1 = 0
@@ -2115,130 +1539,94 @@ function F16(v3: number)
 		buffer.writeu32(MEM, v3, r0 + 1)
 		r1 = r0
 	end
-	repeat
-		repeat
-			r0 = r1
-			local v6 = if r1 == 0 then 0 else 1
-			if v6 == 0 then
-				r0 = 0
-				r1 = 0
-				lbl = 1
-				break
+	r0 = r1
+	local v6 = if r1 == 0 then 0 else 1
+	if v6 == 0 then
+		r0 = 0
+		r1 = 0
+	else
+		r1 = buffer.readu8(MEM, r0)
+		if r1 < 128 then
+			r1 = r1
+			r0 = 1
+		else
+			r0 = bit32.band(r1, 31)
+			r2 = buffer.readu32(MEM, v3)
+			if r2 == buffer.readu32(MEM, v3 + 4) then
+				r3 = 0
+			else
+				buffer.writeu32(MEM, v3, r2 + 1)
+				r3 = r2
 			end
-			if v6 == 1 then
-				r1 = buffer.readu8(MEM, r0)
-				if r1 < 128 then
-					r1 = r1
-					r0 = 1
-					lbl = 2
-					break
-				end
-				r0 = bit32.band(r1, 31)
-				r2 = buffer.readu32(MEM, v3)
-				if r2 == buffer.readu32(MEM, v3 + 4) then
-					r3 = 0
+			r2 = r3
+			local v10 = if r3 == 0 then 0 else 1
+			if v10 == 0 then
+				local v60 = SP
+				local fp_59 = v60 - 24
+				SP = fp_59
+				buffer.writeu32(MEM, v60 + -24, 1049681)
+				buffer.writeu32(MEM, v60 + -20, 399)
+				buffer.writeu32(MEM, v60 + -16, fp_59)
+				buffer.writeu32(MEM, v60 + -12, 1049428)
+				buffer.writeu8(MEM, v60 + -8, 0)
+				buffer.writeu8(MEM, v60 + -7, 0)
+				F23(fp_59 + 8)
+			end
+			r2 = buffer.readu8(MEM, r2)
+			r3 = bit32.bor(bit32.lshift(r0, 6), bit32.band(r2, 63))
+			if 224 <= r1 then
+				r3 = buffer.readu32(MEM, v3)
+				if r3 == buffer.readu32(MEM, v3 + 4) then
+					r4 = 0
 				else
-					buffer.writeu32(MEM, v3, r2 + 1)
-					r3 = r2
+					buffer.writeu32(MEM, v3, r3 + 1)
+					r4 = r3
 				end
-				r2 = r3
-				local v10 = if r3 == 0 then 0 else 1
-				if v10 == 0 then
-					local v60 = SP
-					local fp_59 = v60 - 24
-					SP = fp_59
-					buffer.writeu32(MEM, v60 + -24, 1049681)
-					buffer.writeu32(MEM, v60 + -20, 399)
-					buffer.writeu32(MEM, v60 + -16, fp_59)
-					buffer.writeu32(MEM, v60 + -12, 1049428)
-					buffer.writeu8(MEM, v60 + -8, 0)
-					buffer.writeu8(MEM, v60 + -7, 0)
-					F23(fp_59 + 8)
-					unreachable()
+				r3 = r4
+				local v13 = if r4 == 0 then 0 else 1
+				if v13 == 0 then
+					local v63 = SP
+					local fp_62 = v63 - 24
+					SP = fp_62
+					buffer.writeu32(MEM, v63 + -24, 1049681)
+					buffer.writeu32(MEM, v63 + -20, 399)
+					buffer.writeu32(MEM, v63 + -16, fp_62)
+					buffer.writeu32(MEM, v63 + -12, 1049444)
+					buffer.writeu8(MEM, v63 + -8, 0)
+					buffer.writeu8(MEM, v63 + -7, 0)
+					F23(fp_62 + 8)
 				end
-				if v10 == 1 then
-					r2 = buffer.readu8(MEM, r2)
-					r3 = bit32.bor(bit32.lshift(r0, 6), bit32.band(r2, 63))
-					if 224 <= r1 then
-						r3 = buffer.readu32(MEM, v3)
-						if r3 == buffer.readu32(MEM, v3 + 4) then
-							r4 = 0
-						else
-							buffer.writeu32(MEM, v3, r3 + 1)
-							r4 = r3
-						end
-						r3 = r4
-						local v13 = if r4 == 0 then 0 else 1
-						if v13 == 0 then
-							local v63 = SP
-							local fp_62 = v63 - 24
-							SP = fp_62
-							buffer.writeu32(MEM, v63 + -24, 1049681)
-							buffer.writeu32(MEM, v63 + -20, 399)
-							buffer.writeu32(MEM, v63 + -16, fp_62)
-							buffer.writeu32(MEM, v63 + -12, 1049444)
-							buffer.writeu8(MEM, v63 + -8, 0)
-							buffer.writeu8(MEM, v63 + -7, 0)
-							F23(fp_62 + 8)
-							unreachable()
-						end
-						if v13 ~= 1 then
-							break
-						end
-						r2 = bit32.bor(bit32.lshift(bit32.band(r2, 63), 6), bit32.band(buffer.readu8(MEM, r3), 63))
-						r3 = bit32.bor(bit32.lshift(r0, 12), r2)
-						if 240 <= r1 then
-							r1 = buffer.readu32(MEM, v3)
-							if r1 == buffer.readu32(MEM, v3 + 4) then
-								r3 = 0
-							else
-								buffer.writeu32(MEM, v3, r1 + 1)
-								r3 = r1
-							end
-							r1 = r3
-							local v16 = if r3 == 0 then 0 else 1
-							if v16 == 0 then
-								local v66 = SP
-								local fp_65 = v66 - 24
-								SP = fp_65
-								buffer.writeu32(MEM, v66 + -24, 1049681)
-								buffer.writeu32(MEM, v66 + -20, 399)
-								buffer.writeu32(MEM, v66 + -16, fp_65)
-								buffer.writeu32(MEM, v66 + -12, 1049460)
-								buffer.writeu8(MEM, v66 + -8, 0)
-								buffer.writeu8(MEM, v66 + -7, 0)
-								F23(fp_65 + 8)
-								unreachable()
-							end
-							if v16 ~= 1 then
-								break
-							end
-							r3 = bit32.bor(bit32.lshift(bit32.band(r0, 7), 18), bit32.bor(bit32.lshift(r2, 6), bit32.band(buffer.readu8(MEM, r1), 63)))
-						end
+				r2 = bit32.bor(bit32.lshift(bit32.band(r2, 63), 6), bit32.band(buffer.readu8(MEM, r3), 63))
+				r3 = bit32.bor(bit32.lshift(r0, 12), r2)
+				if 240 <= r1 then
+					r1 = buffer.readu32(MEM, v3)
+					if r1 == buffer.readu32(MEM, v3 + 4) then
+						r3 = 0
+					else
+						buffer.writeu32(MEM, v3, r1 + 1)
+						r3 = r1
 					end
 					r1 = r3
-					r0 = 1
-					lbl = 3
-					break
+					local v16 = if r3 == 0 then 0 else 1
+					if v16 == 0 then
+						local v66 = SP
+						local fp_65 = v66 - 24
+						SP = fp_65
+						buffer.writeu32(MEM, v66 + -24, 1049681)
+						buffer.writeu32(MEM, v66 + -20, 399)
+						buffer.writeu32(MEM, v66 + -16, fp_65)
+						buffer.writeu32(MEM, v66 + -12, 1049460)
+						buffer.writeu8(MEM, v66 + -8, 0)
+						buffer.writeu8(MEM, v66 + -7, 0)
+						F23(fp_65 + 8)
+					end
+					r3 = bit32.bor(bit32.lshift(bit32.band(r0, 7), 18), bit32.bor(bit32.lshift(r2, 6), bit32.band(buffer.readu8(MEM, r1), 63)))
 				end
 			end
-		until true
-		if lbl ~= 0 then
-			if lbl == 1 then
-				lbl = 0
-				break
-			end
-			if lbl == 2 then
-				lbl = 0
-				break
-			end
-			if lbl == 3 then
-				lbl = 0
-				break
-			end
+			r1 = r3
+			r0 = 1
 		end
-		unreachable()
-	until true
+	end
 	return r0, r1
 end
 
@@ -2266,9 +1654,6 @@ function F17(v0: number, v1: number, v2: number)
 			r4 = bit32.band(bit32.bor(r1 + v31 // 8, 0), buffer.readu32(MEM, v0 + 4))
 			r3 = 1
 		else
-			if v30 ~= 0 then
-				unreachable()
-			end
 			r3 = 0
 			r4 = 0
 		end
@@ -2292,9 +1677,6 @@ function F17(v0: number, v1: number, v2: number)
 					local v59 = ctz64(r1, r2)
 					r1 = v59 // 8
 				else
-					if v58 ~= 0 then
-						unreachable()
-					end
 					r1 = 0
 				end
 				r3 = r1
@@ -2334,7 +1716,6 @@ function F18(v3: number, v4: number, v5: number, v6: number, v7: number, v8: boo
 							buffer.writeu32(MEM, r3 + -184, r2 + 4)
 							buffer.writeu32(MEM, r3 + -180, 3)
 							F14(1048719, r2 + 32, 1049568)
-							unreachable()
 						end
 						if r4 < r0 then
 							buffer.writeu32(MEM, r3 + -216, r0)
@@ -2344,7 +1725,6 @@ function F18(v3: number, v4: number, v5: number, v6: number, v7: number, v8: boo
 							buffer.writeu32(MEM, r3 + -136, r2 + 12)
 							buffer.writeu32(MEM, r3 + -132, 3)
 							F14(1048776, r2 + 80, 1049568)
-							unreachable()
 						end
 						if r0 < 0 then
 							buffer.writeu32(MEM, r3 + -208, 0)
@@ -2354,7 +1734,6 @@ function F18(v3: number, v4: number, v5: number, v6: number, v7: number, v8: boo
 							buffer.writeu32(MEM, r3 + -88, r2 + 20)
 							buffer.writeu32(MEM, r3 + -84, 3)
 							F14(1048831, r2 + 128, 1049568)
-							unreachable()
 						end
 						buffer.writeu32(MEM, r3 + -200, r0)
 						buffer.writeu32(MEM, r3 + -196, r4)
@@ -2363,7 +1742,6 @@ function F18(v3: number, v4: number, v5: number, v6: number, v7: number, v8: boo
 						buffer.writeu32(MEM, r3 + -40, r2 + 28)
 						buffer.writeu32(MEM, r3 + -36, 3)
 						F14(1048776, r2 + 176, 1049568)
-						unreachable()
 					end
 					r1 = r0 // 2
 					local v24 = r1
@@ -2371,11 +1749,9 @@ function F18(v3: number, v4: number, v5: number, v6: number, v7: number, v8: boo
 					r2 = v3 + r0 * 8 + (0 - v24) * 8
 					if not (r1 <= r1) then
 						F14(1052028, 19, 1049960)
-						unreachable()
 					end
 					if not (r1 <= r1) then
 						F14(1052028, 19, 1049976)
-						unreachable()
 					end
 					r3 = 0
 					while r3 < r1 do
@@ -2422,7 +1798,6 @@ function F18(v3: number, v4: number, v5: number, v6: number, v7: number, v8: boo
 				buffer.writeu32(MEM, r3 + -184, r2 + 4)
 				buffer.writeu32(MEM, r3 + -180, 3)
 				F14(1048719, r2 + 32, 1049584)
-				unreachable()
 			end
 			if r4 < r0 then
 				buffer.writeu32(MEM, r3 + -216, r0)
@@ -2432,7 +1807,6 @@ function F18(v3: number, v4: number, v5: number, v6: number, v7: number, v8: boo
 				buffer.writeu32(MEM, r3 + -136, r2 + 12)
 				buffer.writeu32(MEM, r3 + -132, 3)
 				F14(1048776, r2 + 80, 1049584)
-				unreachable()
 			end
 			if r0 < 0 then
 				buffer.writeu32(MEM, r3 + -208, 0)
@@ -2442,7 +1816,6 @@ function F18(v3: number, v4: number, v5: number, v6: number, v7: number, v8: boo
 				buffer.writeu32(MEM, r3 + -88, r2 + 20)
 				buffer.writeu32(MEM, r3 + -84, 3)
 				F14(1048831, r2 + 128, 1049584)
-				unreachable()
 			end
 			buffer.writeu32(MEM, r3 + -200, r0)
 			buffer.writeu32(MEM, r3 + -196, r4)
@@ -2451,7 +1824,6 @@ function F18(v3: number, v4: number, v5: number, v6: number, v7: number, v8: boo
 			buffer.writeu32(MEM, r3 + -40, r2 + 28)
 			buffer.writeu32(MEM, r3 + -36, 3)
 			F14(1048776, r2 + 176, 1049584)
-			unreachable()
 		end
 		if not (r1 < v7) then
 			r1 = v7
@@ -2464,6 +1836,7 @@ end
 -- core::slice::sort::stable::drift::logical_merge::<(char, usize), {closure@std::slice::<impl [(char, usize)]>::sort_by<{closure@src/lib.rs:20:15: 20:21}>::{closure#0}}>
 function F19(v1: number, v2: number, v3: number, v4: number, v5: number, v6: number, v7: number)
 	local r0: number, r1: number, r2: number = 0, 0, 0
+	local lbl = 0
 	repeat
 		if v2 <= v4 then
 			if bit32.band(v5, 1) ~= 1 then
@@ -2474,134 +1847,136 @@ function F19(v1: number, v2: number, v3: number, v4: number, v5: number, v6: num
 			end
 		end
 		repeat
-			if bit32.band(v5, 1) ~= 1 then
-				r0 = bit32.rshift(v5, 1)
-				if not (r0 < 0) then
-					if r0 <= v2 then
-						r1 = bit32.bor(r0, 1)
-						local v31 = if r1 == 0 then 0 else 1
-						if v31 == 0 then
-							F14(1049880, 93, 1049552)
-							unreachable()
+			repeat
+				if bit32.band(v5, 1) ~= 1 then
+					r0 = bit32.rshift(v5, 1)
+					if not (r0 < 0) then
+						if r0 <= v2 then
+							r1 = bit32.bor(r0, 1)
+							local v31 = if r1 == 0 then 0 else 1
+							if v31 == 0 then
+								lbl = 1
+								break
+							end
+							local v34 = 31 - bit32.countlz(r1)
+							if v34 < 0 then v34 += 0x100000000 end
+							local v36 = 2 * v34
+							if v36 > 0xFFFFFFFF then v36 -= 0x100000000 end
+							F24(v1, r0, v3, v4, v36, 0, v7)
+							break
 						end
-						if v31 ~= 1 then
-							unreachable()
-						end
-						local v34 = 31 - bit32.countlz(r1)
-						if v34 < 0 then v34 += 0x100000000 end
-						local v36 = 2 * v34
-						if v36 > 0xFFFFFFFF then v36 -= 0x100000000 end
-						F24(v1, r0, v3, v4, v36, 0, v7)
-						break
 					end
+					r2 = SP
+					r1 = r2 - 224
+					SP = r1
+					if v2 < 0 then
+						buffer.writeu32(MEM, r2 + -224, 0)
+						buffer.writeu32(MEM, r2 + -220, v2)
+						buffer.writeu32(MEM, r2 + -192, r1)
+						buffer.writeu32(MEM, r2 + -188, 3)
+						buffer.writeu32(MEM, r2 + -184, r1 + 4)
+						buffer.writeu32(MEM, r2 + -180, 3)
+						F14(1048719, r1 + 32, 1049600)
+					end
+					if v2 < r0 then
+						buffer.writeu32(MEM, r2 + -216, r0)
+						buffer.writeu32(MEM, r2 + -212, v2)
+						buffer.writeu32(MEM, r2 + -144, r1 + 8)
+						buffer.writeu32(MEM, r2 + -140, 3)
+						buffer.writeu32(MEM, r2 + -136, r1 + 12)
+						buffer.writeu32(MEM, r2 + -132, 3)
+						F14(1048776, r1 + 80, 1049600)
+					end
+					if r0 < 0 then
+						buffer.writeu32(MEM, r2 + -208, 0)
+						buffer.writeu32(MEM, r2 + -204, r0)
+						buffer.writeu32(MEM, r2 + -96, r1 + 16)
+						buffer.writeu32(MEM, r2 + -92, 3)
+						buffer.writeu32(MEM, r2 + -88, r1 + 20)
+						buffer.writeu32(MEM, r2 + -84, 3)
+						F14(1048831, r1 + 128, 1049600)
+					end
+					buffer.writeu32(MEM, r2 + -200, r0)
+					buffer.writeu32(MEM, r2 + -196, v2)
+					buffer.writeu32(MEM, r2 + -48, r1 + 24)
+					buffer.writeu32(MEM, r2 + -44, 3)
+					buffer.writeu32(MEM, r2 + -40, r1 + 28)
+					buffer.writeu32(MEM, r2 + -36, 3)
+					F14(1048776, r1 + 176, 1049600)
 				end
-				r2 = SP
-				r1 = r2 - 224
-				SP = r1
-				if v2 < 0 then
-					buffer.writeu32(MEM, r2 + -224, 0)
-					buffer.writeu32(MEM, r2 + -220, v2)
-					buffer.writeu32(MEM, r2 + -192, r1)
-					buffer.writeu32(MEM, r2 + -188, 3)
-					buffer.writeu32(MEM, r2 + -184, r1 + 4)
-					buffer.writeu32(MEM, r2 + -180, 3)
-					F14(1048719, r1 + 32, 1049600)
-					unreachable()
+			until true
+			if lbl ~= 0 then
+				if lbl == 1 then
+					lbl = 0
+					break
 				end
-				if v2 < r0 then
-					buffer.writeu32(MEM, r2 + -216, r0)
-					buffer.writeu32(MEM, r2 + -212, v2)
-					buffer.writeu32(MEM, r2 + -144, r1 + 8)
-					buffer.writeu32(MEM, r2 + -140, 3)
-					buffer.writeu32(MEM, r2 + -136, r1 + 12)
-					buffer.writeu32(MEM, r2 + -132, 3)
-					F14(1048776, r1 + 80, 1049600)
-					unreachable()
-				end
-				if r0 < 0 then
-					buffer.writeu32(MEM, r2 + -208, 0)
-					buffer.writeu32(MEM, r2 + -204, r0)
-					buffer.writeu32(MEM, r2 + -96, r1 + 16)
-					buffer.writeu32(MEM, r2 + -92, 3)
-					buffer.writeu32(MEM, r2 + -88, r1 + 20)
-					buffer.writeu32(MEM, r2 + -84, 3)
-					F14(1048831, r1 + 128, 1049600)
-					unreachable()
-				end
-				buffer.writeu32(MEM, r2 + -200, r0)
-				buffer.writeu32(MEM, r2 + -196, v2)
-				buffer.writeu32(MEM, r2 + -48, r1 + 24)
-				buffer.writeu32(MEM, r2 + -44, 3)
-				buffer.writeu32(MEM, r2 + -40, r1 + 28)
-				buffer.writeu32(MEM, r2 + -36, 3)
-				F14(1048776, r1 + 176, 1049600)
-				unreachable()
 			end
+			if bit32.band(v6, 1) ~= 1 then
+				r0 = bit32.rshift(v5, 1)
+				if v2 < r0 then
+					r2 = SP
+					r1 = r2 - 224
+					SP = r1
+					if v2 < r0 then
+						buffer.writeu32(MEM, r2 + -224, r0)
+						buffer.writeu32(MEM, r2 + -220, v2)
+						buffer.writeu32(MEM, r2 + -192, r1)
+						buffer.writeu32(MEM, r2 + -188, 3)
+						buffer.writeu32(MEM, r2 + -184, r1 + 4)
+						buffer.writeu32(MEM, r2 + -180, 3)
+						F14(1048719, r1 + 32, 1049616)
+					end
+					if v2 < v2 then
+						buffer.writeu32(MEM, r2 + -216, v2)
+						buffer.writeu32(MEM, r2 + -212, v2)
+						buffer.writeu32(MEM, r2 + -144, r1 + 8)
+						buffer.writeu32(MEM, r2 + -140, 3)
+						buffer.writeu32(MEM, r2 + -136, r1 + 12)
+						buffer.writeu32(MEM, r2 + -132, 3)
+						F14(1048776, r1 + 80, 1049616)
+					end
+					if v2 < r0 then
+						buffer.writeu32(MEM, r2 + -208, r0)
+						buffer.writeu32(MEM, r2 + -204, v2)
+						buffer.writeu32(MEM, r2 + -96, r1 + 16)
+						buffer.writeu32(MEM, r2 + -92, 3)
+						buffer.writeu32(MEM, r2 + -88, r1 + 20)
+						buffer.writeu32(MEM, r2 + -84, 3)
+						F14(1048831, r1 + 128, 1049616)
+					end
+					buffer.writeu32(MEM, r2 + -200, v2)
+					buffer.writeu32(MEM, r2 + -196, v2)
+					buffer.writeu32(MEM, r2 + -48, r1 + 24)
+					buffer.writeu32(MEM, r2 + -44, 3)
+					buffer.writeu32(MEM, r2 + -40, r1 + 28)
+					buffer.writeu32(MEM, r2 + -36, 3)
+					F14(1048776, r1 + 176, 1049616)
+				end
+				r1 = v2 - r0
+				r0 = v1 + r0 * 8
+				r2 = bit32.bor(r1, 1)
+				local v71 = if r2 == 0 then 0 else 1
+				if v71 == 0 then
+					break
+				end
+				local v74 = 31 - bit32.countlz(r2)
+				if v74 < 0 then v74 += 0x100000000 end
+				local v76 = 2 * v74
+				if v76 > 0xFFFFFFFF then v76 -= 0x100000000 end
+				F24(r0, r1, v3, v4, v76, 0, v7)
+			end
+			F26(v1, v2, v3, v4, bit32.rshift(v5, 1), v7)
+			r0 = bit32.bor(bit32.lshift(v2, 1), 1)
+			lbl = 2
+			break
 		until true
-		if bit32.band(v6, 1) ~= 1 then
-			r0 = bit32.rshift(v5, 1)
-			if v2 < r0 then
-				r2 = SP
-				r1 = r2 - 224
-				SP = r1
-				if v2 < r0 then
-					buffer.writeu32(MEM, r2 + -224, r0)
-					buffer.writeu32(MEM, r2 + -220, v2)
-					buffer.writeu32(MEM, r2 + -192, r1)
-					buffer.writeu32(MEM, r2 + -188, 3)
-					buffer.writeu32(MEM, r2 + -184, r1 + 4)
-					buffer.writeu32(MEM, r2 + -180, 3)
-					F14(1048719, r1 + 32, 1049616)
-					unreachable()
-				end
-				if v2 < v2 then
-					buffer.writeu32(MEM, r2 + -216, v2)
-					buffer.writeu32(MEM, r2 + -212, v2)
-					buffer.writeu32(MEM, r2 + -144, r1 + 8)
-					buffer.writeu32(MEM, r2 + -140, 3)
-					buffer.writeu32(MEM, r2 + -136, r1 + 12)
-					buffer.writeu32(MEM, r2 + -132, 3)
-					F14(1048776, r1 + 80, 1049616)
-					unreachable()
-				end
-				if v2 < r0 then
-					buffer.writeu32(MEM, r2 + -208, r0)
-					buffer.writeu32(MEM, r2 + -204, v2)
-					buffer.writeu32(MEM, r2 + -96, r1 + 16)
-					buffer.writeu32(MEM, r2 + -92, 3)
-					buffer.writeu32(MEM, r2 + -88, r1 + 20)
-					buffer.writeu32(MEM, r2 + -84, 3)
-					F14(1048831, r1 + 128, 1049616)
-					unreachable()
-				end
-				buffer.writeu32(MEM, r2 + -200, v2)
-				buffer.writeu32(MEM, r2 + -196, v2)
-				buffer.writeu32(MEM, r2 + -48, r1 + 24)
-				buffer.writeu32(MEM, r2 + -44, 3)
-				buffer.writeu32(MEM, r2 + -40, r1 + 28)
-				buffer.writeu32(MEM, r2 + -36, 3)
-				F14(1048776, r1 + 176, 1049616)
-				unreachable()
+		if lbl ~= 0 then
+			if lbl == 2 then
+				lbl = 0
+				break
 			end
-			r1 = v2 - r0
-			r0 = v1 + r0 * 8
-			r2 = bit32.bor(r1, 1)
-			local v71 = if r2 == 0 then 0 else 1
-			if v71 == 0 then
-				F14(1049880, 93, 1049552)
-				unreachable()
-			end
-			if v71 ~= 1 then
-				unreachable()
-			end
-			local v74 = 31 - bit32.countlz(r2)
-			if v74 < 0 then v74 += 0x100000000 end
-			local v76 = 2 * v74
-			if v76 > 0xFFFFFFFF then v76 -= 0x100000000 end
-			F24(r0, r1, v3, v4, v76, 0, v7)
 		end
-		F26(v1, v2, v3, v4, bit32.rshift(v5, 1), v7)
-		r0 = bit32.bor(bit32.lshift(v2, 1), 1)
+		F14(1049880, 93, 1049552)
 	until true
 	return r0
 end
@@ -2631,39 +2006,31 @@ FT[21] = function(v3: number, v4: number)
 		local v30 = buffer.readu32(MEM, r1 + -16)
 		if v30 > 0x7FFFFFFF then v30 -= 0x100000000 end
 		if v30 ~= 0 then
-			if v30 ~= 1 then
-				unreachable()
-			end
 			r2 = buffer.readu32(MEM, r1 + -12)
 			r3 = buffer.readu32(MEM, r1 + -8)
 			local v36 = if r2 == 0 then 0 else 1
 			if v36 == 0 then
 				F14(1049500, 35, 1049520)
-				unreachable()
-			end
-			if v36 ~= 1 then
-				unreachable()
 			end
 			r0 = 0
 			r1 = 0
-			r0 = r2
-			r1 = r3
+			r1 = r2
+			r0 = r3
 			r2 = buffer.readu32(MEM, 1053492)
 			if r2 == 0 then
 				r2 = 10
 			else
 				r2 = r2
 			end
-			FN[r2](r0, r1)
+			FN[r2](r1, r0)
 			rt_abort()
-			unreachable()
 		end
 		local v34 = buffer.readu32(MEM, r1 + -8)
-		local v44 = buffer.readu32(MEM, 1050134)
 		local v45 = buffer.readu32(MEM, 1050138)
 		local v46 = buffer.readu32(MEM, 1050142)
 		local v33 = buffer.readu32(MEM, r1 + -12)
 		local v43 = buffer.readu32(MEM, 1050130)
+		local v44 = buffer.readu32(MEM, 1050134)
 		buffer.writeu32(MEM, v34, buffer.readu32(MEM, 1050126))
 		buffer.writeu32(MEM, v34 + 4, v43)
 		buffer.writeu32(MEM, v34 + 8, v44)
@@ -2817,9 +2184,6 @@ FT[21] = function(v3: number, v4: number)
 			r1 = 1052397
 			r2 = 11
 		else
-			if v18 ~= 42 then
-				unreachable()
-			end
 			r1 = 1052200
 			r2 = 19
 		end
@@ -2832,9 +2196,6 @@ FT[21] = function(v3: number, v4: number)
 		local v20 = F40(v4, buffer.readu32(MEM, v14), buffer.readu32(MEM, v14 + 4))
 		r1 = v20
 	else
-		if v5 ~= 3 then
-			unreachable()
-		end
 		local v9 = buffer.readu32(MEM, v3 + 4)
 		buffer.writeu32(MEM, r0 + -76, v9)
 		buffer.writeu8(MEM, r0 + -80, 3)
@@ -2884,62 +2245,29 @@ function F22(v5: number, v6: boolean, v7: number, v8: number, v9: number, v10: n
 			r7 = buffer.readu16(MEM, v5 + 12)
 			if r7 <= r6 then
 				repeat
-					repeat
-						r2 = r0
-						r3 = r5
-						r1 = r1
-						local v67 = if r0 == 0xFFFFFFFF then 0 else 1
-						if v67 == 1 then
-							local v71 = FN[buffer.readu32(MEM, buffer.readu32(MEM, v5 + 4) + 16)](buffer.readu32(MEM, v5), r2)
-							if v71 ~= 0 then
-								if v71 ~= 1 then
-									break
-								end
-								r0 = 1
-								lbl = 1
-								break
-							end
-						elseif v67 ~= 0 then
-							break
-						end
-						local v73 = if r3 == 0 then 0 else 1
-						if v73 == 1 then
-							local v77 = FN[buffer.readu32(MEM, buffer.readu32(MEM, v5 + 4) + 12)](buffer.readu32(MEM, v5), r3, r1)
-							r0 = v77
-							lbl = 2
-							break
-						end
-						if v73 == 0 then
-							r0 = 0
-							lbl = 3
-							break
-						end
-					until true
-					if lbl ~= 0 then
-						if lbl == 1 then
-							lbl = 0
-							break
-						end
-						if lbl == 2 then
-							lbl = 0
-							break
-						end
-						if lbl == 3 then
-							lbl = 0
+					r2 = r0
+					r3 = r5
+					r1 = r1
+					local v67 = if r0 == 0xFFFFFFFF then 0 else 1
+					if v67 == 1 then
+						local v71 = FN[buffer.readu32(MEM, buffer.readu32(MEM, v5 + 4) + 16)](buffer.readu32(MEM, v5), r2)
+						if v71 ~= 0 then
+							r0 = 1
 							break
 						end
 					end
-					unreachable()
+					local v73 = if r3 == 0 then 0 else 1
+					if v73 == 1 then
+						local v77 = FN[buffer.readu32(MEM, buffer.readu32(MEM, v5 + 4) + 12)](buffer.readu32(MEM, v5), r3, r1)
+						r0 = v77
+					else
+						r0 = 0
+					end
 				until true
 				if r0 == 0 then
 					local v44 = FN[buffer.readu32(MEM, buffer.readu32(MEM, v5 + 4) + 12)](buffer.readu32(MEM, v5), v9, v10)
 					r0 = v44
-					lbl = 4
-					break
-				end
-				if r0 == 1 then
-					r0 = 1
-					lbl = 5
+					lbl = 1
 					break
 				end
 			else
@@ -2947,220 +2275,138 @@ function F22(v5: number, v6: boolean, v7: number, v8: number, v9: number, v10: n
 					repeat
 						repeat
 							repeat
-								repeat
-									r3 = r7 - r6
-									if r3 < 0 then r3 += 0x10000 end
-									r4 = 1
-									local v101 = bit32.band(buffer.readu32(MEM, v5 + 8), 1610612736)
-									if v101 == 0 then
-										r4 = 0
-										r2 = bit32.band(buffer.readu32(MEM, v5 + 8), 0x1FFFFF)
-										lbl = 6
-										break
-									end
-									if v101 == 0x20000000 then
-										r4 = 1
-										r2 = bit32.band(buffer.readu32(MEM, v5 + 8), 0x1FFFFF)
-										break
-									end
-									if v101 == 0x40000000 then
-										r4 = 2
-										r2 = bit32.band(buffer.readu32(MEM, v5 + 8), 0x1FFFFF)
-									else
-										r2 = bit32.band(buffer.readu32(MEM, v5 + 8), 0x1FFFFF)
-										if r4 == 0 then
-											lbl = 7
-											break
-										end
-										if r4 == 1 then
-											break
-										end
-										if r4 ~= 2 then
-											lbl = 8
-											break
-										end
-									end
-									r4 = r3 // 2
-									lbl = 9
-									break
-								until true
-								if lbl ~= 0 then
-									if lbl == 6 then
-										lbl = 0
-										break
-									end
-									if lbl == 7 then
-										lbl = 0
-										break
-									end
+								r3 = r7 - r6
+								if r3 < 0 then r3 += 0x10000 end
+								r4 = 1
+								local v101 = bit32.band(buffer.readu32(MEM, v5 + 8), 1610612736)
+								if v101 == 0 then
+									r4 = 0
+									r2 = bit32.band(buffer.readu32(MEM, v5 + 8), 0x1FFFFF)
+									lbl = 2
 									break
 								end
-								r4 = r3
-								lbl = 10
+								if v101 == 0x20000000 then
+									r4 = 1
+									r2 = bit32.band(buffer.readu32(MEM, v5 + 8), 0x1FFFFF)
+									break
+								end
+								if v101 == 0x40000000 then
+									r4 = 2
+									r2 = bit32.band(buffer.readu32(MEM, v5 + 8), 0x1FFFFF)
+								else
+									r2 = bit32.band(buffer.readu32(MEM, v5 + 8), 0x1FFFFF)
+									if r4 == 0 then
+										lbl = 3
+										break
+									end
+									if r4 == 1 then
+										break
+									end
+								end
+								r4 = r3 // 2
+								lbl = 4
 								break
 							until true
 							if lbl ~= 0 then
-								if lbl == 9 then
+								if lbl == 2 then
 									lbl = 0
 									break
 								end
-								if lbl == 10 then
+								if lbl == 3 then
 									lbl = 0
 									break
 								end
 								break
 							end
-							r4 = 0
+							r4 = r3
+							lbl = 5
+							break
 						until true
 						if lbl ~= 0 then
-							if lbl == 8 then
+							if lbl == 4 then
+								lbl = 0
+								break
+							end
+							if lbl == 5 then
 								lbl = 0
 								break
 							end
 						end
-						r7 = r4
-						r6 = 0
+						r4 = 0
+					until true
+					r7 = r4
+					r6 = 0
+					while true do
+						if r6 < r7 then
+							r6 = r6 + 1
+							local v110 = FN[buffer.readu32(MEM, buffer.readu32(MEM, v5 + 4) + 16)](buffer.readu32(MEM, v5), r2)
+							if v110 == 0 then
+								continue
+							end
+							r4 = 0xFFFFFFFF
+							r3 = 0
+						else
+							r3 = r3 - r4
+							if r3 < 0 then r3 += 0x10000 end
+							r4 = r2
+						end
+						r2 = r4
+						r3 = r3
+						local v40 = if r4 == 0xFFFFFFFF then 1 else 0
+						if v40 ~= 0 then
+							break
+						end
+						repeat
+							r4 = r0
+							r5 = r5
+							r1 = r1
+							local v157 = if r0 == 0xFFFFFFFF then 0 else 1
+							if v157 == 1 then
+								local v161 = FN[buffer.readu32(MEM, buffer.readu32(MEM, v5 + 4) + 16)](buffer.readu32(MEM, v5), r4)
+								if v161 ~= 0 then
+									r0 = 1
+									break
+								end
+							end
+							local v163 = if r5 == 0 then 0 else 1
+							if v163 == 1 then
+								local v167 = FN[buffer.readu32(MEM, buffer.readu32(MEM, v5 + 4) + 12)](buffer.readu32(MEM, v5), r5, r1)
+								r0 = v167
+							else
+								r0 = 0
+							end
+						until true
+						if r0 ~= 0 then
+							break
+						end
+						local v56 = FN[buffer.readu32(MEM, buffer.readu32(MEM, v5 + 4) + 12)](buffer.readu32(MEM, v5), v9, v10)
+						if v56 ~= 0 then
+							break
+						end
+						r0 = 0
 						while true do
-							if r6 < r7 then
-								r6 = r6 + 1
-								local v110 = FN[buffer.readu32(MEM, buffer.readu32(MEM, v5 + 4) + 16)](buffer.readu32(MEM, v5), r2)
-								if v110 == 0 then
+							if r0 < r3 then
+								r0 = r0 + 1
+								local v175 = FN[buffer.readu32(MEM, buffer.readu32(MEM, v5 + 4) + 16)](buffer.readu32(MEM, v5), r2)
+								if v175 == 0 then
 									continue
 								end
-								if v110 ~= 1 then
-									break
-								end
-								r4 = 0xFFFFFFFF
-								r3 = 0
+								r0 = 1
 							else
-								r3 = r3 - r4
-								if r3 < 0 then r3 += 0x10000 end
-								r4 = r2
+								r0 = 0
 							end
-							r2 = r4
-							r3 = r3
-							local v40 = if r4 == 0xFFFFFFFF then 1 else 0
-							if v40 ~= 0 then
-								if v40 ~= 1 then
-									lbl = 20
-									break
-								end
-								r0 = 1
-								lbl = 19
-								break
-							end
-							repeat
-								repeat
-									r4 = r0
-									r5 = r5
-									r1 = r1
-									local v157 = if r0 == 0xFFFFFFFF then 0 else 1
-									if v157 == 1 then
-										local v161 = FN[buffer.readu32(MEM, buffer.readu32(MEM, v5 + 4) + 16)](buffer.readu32(MEM, v5), r4)
-										if v161 ~= 0 then
-											if v161 ~= 1 then
-												break
-											end
-											r0 = 1
-											lbl = 11
-											break
-										end
-									elseif v157 ~= 0 then
-										break
-									end
-									local v163 = if r5 == 0 then 0 else 1
-									if v163 == 1 then
-										local v167 = FN[buffer.readu32(MEM, buffer.readu32(MEM, v5 + 4) + 12)](buffer.readu32(MEM, v5), r5, r1)
-										r0 = v167
-										lbl = 12
-										break
-									end
-									if v163 == 0 then
-										r0 = 0
-										lbl = 13
-										break
-									end
-								until true
-								if lbl ~= 0 then
-									if lbl == 11 then
-										lbl = 0
-										break
-									end
-									if lbl == 12 then
-										lbl = 0
-										break
-									end
-									if lbl == 13 then
-										lbl = 0
-										break
-									end
-								end
-								unreachable()
-							until true
-							if r0 ~= 0 then
-								if r0 ~= 1 then
-									lbl = 18
-									break
-								end
-								r0 = 1
-								lbl = 17
-								break
-							end
-							local v56 = FN[buffer.readu32(MEM, buffer.readu32(MEM, v5 + 4) + 12)](buffer.readu32(MEM, v5), v9, v10)
-							if v56 ~= 0 then
-								if v56 ~= 1 then
-									lbl = 16
-									break
-								end
-								r0 = 1
-								lbl = 15
-								break
-							end
-							r0 = 0
-							while true do
-								if r0 < r3 then
-									r0 = r0 + 1
-									local v175 = FN[buffer.readu32(MEM, buffer.readu32(MEM, v5 + 4) + 16)](buffer.readu32(MEM, v5), r2)
-									if v175 == 0 then
-										continue
-									end
-									if v175 ~= 1 then
-										unreachable()
-									end
-									r0 = 1
-								else
-									r0 = 0
-								end
-								r0 = r0
-								lbl = 14
-								break
-							end
-							if lbl ~= 0 then
-								break
-							end
+							r0 = r0
+							lbl = 6
+							break
 						end
 						if lbl ~= 0 then
 							break
 						end
-					until true
+					end
 					if lbl ~= 0 then
-						if lbl == 16 then
-							lbl = 0
-							break
-						end
-						if lbl == 18 then
-							lbl = 0
-							break
-						end
-						if lbl == 20 then
-							lbl = 0
-							break
-						end
 						break
 					end
-					unreachable()
-				end
-				repeat
+				else
 					repeat
 						r2 = buffer.readu32(MEM, v5 + 8)
 						r3 = buffer.readu16(MEM, v5 + 12)
@@ -3175,47 +2421,19 @@ function F22(v5: number, v6: boolean, v7: number, v8: number, v9: number, v10: n
 						if v83 == 1 then
 							local v87 = FN[buffer.readu32(MEM, buffer.readu32(MEM, v5 + 4) + 16)](buffer.readu32(MEM, v5), r8)
 							if v87 ~= 0 then
-								if v87 ~= 1 then
-									break
-								end
 								r0 = 1
-								lbl = 21
 								break
 							end
-						elseif v83 ~= 0 then
-							break
 						end
 						local v89 = if r5 == 0 then 0 else 1
 						if v89 == 1 then
 							local v93 = FN[buffer.readu32(MEM, buffer.readu32(MEM, v5 + 4) + 12)](buffer.readu32(MEM, v5), r5, r1)
 							r0 = v93
-							lbl = 22
-							break
-						end
-						if v89 == 0 then
+						else
 							r0 = 0
-							lbl = 23
-							break
 						end
 					until true
-					if lbl ~= 0 then
-						if lbl == 21 then
-							lbl = 0
-							break
-						end
-						if lbl == 22 then
-							lbl = 0
-							break
-						end
-						if lbl == 23 then
-							lbl = 0
-							break
-						end
-					end
-					unreachable()
-				until true
-				if r0 == 0 then
-					repeat
+					if r0 == 0 then
 						repeat
 							repeat
 								repeat
@@ -3226,7 +2444,7 @@ function F22(v5: number, v6: boolean, v7: number, v8: number, v9: number, v10: n
 									if v126 == 0 then
 										r5 = 0
 										r0 = bit32.band(buffer.readu32(MEM, v5 + 8), 0x1FFFFF)
-										lbl = 24
+										lbl = 7
 										break
 									end
 									if v126 == 0x20000000 then
@@ -3240,55 +2458,44 @@ function F22(v5: number, v6: boolean, v7: number, v8: number, v9: number, v10: n
 									else
 										r0 = bit32.band(buffer.readu32(MEM, v5 + 8), 0x1FFFFF)
 										if r5 == 0 then
-											lbl = 25
+											lbl = 8
 											break
 										end
 										if r5 == 1 then
 											break
 										end
-										if r5 ~= 2 then
-											lbl = 26
-											break
-										end
 									end
 									r5 = r1 // 2
-									lbl = 27
+									lbl = 9
 									break
 								until true
 								if lbl ~= 0 then
-									if lbl == 24 then
+									if lbl == 7 then
 										lbl = 0
 										break
 									end
-									if lbl == 25 then
+									if lbl == 8 then
 										lbl = 0
 										break
 									end
 									break
 								end
 								r5 = r1
-								lbl = 28
+								lbl = 10
 								break
 							until true
 							if lbl ~= 0 then
-								if lbl == 27 then
+								if lbl == 9 then
 									lbl = 0
 									break
 								end
-								if lbl == 28 then
+								if lbl == 10 then
 									lbl = 0
 									break
 								end
-								break
 							end
 							r5 = 0
 						until true
-						if lbl ~= 0 then
-							if lbl == 26 then
-								lbl = 0
-								break
-							end
-						end
 						r7 = r5
 						r6 = 0
 						while true do
@@ -3297,9 +2504,6 @@ function F22(v5: number, v6: boolean, v7: number, v8: number, v9: number, v10: n
 								local v135 = FN[buffer.readu32(MEM, buffer.readu32(MEM, v5 + 4) + 16)](buffer.readu32(MEM, v5), r0)
 								if v135 == 0 then
 									continue
-								end
-								if v135 ~= 1 then
-									break
 								end
 								r5 = 0xFFFFFFFF
 								r1 = 0
@@ -3312,22 +2516,10 @@ function F22(v5: number, v6: boolean, v7: number, v8: number, v9: number, v10: n
 							r1 = r1
 							local v34 = if r5 == 0xFFFFFFFF then 1 else 0
 							if v34 ~= 0 then
-								if v34 ~= 1 then
-									lbl = 35
-									break
-								end
-								r0 = 1
-								lbl = 34
 								break
 							end
 							local v52 = FN[buffer.readu32(MEM, buffer.readu32(MEM, v5 + 4) + 12)](buffer.readu32(MEM, v5), v9, v10)
 							if v52 ~= 0 then
-								if v52 ~= 1 then
-									lbl = 33
-									break
-								end
-								r0 = 1
-								lbl = 32
 								break
 							end
 							r5 = 0
@@ -3338,108 +2530,51 @@ function F22(v5: number, v6: boolean, v7: number, v8: number, v9: number, v10: n
 									if v151 == 0 then
 										continue
 									end
-									if v151 ~= 1 then
-										unreachable()
-									end
 									r0 = 1
 								else
 									r0 = 0
 								end
-								if r0 == 0 then
-									buffer.writeu32(MEM, v5 + 8, r2)
-									buffer.writeu16(MEM, v5 + 12, r3)
-									buffer.writeu16(MEM, v5 + 14, r4)
-									r0 = 0
-									lbl = 29
+								if r0 ~= 0 then
+									lbl = 12
 									break
 								end
-								if r0 ~= 1 then
-									lbl = 31
-									break
-								end
-								r0 = 1
-								lbl = 30
+								buffer.writeu32(MEM, v5 + 8, r2)
+								buffer.writeu16(MEM, v5 + 12, r3)
+								buffer.writeu16(MEM, v5 + 14, r4)
+								r0 = 0
+								lbl = 11
 								break
 							end
 							if lbl ~= 0 then
+								if lbl == 12 then
+									lbl = 0
+									break
+								end
 								break
 							end
 						end
 						if lbl ~= 0 then
 							break
 						end
-					until true
-					if lbl ~= 0 then
-						if lbl == 31 then
-							lbl = 0
-							break
-						end
-						if lbl == 33 then
-							lbl = 0
-							break
-						end
-						if lbl == 35 then
-							lbl = 0
-							break
-						end
-						break
 					end
-					unreachable()
-				end
-				if r0 == 1 then
-					r0 = 1
-					lbl = 36
-					break
 				end
 			end
 		until true
 		if lbl ~= 0 then
-			if lbl == 4 then
+			if lbl == 1 then
 				lbl = 0
 				break
 			end
-			if lbl == 5 then
+			if lbl == 6 then
 				lbl = 0
 				break
 			end
-			if lbl == 14 then
-				lbl = 0
-				break
-			end
-			if lbl == 15 then
-				lbl = 0
-				break
-			end
-			if lbl == 17 then
-				lbl = 0
-				break
-			end
-			if lbl == 19 then
-				lbl = 0
-				break
-			end
-			if lbl == 29 then
-				lbl = 0
-				break
-			end
-			if lbl == 30 then
-				lbl = 0
-				break
-			end
-			if lbl == 32 then
-				lbl = 0
-				break
-			end
-			if lbl == 34 then
-				lbl = 0
-				break
-			end
-			if lbl == 36 then
+			if lbl == 11 then
 				lbl = 0
 				break
 			end
 		end
-		unreachable()
+		r0 = 1
 	until true
 	return r0
 end
@@ -3466,10 +2601,6 @@ function F23(v0: number)
 		SP = r1
 		rt_panic_msg(v5, v6, buffer.readu32(MEM, v0 + 4), 0, 8, 12)
 		rt_abort()
-		unreachable()
-	end
-	if v9 ~= 1 then
-		unreachable()
 	end
 	local v11 = SP
 	local fp_10 = v11 - 64
@@ -3483,7 +2614,6 @@ function F23(v0: number)
 	buffer.writeu32(MEM, v11 + -40, fp_10 + 8)
 	buffer.writeu32(MEM, v11 + -36, 9)
 	F14(1053483, fp_10 + 16, 1053032)
-	unreachable()
 end
 
 -- core::slice::sort::stable::quicksort::quicksort::<(char, usize), {closure@std::slice::<impl [(char, usize)]>::sort_by<{closure@src/lib.rs:20:15: 20:21}>::{closure#0}}>
@@ -3507,7 +2637,6 @@ function F24(v8: number, v9: number, v10: number, v11: number, v12: number, v13:
 				r7 = r2
 				if r2 < 8 then
 					rt_abort()
-					unreachable()
 				end
 				r8 = r7 // 8
 				r9 = r6 + bit32.bor(r8 * 4, 0) * 8
@@ -3555,9 +2684,6 @@ function F24(v8: number, v9: number, v10: number, v11: number, v12: number, v13:
 							break
 						end
 					else
-						if v35 ~= 0 then
-							unreachable()
-						end
 						r7 = 0
 					end
 					local v29 = F37(r4, r2, v10, v11, r6, false, v14)
@@ -3576,7 +2702,6 @@ function F24(v8: number, v9: number, v10: number, v11: number, v12: number, v13:
 						continue
 					end
 					F14(1052028, 19, 1049928)
-					unreachable()
 				end
 				buffer.writeu32(MEM, r1 + -8, v14)
 				r5 = F38(r4, r2, v10, v11, r6, true, r0 + 8)
@@ -3598,7 +2723,6 @@ function F24(v8: number, v9: number, v10: number, v11: number, v12: number, v13:
 					buffer.writeu32(MEM, r1 + -184, r0 + 4)
 					buffer.writeu32(MEM, r1 + -180, 3)
 					F14(1048719, r0 + 32, 1049944)
-					unreachable()
 				end
 				if r6 < r6 then
 					buffer.writeu32(MEM, r1 + -216, r6)
@@ -3608,7 +2732,6 @@ function F24(v8: number, v9: number, v10: number, v11: number, v12: number, v13:
 					buffer.writeu32(MEM, r1 + -136, r0 + 12)
 					buffer.writeu32(MEM, r1 + -132, 3)
 					F14(1048776, r0 + 80, 1049944)
-					unreachable()
 				end
 				if r6 < r5 then
 					buffer.writeu32(MEM, r1 + -208, r5)
@@ -3618,7 +2741,6 @@ function F24(v8: number, v9: number, v10: number, v11: number, v12: number, v13:
 					buffer.writeu32(MEM, r1 + -88, r0 + 20)
 					buffer.writeu32(MEM, r1 + -84, 3)
 					F14(1048831, r0 + 128, 1049944)
-					unreachable()
 				end
 				buffer.writeu32(MEM, r1 + -200, r6)
 				buffer.writeu32(MEM, r1 + -196, r6)
@@ -3627,7 +2749,6 @@ function F24(v8: number, v9: number, v10: number, v11: number, v12: number, v13:
 				buffer.writeu32(MEM, r1 + -40, r0 + 28)
 				buffer.writeu32(MEM, r1 + -36, 3)
 				F14(1048776, r0 + 176, 1049944)
-				unreachable()
 			end
 			F10(r4, r2, v10, v11, true, v14)
 		end
@@ -3815,7 +2936,7 @@ function F27(ret_2: number, v3: number, v4: number, v5: number)
 	r3 = SP
 	r4 = r3 - 8
 	SP = r4
-	r5, r6 = F58()
+	r5, r6 = F57()
 	if r5 == buffer.readu32(MEM, r2) and r6 == buffer.readu32(MEM, r2 + 4) then
 		r4 = buffer.readu32(MEM, r2 + 8)
 		local v13 = r4 + 1
@@ -3830,7 +2951,6 @@ function F27(ret_2: number, v3: number, v4: number, v5: number)
 			buffer.writeu32(MEM, v26 + -24, fp_25)
 			buffer.writeu32(MEM, v26 + -20, 5)
 			F14(1053608, fp_25 + 8, 1053224)
-			unreachable()
 		end
 		buffer.writeu32(MEM, r2 + 8, r4 + 1)
 	else
@@ -3862,7 +2982,6 @@ function F27(ret_2: number, v3: number, v4: number, v5: number)
 			buffer.writeu32(MEM, v32 + -144, fp_31 + 8)
 			buffer.writeu32(MEM, v32 + -140, 9)
 			F14(1054082, fp_31 + 32, 1053276)
-			unreachable()
 		end
 		buffer.writeu32(MEM, r2, r5)
 		buffer.writeu32(MEM, r2 + 4, r6)
@@ -3881,15 +3000,11 @@ function F27(ret_2: number, v3: number, v4: number, v5: number)
 	local v39 = F41(r2, 1053292, v4, v5)
 	if v39 == 0 then
 		if (if buffer.readu8(MEM, r3 + -16) == 255 then 0 else 1) ~= 0 then
-			F62(r2)
+			F61(r2)
 		end
 	else
-		if v39 ~= 1 then
-			unreachable()
-		end
 		if (if buffer.readu8(MEM, r3 + -16) == 255 then 0 else 1) == 0 then
 			F14(1053316, 173, 1053404)
-			unreachable()
 		end
 		local v48 = buffer.readu32(MEM, r3 + -12)
 		buffer.writeu32(MEM, ret_2, buffer.readu32(MEM, r3 + -16))
@@ -3937,7 +3052,7 @@ FT[29] = function(v3: number, v4: number)
 	end
 	local v10 = r3
 	if v10 < 0 then v10 += 0x100000000 end
-	local v14 = F51(v10, r0, 10)
+	local v14 = F31(v10, r0, 10)
 	local v8 = F22(v4, r2, 1049414, 0, r0 + v14, 10 - v14)
 	SP = r1
 	return v8
@@ -4309,22 +3424,22 @@ end
 -- hashbrown::raw::RawTableInner::rehash_in_place
 function F34(v2: number, v3: number, v4: number, v5: number, v6: number)
 	local r0: number, r1: number, r2: number, r3: number, r4: number, r5: number, r6: number, r7: number = 0, 0, 0, 0, 0, 0, 0, 0
-	r1 = SP
-	r0 = r1 - 8
-	SP = r0
-	local v104 = buffer.readu32(MEM, v2 + 4) + 1
-	if v104 > 0xFFFFFFFF then v104 -= 0x100000000 end
-	r2 = v104
-	if 0 < v104 then
-		r3 = r2
-		if 0 <= r2 then
-			r2 = r3
-		else
-			r2 = 0
+	repeat
+		r1 = SP
+		r0 = r1 - 8
+		SP = r0
+		local v104 = buffer.readu32(MEM, v2 + 4) + 1
+		if v104 > 0xFFFFFFFF then v104 -= 0x100000000 end
+		r2 = v104
+		if 0 < v104 then
+			r3 = r2
+			if 0 <= r2 then
+				r2 = r3
+				break
+			end
 		end
-	else
 		r2 = 0
-	end
+	until true
 	r3 = r2 // 8
 	if 0 < r2 % 8 then
 		r3 = r3 + 1
@@ -4430,8 +3545,6 @@ function F34(v2: number, v3: number, v4: number, v5: number, v6: number)
 						local v90 = if v5 == 0 then 0 else 1
 						if v90 == 1 then
 							F45(r2, r7, v5)
-						elseif v90 ~= 0 then
-							unreachable()
 						end
 					end
 				end
@@ -4443,113 +3556,102 @@ end
 -- hashbrown::raw::RawTableInner::resize_inner::<std::alloc::Global>
 function F35(v4: number, v5: number, v6: number, v7: number, v8: number, v9: number, v10: number, v11: number)
 	local r0: number, r1: number, r2: number, r3: number, r4: number, r5: number, r6: number, r7: number, r8: number, r9: number, r10: number = 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0
-	repeat
-		r4 = 0
-		r10 = 0
-		r5 = 0
-		r2 = 0
-		r3 = 0
-		r4 = 0
-		r5 = 0
-		r6 = 0
-		r6 = 0
-		r0 = SP
-		r1 = r0 - 152
-		SP = r1
-		r3 = SP
-		r4 = r3 - 48
-		SP = r4
-		if v6 ~= 0 then
-			if v6 < 15 then
-				repeat
-					if 0 <= v10 then
-						if v10 <= 1 then
-							r5 = 7
-							break
-						end
-					end
-					r5 = 3
-				until true
-				if not (v6 < r5) then
-					r5 = v6
-				end
-				if r5 < 4 then
-					r5 = 4
-				else
-					if r5 < 8 then
-						r5 = 8
-					else
-						r5 = 16
-					end
-				end
-				r6 = r5
-				r5 = 1
-			else
-				r5 = bit32.bor(v6 * 8, 0)
-				if r5 ~= v6 * 8 then
-					r5 = 0
-					r6 = 0
-				else
-					r5 = r5 // 7
-					if r5 <= 1 then
-						r5 = 0
-					else
-						local v103 = r5 - 1
-						if v103 < 0 then v103 += 0x100000000 end
-						r5 = bit32.rshift(0xFFFFFFFF, bit32.band(bit32.countlz(v103), 31))
-					end
-					r6 = bit32.bor(r5 + 1, 0)
-					r5 = 1
-				end
-			end
-			r6 = r6
-			if r5 == 0 then
-				if v9 == 0 then
-					r6 = 0
-					r4 = 0
-					r5 = 0
-					break
-				end
-				if v9 ~= 1 then
-					unreachable()
-				end
-				F14(1051875, 57, 1051904)
-				unreachable()
-			end
-			if r5 == 1 then
-				F53(r4 + 32, v5, v10, v11, r6, v9)
-				local v72 = if buffer.readu32(MEM, r3 + -16) == 0 then 1 else 0
-				if v72 == 0 then
-					local v76 = buffer.readu32(MEM, r3 + -16)
-					local v77 = buffer.readu32(MEM, r3 + -12)
-					local v81 = v77 + 1
-					if v81 > 0xFFFFFFFF then v81 -= 0x100000000 end
-					local v83 = v81 + 8
-					if v83 > 0xFFFFFFFF then v83 -= 0x100000000 end
-					local v78 = buffer.readu32(MEM, r3 + -8)
-					local v79 = buffer.readu32(MEM, r3 + -4)
-					buffer.fill(MEM, v76, 255, v83)
-					r5 = v76
-					r6 = v77
-					r4 = v78
-					r2 = v79
-					break
-				end
-				if v72 == 1 then
-					r6 = buffer.readu32(MEM, r3 + -12)
-					r4 = buffer.readu32(MEM, r3 + -8)
-					r5 = 0
-					break
-				end
-			end
-			unreachable()
-		end
+	r5 = 0
+	r6 = 0
+	r7 = 0
+	r6 = 0
+	r4 = 0
+	r8 = 0
+	r9 = 0
+	r10 = 0
+	r3 = 0
+	r0 = SP
+	r1 = r0 - 152
+	SP = r1
+	r2 = SP
+	r4 = r2 - 48
+	SP = r4
+	if v6 == 0 then
 		r5 = 1048600
 		r6 = 0
 		r4 = 0
-		r2 = 0
-	until true
-	SP = r3
+		r3 = 0
+	else
+		if v6 < 15 then
+			repeat
+				if 0 <= v10 then
+					if v10 <= 1 then
+						r5 = 7
+						break
+					end
+				end
+				r5 = 3
+			until true
+			if not (v6 < r5) then
+				r5 = v6
+			end
+			if r5 < 4 then
+				r5 = 4
+			else
+				if r5 < 8 then
+					r5 = 8
+				else
+					r5 = 16
+				end
+			end
+			r6 = r5
+			r5 = 1
+		else
+			r5 = bit32.bor(v6 * 8, 0)
+			if r5 ~= v6 * 8 then
+				r5 = 0
+				r6 = 0
+			else
+				r5 = r5 // 7
+				if r5 <= 1 then
+					r5 = 0
+				else
+					local v103 = r5 - 1
+					if v103 < 0 then v103 += 0x100000000 end
+					r5 = bit32.rshift(0xFFFFFFFF, bit32.band(bit32.countlz(v103), 31))
+				end
+				r6 = bit32.bor(r5 + 1, 0)
+				r5 = 1
+			end
+		end
+		r6 = r6
+		if r5 == 0 then
+			if v9 ~= 0 then
+				F14(1051875, 57, 1051904)
+			end
+			r6 = 0
+			r4 = 0
+			r5 = 0
+		else
+			F52(r4 + 32, v5, v10, v11, r6, v9)
+			local v72 = if buffer.readu32(MEM, r2 + -16) == 0 then 1 else 0
+			if v72 == 0 then
+				local v76 = buffer.readu32(MEM, r2 + -16)
+				local v77 = buffer.readu32(MEM, r2 + -12)
+				local v81 = v77 + 1
+				if v81 > 0xFFFFFFFF then v81 -= 0x100000000 end
+				local v83 = v81 + 8
+				if v83 > 0xFFFFFFFF then v83 -= 0x100000000 end
+				local v78 = buffer.readu32(MEM, r2 + -8)
+				local v79 = buffer.readu32(MEM, r2 + -4)
+				buffer.fill(MEM, v76, 255, v83)
+				r5 = v76
+				r6 = v77
+				r4 = v78
+				r3 = v79
+			else
+				r6 = buffer.readu32(MEM, r2 + -12)
+				r4 = buffer.readu32(MEM, r2 + -8)
+				r5 = 0
+			end
+		end
+	end
+	SP = r2
 	local v25 = if r5 == 0 then 1 else 0
 	if v25 == 0 then
 		buffer.writeu32(MEM, r0 + -152, v5)
@@ -4558,18 +3660,18 @@ function F35(v4: number, v5: number, v6: number, v7: number, v8: number, v9: num
 		buffer.writeu32(MEM, r0 + -140, r5)
 		buffer.writeu32(MEM, r0 + -136, r6)
 		buffer.writeu32(MEM, r0 + -132, r4)
-		buffer.writeu32(MEM, r0 + -128, r2)
+		buffer.writeu32(MEM, r0 + -128, r3)
 		local v26 = buffer.readu32(MEM, v4)
-		local v27 = buffer.readu32(MEM, v26)
 		local v28 = buffer.readu32(MEM, v26 + 4)
+		local v27 = buffer.readu32(MEM, v26)
 		buffer.fill(MEM, r1 + 144, 128, 8)
-		r5 = bit32.bxor(bit32.band(v27, buffer.readu32(MEM, r0 + -8)), 2155905152)
-		r6 = bit32.bxor(bit32.band(v28, buffer.readu32(MEM, r0 + -4)), 2155905152)
-		r10 = 0
-		r3 = buffer.readu32(MEM, v4 + 12)
-		r4 = v26
+		r8 = bit32.bxor(bit32.band(v27, buffer.readu32(MEM, r0 + -8)), 2155905152)
+		r10 = bit32.bxor(bit32.band(v28, buffer.readu32(MEM, r0 + -4)), 2155905152)
+		r7 = 0
+		r6 = buffer.readu32(MEM, v4 + 12)
+		r9 = v26
 		while true do
-			if r3 == 0 then
+			if r6 == 0 then
 				local v19 = buffer.readu32(MEM, r0 + -132) - buffer.readu32(MEM, v4 + 12)
 				if v19 < 0 then v19 += 0x100000000 end
 				buffer.writeu32(MEM, r0 + -132, v19)
@@ -4577,48 +3679,44 @@ function F35(v4: number, v5: number, v6: number, v7: number, v8: number, v9: num
 				F45(v4, r1 + 12, 16)
 				r1 = 0xFFFFFFFF
 				r2 = 0
-				r5 = 0
 				r4 = 0
 				r3 = 0
+				r5 = 0
 				if buffer.readu32(MEM, r0 + -136) == 0 then
 					break
 				end
-				local v142 = buffer.readu32(MEM, r0 + -148)
-				r5 = buffer.readu32(MEM, r0 + -144)
-				r8 = buffer.readu32(MEM, r0 + -136) + 1
-				if r8 > 0xFFFFFFFF then r8 -= 0x100000000 end
-				r7 = imul32(v142, r8)
-				if r7 ~= v142 * r8 then
-					r5 = 0
-				else
-					r6 = r5 - 1
-					if r6 < 0 then r6 += 0x100000000 end
-					local v158 = r7 + r6
-					local v159 = v158
-					if v159 > 0xFFFFFFFF then v159 -= 0x100000000 end
-					if v159 ~= v158 then
-						r5 = 0
-					else
-						r7 = bit32.band(r7 + r6, 0xFFFFFFFF - r6)
-						r8 = r8 + 8
-						if r8 > 0xFFFFFFFF then r8 -= 0x100000000 end
-						local v166 = r7 + r8
-						if bit32.bor(v166, 0) ~= v166 then
-							r5 = 0
-						else
-							r8 = r7 + r8
-							local v171 = 0x7FFFFFFF - r6
-							if v171 < 0 then v171 += 0x100000000 end
-							if v171 < r8 then
-								r5 = 0
-							else
-								r5 = r5
-								r3 = r8
-								r4 = r7
+				repeat
+					local v142 = buffer.readu32(MEM, r0 + -148)
+					r5 = buffer.readu32(MEM, r0 + -144)
+					r8 = buffer.readu32(MEM, r0 + -136) + 1
+					if r8 > 0xFFFFFFFF then r8 -= 0x100000000 end
+					r7 = imul32(v142, r8)
+					if r7 == v142 * r8 then
+						r6 = r5 - 1
+						if r6 < 0 then r6 += 0x100000000 end
+						local v158 = r7 + r6
+						local v159 = v158
+						if v159 > 0xFFFFFFFF then v159 -= 0x100000000 end
+						if v159 == v158 then
+							r7 = bit32.band(r7 + r6, 0xFFFFFFFF - r6)
+							r8 = r8 + 8
+							if r8 > 0xFFFFFFFF then r8 -= 0x100000000 end
+							local v166 = r7 + r8
+							if bit32.bor(v166, 0) == v166 then
+								r8 = r7 + r8
+								local v171 = 0x7FFFFFFF - r6
+								if v171 < 0 then v171 += 0x100000000 end
+								if not (v171 < r8) then
+									r5 = r5
+									r3 = r8
+									r4 = r7
+									break
+								end
 							end
 						end
 					end
-				end
+					r5 = 0
+				until true
 				r5 = r5
 				r6 = r3
 				local v150 = r4
@@ -4630,28 +3728,28 @@ function F35(v4: number, v5: number, v6: number, v7: number, v8: number, v9: num
 				rt_dealloc(r4, r6, r5)
 				break
 			end
-			r7 = SP
-			r2 = r7 - 8
+			r3 = SP
+			r2 = r3 - 8
 			SP = r2
 			while true do
-				r8 = r5
-				r9 = r6
-				local v111, v112 = sub64(r5, r6, 0, 0)
+				r4 = r8
+				r5 = r10
+				local v111, v112 = sub64(r8, r10, 0, 0)
 				local v116 = if v112 == 0 and v111 <= 0 then v111 else 1
 				if v116 == 1 then
-					local v117 = ctz64(r8, r9)
-					local v130 = r5 - 1
+					local v117 = ctz64(r4, r5)
+					local v130 = r8 - 1
 					local v131 = v130
 					if v131 < 0 then v131 += 0x100000000 end
-					local v135 = r6 - (v131 - v130) * 2.3283064365386963e-10
+					local v135 = r10 - (v131 - v130) * 2.3283064365386963e-10
 					if v135 > 0xFFFFFFFF then v135 -= 0x100000000 end
 					if v135 < 0 then v135 += 0x100000000 end
-					r5 = bit32.band(r5, v131)
-					r6 = bit32.band(r6, v135)
-					local v139 = bit32.bor(r10 + v117 // 8, 0)
-					SP = r7
-					r3 = r3 - 1
-					if r3 < 0 then r3 += 0x100000000 end
+					r8 = bit32.band(r8, v131)
+					r10 = bit32.band(r10, v135)
+					local v139 = bit32.bor(r7 + v117 // 8, 0)
+					SP = r3
+					r6 = r6 - 1
+					if r6 < 0 then r6 += 0x100000000 end
 					local v14, v15 = FN[buffer.readu32(MEM, v8 + 20)](v7, v4, v139)
 					local v23 = F17(r1 + 12, v14, v15)
 					local v41 = bit32.band(bit32.bor(bit32.rshift(v14, 25), bit32.lshift(v15, 7)), 127)
@@ -4671,24 +3769,18 @@ function F35(v4: number, v5: number, v6: number, v7: number, v8: number, v9: num
 					buffer.copy(MEM, buffer.readu32(MEM, r0 + -140) + (0 - v63), MEM, buffer.readu32(MEM, v4) + (0 - v56), v10)
 					break
 				end
-				if v116 ~= 0 then
-					unreachable()
-				end
-				local v118 = r4
-				r4 = r4 + 8
-				local v120 = buffer.readu32(MEM, v118 + 8)
+				local v118 = r9
+				r9 = r9 + 8
 				local v121 = buffer.readu32(MEM, v118 + 12)
+				local v120 = buffer.readu32(MEM, v118 + 8)
 				buffer.fill(MEM, r2, 128, 8)
-				r5 = bit32.bxor(bit32.band(v120, buffer.readu32(MEM, r7 + -8)), 2155905152)
-				r6 = bit32.bxor(bit32.band(v121, buffer.readu32(MEM, r7 + -4)), 2155905152)
-				r10 = r10 + 8
-				if r10 > 0xFFFFFFFF then r10 -= 0x100000000 end
+				r8 = bit32.bxor(bit32.band(v120, buffer.readu32(MEM, r3 + -8)), 2155905152)
+				r10 = bit32.bxor(bit32.band(v121, buffer.readu32(MEM, r3 + -4)), 2155905152)
+				r7 = r7 + 8
+				if r7 > 0xFFFFFFFF then r7 -= 0x100000000 end
 			end
 		end
 	else
-		if v25 ~= 1 then
-			unreachable()
-		end
 		r1 = r6
 		r2 = r4
 	end
@@ -4699,134 +3791,122 @@ end
 -- alloc::raw_vec::RawVecInner::<A>::reserve::do_reserve_and_handle::<std::alloc::Global>
 function F36(v0: number, v1: number, v2: number, v3: number, v4: number)
 	local r0: number, r1: number, r2: number, r3: number = 0, 0, 0, 0
-	r0 = SP
-	r1 = r0 - 40
-	SP = r1
-	if v4 == 0 then
-		r1 = 0
-		r2 = 0
-	else
-		local v16 = v1 + v2
-		local v17 = v16
-		if v17 > 0xFFFFFFFF then v17 -= 0x100000000 end
-		if v17 ~= v16 then
-			r1 = 0
-			r2 = 0
-		else
-			r3 = v1 + v2
-			local v24 = buffer.readu32(MEM, v0) * 2
-			if v24 > 0xFFFFFFFF then v24 -= 0x100000000 end
-			r2 = v24
-			if not (r3 < v24) then
-				r2 = r3
-			end
-			if v4 == 1 then
-				r3 = 8
-			else
-				if v4 <= 1024 then
-					r3 = 4
-				else
-					r3 = 1
+	repeat
+		r0 = SP
+		r1 = r0 - 40
+		SP = r1
+		if v4 ~= 0 then
+			local v16 = v1 + v2
+			local v17 = v16
+			if v17 > 0xFFFFFFFF then v17 -= 0x100000000 end
+			if v17 == v16 then
+				r3 = v1 + v2
+				local v24 = buffer.readu32(MEM, v0) * 2
+				if v24 > 0xFFFFFFFF then v24 -= 0x100000000 end
+				r2 = v24
+				if not (r3 < v24) then
+					r2 = r3
 				end
-			end
-			if not (r2 < r3) then
-				r3 = r2
-			end
-			F54(r1 + 28, v0, r3, v3, v4)
-			local v20 = buffer.readu32(MEM, r0 + -12)
-			if v20 > 0x7FFFFFFF then v20 -= 0x100000000 end
-			if v20 == 0 then
-				buffer.writeu32(MEM, v0 + 4, buffer.readu32(MEM, r0 + -8))
-				buffer.writeu32(MEM, v0, r3)
-				r1 = 0xFFFFFFFF
-				r2 = 0
-			else
-				if v20 ~= 1 then
-					unreachable()
+				if v4 == 1 then
+					r3 = 8
+				else
+					if v4 <= 1024 then
+						r3 = 4
+					else
+						r3 = 1
+					end
+				end
+				if not (r2 < r3) then
+					r3 = r2
+				end
+				F53(r1 + 28, v0, r3, v3, v4)
+				local v20 = buffer.readu32(MEM, r0 + -12)
+				if v20 > 0x7FFFFFFF then v20 -= 0x100000000 end
+				if v20 == 0 then
+					buffer.writeu32(MEM, v0 + 4, buffer.readu32(MEM, r0 + -8))
+					buffer.writeu32(MEM, v0, r3)
+					r1 = 0xFFFFFFFF
+					r2 = 0
+					break
 				end
 				r1 = buffer.readu32(MEM, r0 + -8)
 				r2 = buffer.readu32(MEM, r0 + -4)
+				break
 			end
 		end
-	end
+		r1 = 0
+		r2 = 0
+	until true
 	SP = r0
 	r0 = r1
 	r3 = r2
 	local v8 = if r1 == 0xFFFFFFFF then 0 else 1
 	if v8 ~= 1 then
-		if v8 == 0 then
-			return
-		end
-		unreachable()
+		return
 	end
 	local v34 = if r0 == 0 then 0 else 1
 	if v34 == 0 then
 		F14(1049500, 35, 1049520)
-		unreachable()
-	end
-	if v34 ~= 1 then
-		unreachable()
 	end
 	r1 = 0
 	r2 = 0
-	r1 = r0
-	r2 = r3
+	r2 = r0
+	r1 = r3
 	r0 = buffer.readu32(MEM, 1053492)
 	if r0 == 0 then
 		r0 = 10
 	else
 		r0 = r0
 	end
-	FN[r0](r1, r2)
+	FN[r0](r2, r1)
 	rt_abort()
-	unreachable()
 end
 
 -- core::slice::sort::stable::quicksort::stable_partition::<(char, usize), {closure@std::slice::<impl [(char, usize)]>::sort_by<{closure@src/lib.rs:20:15: 20:21}>::{closure#0}}>
 function F37(v2: number, v3: number, v4: number, v5: number, v6: number, v7: boolean, v8: number)
 	local r0: number, r1: number, r2: number, r3: number, r4: number, r5: number, r6: number, r7: boolean, r8: number, r9: number = 0, 0, 0, 0, 0, 0, 0, false, 0, 0
 	local lbl = 0
-	r2 = 0
 	r0 = 0
+	r2 = 0
 	r3 = 0
 	r4 = 0
 	r5 = v6
 	if not (v5 < v3) then
 		if not (v3 <= r5) then
 			r1 = v2 + r5 * 8
-			r4 = v4
-			r3 = v2
+			r3 = v4
+			r2 = v2
 			r0 = 0
-			r2 = v4 + v3 * 8
+			r4 = v4 + v3 * 8
 			while true do
 				r6 = v2 + math.min(math.max(r5 - 3, 0), 0xFFFFFFFF) * 8
 				while true do
-					if r3 < r6 then
+					if r2 < r6 then
 						local v45 = buffer.readu32(MEM, r1 + 4)
-						local v46 = buffer.readu32(MEM, r3 + 4)
+						local v46 = buffer.readu32(MEM, r2 + 4)
 						local v50 = if v45 < v46 then -1 else if v46 < v45 then 1 else 0
 						r8 = v50
-						local v51 = buffer.readu32(MEM, r3)
+						local v51 = buffer.readu32(MEM, r2)
 						local v52 = buffer.readu32(MEM, r1)
 						r9 = if v51 < v52 then -1 else if v52 < v51 then 1 else 0
 						if v50 == 0 then
 							r8 = r9
 						end
 						r7 = r8 == -1
-						r2 = r2 + -8
+						r4 = r4 + -8
 						if r7 then
-							r8 = r4
+							r8 = r3
 						else
-							r8 = r2
+							r8 = r4
 						end
 						local v84 = r8 + r0 * 8
-						local v90 = buffer.readu32(MEM, r3 + 4)
-						buffer.writeu32(MEM, v84, buffer.readu32(MEM, r3))
+						local v90 = buffer.readu32(MEM, r2 + 4)
+						buffer.writeu32(MEM, v84, buffer.readu32(MEM, r2))
 						buffer.writeu32(MEM, v84 + 4, v90)
 						r0 = r0 + (if r7 then 1 else 0)
 						if r0 > 0xFFFFFFFF then r0 -= 0x100000000 end
-						local v88 = r3 + 8
-						r3 = v88
+						local v88 = r2 + 8
+						r2 = v88
 						local v102 = buffer.readu32(MEM, r1 + 4)
 						local v103 = buffer.readu32(MEM, v88 + 4)
 						local v107 = if v102 < v103 then -1 else if v103 < v102 then 1 else 0
@@ -4838,20 +3918,20 @@ function F37(v2: number, v3: number, v4: number, v5: number, v6: number, v7: boo
 							r8 = r9
 						end
 						r7 = r8 == -1
-						r2 = r2 + -8
+						r4 = r4 + -8
 						if r7 then
-							r8 = r4
+							r8 = r3
 						else
-							r8 = r2
+							r8 = r4
 						end
 						local v117 = r8 + r0 * 8
-						local v123 = buffer.readu32(MEM, r3 + 4)
-						buffer.writeu32(MEM, v117, buffer.readu32(MEM, r3))
+						local v123 = buffer.readu32(MEM, r2 + 4)
+						buffer.writeu32(MEM, v117, buffer.readu32(MEM, r2))
 						buffer.writeu32(MEM, v117 + 4, v123)
 						r0 = r0 + (if r7 then 1 else 0)
 						if r0 > 0xFFFFFFFF then r0 -= 0x100000000 end
-						local v121 = r3 + 8
-						r3 = v121
+						local v121 = r2 + 8
+						r2 = v121
 						local v126 = buffer.readu32(MEM, r1 + 4)
 						local v127 = buffer.readu32(MEM, v121 + 4)
 						local v131 = if v126 < v127 then -1 else if v127 < v126 then 1 else 0
@@ -4863,20 +3943,20 @@ function F37(v2: number, v3: number, v4: number, v5: number, v6: number, v7: boo
 							r8 = r9
 						end
 						r7 = r8 == -1
-						r2 = r2 + -8
+						r4 = r4 + -8
 						if r7 then
-							r8 = r4
+							r8 = r3
 						else
-							r8 = r2
+							r8 = r4
 						end
 						local v141 = r8 + r0 * 8
-						local v147 = buffer.readu32(MEM, r3 + 4)
-						buffer.writeu32(MEM, v141, buffer.readu32(MEM, r3))
+						local v147 = buffer.readu32(MEM, r2 + 4)
+						buffer.writeu32(MEM, v141, buffer.readu32(MEM, r2))
 						buffer.writeu32(MEM, v141 + 4, v147)
 						r0 = r0 + (if r7 then 1 else 0)
 						if r0 > 0xFFFFFFFF then r0 -= 0x100000000 end
-						local v145 = r3 + 8
-						r3 = v145
+						local v145 = r2 + 8
+						r2 = v145
 						local v150 = buffer.readu32(MEM, r1 + 4)
 						local v151 = buffer.readu32(MEM, v145 + 4)
 						local v155 = if v150 < v151 then -1 else if v151 < v150 then 1 else 0
@@ -4888,62 +3968,62 @@ function F37(v2: number, v3: number, v4: number, v5: number, v6: number, v7: boo
 							r8 = r9
 						end
 						r7 = r8 == -1
-						r2 = r2 + -8
+						r4 = r4 + -8
 						if r7 then
-							r8 = r4
+							r8 = r3
 						else
-							r8 = r2
+							r8 = r4
 						end
 						local v165 = r8 + r0 * 8
-						local v171 = buffer.readu32(MEM, r3 + 4)
-						buffer.writeu32(MEM, v165, buffer.readu32(MEM, r3))
+						local v171 = buffer.readu32(MEM, r2 + 4)
+						buffer.writeu32(MEM, v165, buffer.readu32(MEM, r2))
 						buffer.writeu32(MEM, v165 + 4, v171)
 						r0 = r0 + (if r7 then 1 else 0)
 						if r0 > 0xFFFFFFFF then r0 -= 0x100000000 end
-						r3 = r3 + 8
+						r2 = r2 + 8
 					else
 						r6 = v2 + r5 * 8
 						while true do
-							if r3 < r6 then
+							if r2 < r6 then
 								local v60 = buffer.readu32(MEM, r1 + 4)
-								local v61 = buffer.readu32(MEM, r3 + 4)
+								local v61 = buffer.readu32(MEM, r2 + 4)
 								local v65 = if v60 < v61 then -1 else if v61 < v60 then 1 else 0
 								r8 = v65
-								local v66 = buffer.readu32(MEM, r3)
+								local v66 = buffer.readu32(MEM, r2)
 								local v67 = buffer.readu32(MEM, r1)
 								r9 = if v66 < v67 then -1 else if v67 < v66 then 1 else 0
 								if v65 == 0 then
 									r8 = r9
 								end
 								r7 = r8 == -1
-								r2 = r2 + -8
+								r4 = r4 + -8
 								if r7 then
-									r8 = r4
+									r8 = r3
 								else
-									r8 = r2
+									r8 = r4
 								end
 								local v93 = r8 + r0 * 8
-								local v99 = buffer.readu32(MEM, r3 + 4)
-								buffer.writeu32(MEM, v93, buffer.readu32(MEM, r3))
+								local v99 = buffer.readu32(MEM, r2 + 4)
+								buffer.writeu32(MEM, v93, buffer.readu32(MEM, r2))
 								buffer.writeu32(MEM, v93 + 4, v99)
 								r0 = r0 + (if r7 then 1 else 0)
 								if r0 > 0xFFFFFFFF then r0 -= 0x100000000 end
-								r3 = r3 + 8
+								r2 = r2 + 8
 							else
 								if r5 ~= v3 then
-									r2 = r2 + -8
+									r4 = r4 + -8
 									if v7 then
-										r5 = r4
+										r5 = r3
 									else
-										r5 = r2
+										r5 = r4
 									end
 									local v75 = r5 + r0 * 8
-									local v81 = buffer.readu32(MEM, r3 + 4)
-									buffer.writeu32(MEM, v75, buffer.readu32(MEM, r3))
+									local v81 = buffer.readu32(MEM, r2 + 4)
+									buffer.writeu32(MEM, v75, buffer.readu32(MEM, r2))
 									buffer.writeu32(MEM, v75 + 4, v81)
 									r0 = r0 + (if v7 then 1 else 0)
 									if r0 > 0xFFFFFFFF then r0 -= 0x100000000 end
-									r3 = r3 + 8
+									r2 = r2 + 8
 									r5 = v3
 									lbl = 1
 									break
@@ -4980,35 +4060,34 @@ function F37(v2: number, v3: number, v4: number, v5: number, v6: number, v7: boo
 		end
 	end
 	rt_abort()
-	unreachable()
 end
 
 -- core::slice::sort::stable::quicksort::stable_partition::<(char, usize), {closure@core::slice::sort::stable::quicksort::quicksort<(char, usize), {closure@std::slice::<impl [(char, usize)]>::sort_by<{closure@src/lib.rs:20:15: 20:21}>::{closure#0}}>::{closure#0}}>
 function F38(v2: number, v3: number, v4: number, v5: number, v6: number, v7: boolean, v8: number)
 	local r0: number, r1: number, r2: number, r3: number, r4: number, r5: number, r6: number, r7: boolean, r8: number, r9: number = 0, 0, 0, 0, 0, 0, 0, false, 0, 0
 	local lbl = 0
-	r0 = 0
 	r2 = 0
+	r0 = 0
 	r3 = 0
 	r4 = 0
 	r5 = v6
 	if not (v5 < v3) then
 		if not (v3 <= r5) then
 			r1 = v2 + r5 * 8
-			r2 = v4
-			r4 = v2
+			r4 = v4
+			r2 = v2
 			r0 = 0
 			r3 = v4 + v3 * 8
 			while true do
 				r6 = v2 + math.min(math.max(r5 - 3, 0), 0xFFFFFFFF) * 8
 				while true do
-					if r4 < r6 then
-						local v46 = buffer.readu32(MEM, r4 + 4)
+					if r2 < r6 then
+						local v46 = buffer.readu32(MEM, r2 + 4)
 						local v47 = buffer.readu32(MEM, r1 + 4)
 						local v51 = if v46 < v47 then -1 else if v47 < v46 then 1 else 0
 						r8 = v51
 						local v52 = buffer.readu32(MEM, r1)
-						local v53 = buffer.readu32(MEM, r4)
+						local v53 = buffer.readu32(MEM, r2)
 						r9 = if v52 < v53 then -1 else if v53 < v52 then 1 else 0
 						if v51 == 0 then
 							r8 = r9
@@ -5016,18 +4095,18 @@ function F38(v2: number, v3: number, v4: number, v5: number, v6: number, v7: boo
 						r7 = not (r8 == -1)
 						r3 = r3 + -8
 						if r7 then
-							r8 = r2
+							r8 = r4
 						else
 							r8 = r3
 						end
 						local v86 = r8 + r0 * 8
-						local v92 = buffer.readu32(MEM, r4 + 4)
-						buffer.writeu32(MEM, v86, buffer.readu32(MEM, r4))
+						local v92 = buffer.readu32(MEM, r2 + 4)
+						buffer.writeu32(MEM, v86, buffer.readu32(MEM, r2))
 						buffer.writeu32(MEM, v86 + 4, v92)
 						r0 = r0 + (if r7 then 1 else 0)
 						if r0 > 0xFFFFFFFF then r0 -= 0x100000000 end
-						local v90 = r4 + 8
-						r4 = v90
+						local v90 = r2 + 8
+						r2 = v90
 						local v105 = buffer.readu32(MEM, v90 + 4)
 						local v106 = buffer.readu32(MEM, r1 + 4)
 						local v110 = if v105 < v106 then -1 else if v106 < v105 then 1 else 0
@@ -5041,18 +4120,18 @@ function F38(v2: number, v3: number, v4: number, v5: number, v6: number, v7: boo
 						r7 = not (r8 == -1)
 						r3 = r3 + -8
 						if r7 then
-							r8 = r2
+							r8 = r4
 						else
 							r8 = r3
 						end
 						local v120 = r8 + r0 * 8
-						local v126 = buffer.readu32(MEM, r4 + 4)
-						buffer.writeu32(MEM, v120, buffer.readu32(MEM, r4))
+						local v126 = buffer.readu32(MEM, r2 + 4)
+						buffer.writeu32(MEM, v120, buffer.readu32(MEM, r2))
 						buffer.writeu32(MEM, v120 + 4, v126)
 						r0 = r0 + (if r7 then 1 else 0)
 						if r0 > 0xFFFFFFFF then r0 -= 0x100000000 end
-						local v124 = r4 + 8
-						r4 = v124
+						local v124 = r2 + 8
+						r2 = v124
 						local v130 = buffer.readu32(MEM, v124 + 4)
 						local v131 = buffer.readu32(MEM, r1 + 4)
 						local v135 = if v130 < v131 then -1 else if v131 < v130 then 1 else 0
@@ -5066,18 +4145,18 @@ function F38(v2: number, v3: number, v4: number, v5: number, v6: number, v7: boo
 						r7 = not (r8 == -1)
 						r3 = r3 + -8
 						if r7 then
-							r8 = r2
+							r8 = r4
 						else
 							r8 = r3
 						end
 						local v145 = r8 + r0 * 8
-						local v151 = buffer.readu32(MEM, r4 + 4)
-						buffer.writeu32(MEM, v145, buffer.readu32(MEM, r4))
+						local v151 = buffer.readu32(MEM, r2 + 4)
+						buffer.writeu32(MEM, v145, buffer.readu32(MEM, r2))
 						buffer.writeu32(MEM, v145 + 4, v151)
 						r0 = r0 + (if r7 then 1 else 0)
 						if r0 > 0xFFFFFFFF then r0 -= 0x100000000 end
-						local v149 = r4 + 8
-						r4 = v149
+						local v149 = r2 + 8
+						r2 = v149
 						local v155 = buffer.readu32(MEM, v149 + 4)
 						local v156 = buffer.readu32(MEM, r1 + 4)
 						local v160 = if v155 < v156 then -1 else if v156 < v155 then 1 else 0
@@ -5091,27 +4170,27 @@ function F38(v2: number, v3: number, v4: number, v5: number, v6: number, v7: boo
 						r7 = not (r8 == -1)
 						r3 = r3 + -8
 						if r7 then
-							r8 = r2
+							r8 = r4
 						else
 							r8 = r3
 						end
 						local v170 = r8 + r0 * 8
-						local v176 = buffer.readu32(MEM, r4 + 4)
-						buffer.writeu32(MEM, v170, buffer.readu32(MEM, r4))
+						local v176 = buffer.readu32(MEM, r2 + 4)
+						buffer.writeu32(MEM, v170, buffer.readu32(MEM, r2))
 						buffer.writeu32(MEM, v170 + 4, v176)
 						r0 = r0 + (if r7 then 1 else 0)
 						if r0 > 0xFFFFFFFF then r0 -= 0x100000000 end
-						r4 = r4 + 8
+						r2 = r2 + 8
 					else
 						r6 = v2 + r5 * 8
 						while true do
-							if r4 < r6 then
-								local v62 = buffer.readu32(MEM, r4 + 4)
+							if r2 < r6 then
+								local v62 = buffer.readu32(MEM, r2 + 4)
 								local v63 = buffer.readu32(MEM, r1 + 4)
 								local v67 = if v62 < v63 then -1 else if v63 < v62 then 1 else 0
 								r8 = v67
 								local v68 = buffer.readu32(MEM, r1)
-								local v69 = buffer.readu32(MEM, r4)
+								local v69 = buffer.readu32(MEM, r2)
 								r9 = if v68 < v69 then -1 else if v69 < v68 then 1 else 0
 								if v67 == 0 then
 									r8 = r9
@@ -5119,32 +4198,32 @@ function F38(v2: number, v3: number, v4: number, v5: number, v6: number, v7: boo
 								r7 = not (r8 == -1)
 								r3 = r3 + -8
 								if r7 then
-									r8 = r2
+									r8 = r4
 								else
 									r8 = r3
 								end
 								local v95 = r8 + r0 * 8
-								local v101 = buffer.readu32(MEM, r4 + 4)
-								buffer.writeu32(MEM, v95, buffer.readu32(MEM, r4))
+								local v101 = buffer.readu32(MEM, r2 + 4)
+								buffer.writeu32(MEM, v95, buffer.readu32(MEM, r2))
 								buffer.writeu32(MEM, v95 + 4, v101)
 								r0 = r0 + (if r7 then 1 else 0)
 								if r0 > 0xFFFFFFFF then r0 -= 0x100000000 end
-								r4 = r4 + 8
+								r2 = r2 + 8
 							else
 								if r5 ~= v3 then
 									r3 = r3 + -8
 									if v7 then
-										r5 = r2
+										r5 = r4
 									else
 										r5 = r3
 									end
 									local v77 = r5 + r0 * 8
-									local v83 = buffer.readu32(MEM, r4 + 4)
-									buffer.writeu32(MEM, v77, buffer.readu32(MEM, r4))
+									local v83 = buffer.readu32(MEM, r2 + 4)
+									buffer.writeu32(MEM, v77, buffer.readu32(MEM, r2))
 									buffer.writeu32(MEM, v77 + 4, v83)
 									r0 = r0 + (if v7 then 1 else 0)
 									if r0 > 0xFFFFFFFF then r0 -= 0x100000000 end
-									r4 = r4 + 8
+									r2 = r2 + 8
 									r5 = v3
 									lbl = 1
 									break
@@ -5181,7 +4260,6 @@ function F38(v2: number, v3: number, v4: number, v5: number, v6: number, v7: boo
 		end
 	end
 	rt_abort()
-	unreachable()
 end
 
 -- core::fmt::builders::DebugInner::<'_, '_>::entry_with::<{closure@std::fmt::DebugList<'_, '_>::entry::{closure#0}}>
@@ -5200,28 +4278,18 @@ function F39(v1: number, v2: number, v3: number)
 						local v18 = buffer.readu32(MEM, v1)
 						local v37 = FN[buffer.readu32(MEM, buffer.readu32(MEM, v18 + 4) + 12)](buffer.readu32(MEM, v18), 1053081, 2)
 						if v37 ~= 0 then
-							if v37 ~= 1 then
-								break
-							end
-							r1 = 1
-							lbl = 1
 							break
 						end
 					end
 					local v39 = FN[buffer.readu32(MEM, v3 + 12)](v2, buffer.readu32(MEM, v1))
 					r1 = v39
-					lbl = 2
+					lbl = 1
 					break
 				end
 				if buffer.readu8(MEM, v1 + 5) == 0 then
 					local v13 = buffer.readu32(MEM, v1)
 					local v23 = FN[buffer.readu32(MEM, buffer.readu32(MEM, v13 + 4) + 12)](buffer.readu32(MEM, v13), 1053080, 1)
 					if v23 ~= 0 then
-						if v23 ~= 1 then
-							break
-						end
-						r1 = 1
-						lbl = 3
 						break
 					end
 				end
@@ -5245,14 +4313,10 @@ function F39(v1: number, v2: number, v3: number)
 					buffer.writeu8(MEM, v32 + -8, 0)
 					buffer.writeu8(MEM, v32 + -7, 0)
 					F23(fp_31 + 8)
-					unreachable()
 				end
-				if v27 ~= 1 then
-					unreachable()
-				end
+				local v28 = buffer.readu32(MEM, r2 + 8)
 				local v29 = buffer.readu16(MEM, r2 + 12)
 				local v30 = buffer.readu16(MEM, r2 + 14)
-				local v28 = buffer.readu32(MEM, r2 + 8)
 				buffer.writeu32(MEM, r0 + -16, r1)
 				buffer.writeu32(MEM, r0 + -12, 1053512)
 				buffer.writeu32(MEM, r0 + -8, v28)
@@ -5262,12 +4326,7 @@ function F39(v1: number, v2: number, v3: number)
 				if v45 == 0 then
 					local v43 = FN[buffer.readu32(MEM, buffer.readu32(MEM, r0 + -12) + 12)](buffer.readu32(MEM, r0 + -16), 1053083, 2)
 					r1 = v43
-					lbl = 4
-					break
-				end
-				if v45 == 1 then
-					r1 = 1
-					lbl = 5
+					lbl = 2
 					break
 				end
 			until true
@@ -5280,27 +4339,12 @@ function F39(v1: number, v2: number, v3: number)
 					lbl = 0
 					break
 				end
-				if lbl == 3 then
-					lbl = 0
-					break
-				end
-				if lbl == 4 then
-					lbl = 0
-					break
-				end
-				if lbl == 5 then
-					lbl = 0
-					break
-				end
 			end
-			unreachable()
+			r1 = 1
 		until true
 		SP = r0
 		r0 = r1
 	else
-		if v4 ~= 1 then
-			unreachable()
-		end
 		r0 = 1
 	end
 	buffer.writeu8(MEM, v1 + 4, r0)
@@ -5319,300 +4363,202 @@ function F40(v7: number, v8: number, v9: number)
 		r1 = v8
 		r2 = v9
 		if bit32.band(buffer.readu32(MEM, v7 + 8), 402653184) ~= 0 then
-			repeat
-				if bit32.band(buffer.readu32(MEM, v7 + 8), 0x10000000) == 0 then
-					r3 = r1
-					r4 = r1 + r2 - r1
-					if r4 < 16 then
-						local v76 = F42(r3, r4)
-						r3 = v76
-					else
-						local v77 = F43(r3, r4)
-						r3 = v77
-					end
-					r3 = r3
+			if bit32.band(buffer.readu32(MEM, v7 + 8), 0x10000000) == 0 then
+				r3 = r1
+				r4 = r1 + r2 - r1
+				if r4 < 16 then
+					local v72 = F42(r3, r4)
+					r3 = v72
 				else
-					repeat
-						r3 = buffer.readu16(MEM, v7 + 14)
-						buffer.writeu32(MEM, r0 + -8, 0)
-						buffer.writeu32(MEM, r0 + -16, r1)
-						buffer.writeu32(MEM, r0 + -12, r1 + r2)
-						local v37 = if r3 == 0 then 0 else 1
-						if v37 == 1 then
-							r2 = r3
-							while true do
-								r7 = buffer.readu32(MEM, r0 + -12) - buffer.readu32(MEM, r0 + -16)
-								r5, r6 = F16(r4)
-								local v91 = r5
-								if v91 > 0x7FFFFFFF then v91 -= 0x100000000 end
-								if v91 == 0 then
-									r5 = 0xFFFFFFFF
+					local v73 = F43(r3, r4)
+					r3 = v73
+				end
+				r3 = r3
+			else
+				repeat
+					r3 = buffer.readu16(MEM, v7 + 14)
+					buffer.writeu32(MEM, r0 + -8, 0)
+					buffer.writeu32(MEM, r0 + -16, r1)
+					buffer.writeu32(MEM, r0 + -12, r1 + r2)
+					local v33 = if r3 == 0 then 0 else 1
+					if v33 == 1 then
+						r2 = r3
+						while true do
+							r7 = buffer.readu32(MEM, r0 + -12) - buffer.readu32(MEM, r0 + -16)
+							r5, r6 = F16(r4)
+							local v87 = r5
+							if v87 > 0x7FFFFFFF then v87 -= 0x100000000 end
+							if v87 == 0 then
+								r5 = 0xFFFFFFFF
+							else
+								local v93 = buffer.readu32(MEM, r0 + -8) + (r7 - (buffer.readu32(MEM, r0 + -12) - buffer.readu32(MEM, r0 + -16)))
+								if v93 > 0xFFFFFFFF then v93 -= 0x100000000 end
+								buffer.writeu32(MEM, r0 + -8, v93)
+								r5 = r6
+							end
+							local v77 = if r5 == 0xFFFFFFFF then 0 else 1
+							if v77 == 1 then
+								r2 = r2 - 1
+								if r2 < 0 then r2 += 0x100000000 end
+								local v99 = if r2 == 0 then 0 else 1
+								if v99 == 0 then
+									r5 = 0
 								else
-									if v91 ~= 1 then
-										unreachable()
-									end
-									local v97 = buffer.readu32(MEM, r0 + -8) + (r7 - (buffer.readu32(MEM, r0 + -12) - buffer.readu32(MEM, r0 + -16)))
-									if v97 > 0xFFFFFFFF then v97 -= 0x100000000 end
-									buffer.writeu32(MEM, r0 + -8, v97)
-									r5 = r6
+									r5 = r2
 								end
-								repeat
-									local v81 = if r5 == 0xFFFFFFFF then 0 else 1
-									if v81 == 1 then
-										r2 = r2 - 1
-										if r2 < 0 then r2 += 0x100000000 end
-										local v103 = if r2 == 0 then 0 else 1
-										if v103 == 0 then
-											r5 = 0
-										else
-											if v103 ~= 1 then
-												unreachable()
-											end
-											r5 = r2
-										end
-										r2 = r5
-										local v84 = if r5 == 0 then 1 else 0
-										if v84 == 0 then
-											r2 = r2
-											lbl = 1
-											break
-										end
-										if v84 == 1 then
-											r4 = 0
-											break
-										end
-									elseif v81 == 0 then
-										r4 = r2
-										break
-									end
-									unreachable()
-								until true
-								if lbl ~= 0 then
-									if lbl == 1 then
-										lbl = 0
-										continue
-									end
+								r2 = r5
+								local v80 = if r5 == 0 then 1 else 0
+								if v80 == 0 then
+									r2 = r2
+									continue
 								end
-								r2 = r4
-								local v41 = if r4 == 0 then 0 else 1
-								if v41 == 0 then
-									break
-								end
-								if v41 ~= 1 then
-									lbl = 3
-									break
-								end
+								r4 = 0
+							else
 								r4 = r2
+							end
+							r2 = r4
+							local v37 = if r4 == 0 then 0 else 1
+							if v37 == 0 then
+								break
+							end
+							r4 = r2
+							lbl = 1
+							break
+						end
+						if lbl ~= 0 then
+							if lbl == 1 then
+								lbl = 0
+								break
+							end
+						end
+					end
+					r4 = 0
+				until true
+				r1 = r1
+				r2 = buffer.readu32(MEM, r0 + -8)
+				r3 = bit32.bor(r3 - r4, 0)
+			end
+			if r3 < buffer.readu16(MEM, v7 + 12) then
+				repeat
+					repeat
+						repeat
+							r4 = buffer.readu16(MEM, v7 + 12) - r3
+							if r4 < 0 then r4 += 0x10000 end
+							r5 = 0
+							local v50 = bit32.band(buffer.readu32(MEM, v7 + 8), 1610612736)
+							if v50 == 0 then
+								r5 = 0
+								r3 = bit32.band(buffer.readu32(MEM, v7 + 8), 0x1FFFFF)
 								lbl = 2
 								break
 							end
-							if lbl ~= 0 then
-								if lbl == 2 then
-									lbl = 0
-									break
-								end
+							if v50 == 0x20000000 then
+								r5 = 1
+								r3 = bit32.band(buffer.readu32(MEM, v7 + 8), 0x1FFFFF)
 								break
 							end
-						elseif v37 ~= 0 then
+							if v50 == 0x40000000 then
+								r5 = 2
+								r3 = bit32.band(buffer.readu32(MEM, v7 + 8), 0x1FFFFF)
+							else
+								r3 = bit32.band(buffer.readu32(MEM, v7 + 8), 0x1FFFFF)
+								if r5 == 0 then
+									lbl = 3
+									break
+								end
+								if r5 == 1 then
+									break
+								end
+							end
+							r5 = r4 // 2
 							lbl = 4
 							break
-						end
-						r4 = 0
-					until true
-					if lbl ~= 0 then
-						if lbl == 3 then
-							lbl = 0
+						until true
+						if lbl ~= 0 then
+							if lbl == 2 then
+								lbl = 0
+								break
+							end
+							if lbl == 3 then
+								lbl = 0
+								break
+							end
 							break
 						end
+						r5 = r4
+						lbl = 5
+						break
+					until true
+					if lbl ~= 0 then
 						if lbl == 4 then
 							lbl = 0
 							break
 						end
-					end
-					r1 = r1
-					r2 = buffer.readu32(MEM, r0 + -8)
-					r3 = bit32.bor(r3 - r4, 0)
-				end
-				if not (r3 < buffer.readu16(MEM, v7 + 12)) then
-					local v33 = FN[buffer.readu32(MEM, buffer.readu32(MEM, v7 + 4) + 12)](buffer.readu32(MEM, v7), r1, r2)
-					r1 = v33
-					lbl = 15
-					break
-				end
-				repeat
-					repeat
-						repeat
-							repeat
-								r4 = buffer.readu16(MEM, v7 + 12) - r3
-								if r4 < 0 then r4 += 0x10000 end
-								r5 = 0
-								local v54 = bit32.band(buffer.readu32(MEM, v7 + 8), 1610612736)
-								if v54 == 0 then
-									r5 = 0
-									r3 = bit32.band(buffer.readu32(MEM, v7 + 8), 0x1FFFFF)
-									lbl = 5
-									break
-								end
-								if v54 == 0x20000000 then
-									r5 = 1
-									r3 = bit32.band(buffer.readu32(MEM, v7 + 8), 0x1FFFFF)
-									break
-								end
-								if v54 == 0x40000000 then
-									r5 = 2
-									r3 = bit32.band(buffer.readu32(MEM, v7 + 8), 0x1FFFFF)
-								else
-									r3 = bit32.band(buffer.readu32(MEM, v7 + 8), 0x1FFFFF)
-									if r5 == 0 then
-										lbl = 6
-										break
-									end
-									if r5 == 1 then
-										break
-									end
-									if r5 ~= 2 then
-										lbl = 7
-										break
-									end
-								end
-								r5 = r4 // 2
-								lbl = 8
-								break
-							until true
-							if lbl ~= 0 then
-								if lbl == 5 then
-									lbl = 0
-									break
-								end
-								if lbl == 6 then
-									lbl = 0
-									break
-								end
-								break
-							end
-							r5 = r4
-							lbl = 9
-							break
-						until true
-						if lbl ~= 0 then
-							if lbl == 8 then
-								lbl = 0
-								break
-							end
-							if lbl == 9 then
-								lbl = 0
-								break
-							end
-							break
-						end
-						r5 = 0
-					until true
-					if lbl ~= 0 then
-						if lbl == 7 then
+						if lbl == 5 then
 							lbl = 0
 							break
 						end
 					end
-					r7 = r5
-					r6 = 0
-					while true do
-						if r6 < r7 then
-							r6 = r6 + 1
-							local v63 = FN[buffer.readu32(MEM, buffer.readu32(MEM, v7 + 4) + 16)](buffer.readu32(MEM, v7), r3)
-							if v63 == 0 then
-								continue
-							end
-							if v63 ~= 1 then
-								break
-							end
-							r5 = 0xFFFFFFFF
-							r4 = 0
-						else
-							r4 = r4 - r5
-							if r4 < 0 then r4 += 0x10000 end
-							r5 = r3
-						end
-						r3 = r5
-						r4 = r4
-						local v29 = if r5 == 0xFFFFFFFF then 1 else 0
-						if v29 ~= 0 then
-							if v29 ~= 1 then
-								lbl = 14
-								break
-							end
-							r1 = 1
-							lbl = 13
-							break
-						end
-						local v46 = FN[buffer.readu32(MEM, buffer.readu32(MEM, v7 + 4) + 12)](buffer.readu32(MEM, v7), r1, r2)
-						if v46 ~= 0 then
-							if v46 ~= 1 then
-								lbl = 12
-								break
-							end
-							r1 = 1
-							lbl = 11
-							break
-						end
-						r1 = 0
-						while true do
-							if r1 < r4 then
-								r1 = r1 + 1
-								local v111 = FN[buffer.readu32(MEM, buffer.readu32(MEM, v7 + 4) + 16)](buffer.readu32(MEM, v7), r3)
-								if v111 == 0 then
-									continue
-								end
-								if v111 ~= 1 then
-									unreachable()
-								end
-								r1 = 1
-							else
-								r1 = 0
-							end
-							r1 = r1
-							lbl = 10
-							break
-						end
-						if lbl ~= 0 then
-							break
-						end
-					end
-					if lbl ~= 0 then
-						break
-					end
+					r5 = 0
 				until true
+				r7 = r5
+				r6 = 0
+				while true do
+					if r6 < r7 then
+						r6 = r6 + 1
+						local v59 = FN[buffer.readu32(MEM, buffer.readu32(MEM, v7 + 4) + 16)](buffer.readu32(MEM, v7), r3)
+						if v59 == 0 then
+							continue
+						end
+						r5 = 0xFFFFFFFF
+						r4 = 0
+					else
+						r4 = r4 - r5
+						if r4 < 0 then r4 += 0x10000 end
+						r5 = r3
+					end
+					r3 = r5
+					r4 = r4
+					local v29 = if r5 == 0xFFFFFFFF then 1 else 0
+					if v29 == 0 then
+						local v42 = FN[buffer.readu32(MEM, buffer.readu32(MEM, v7 + 4) + 12)](buffer.readu32(MEM, v7), r1, r2)
+						if v42 == 0 then
+							r1 = 0
+							while true do
+								if r1 < r4 then
+									r1 = r1 + 1
+									local v107 = FN[buffer.readu32(MEM, buffer.readu32(MEM, v7 + 4) + 16)](buffer.readu32(MEM, v7), r3)
+									if v107 == 0 then
+										continue
+									end
+									r1 = 1
+								else
+									r1 = 0
+								end
+								r1 = r1
+								lbl = 6
+								break
+							end
+							if lbl ~= 0 then
+								break
+							end
+						end
+					end
+					r1 = 1
+					lbl = 7
+					break
+				end
 				if lbl ~= 0 then
-					if lbl == 12 then
+					if lbl == 6 then
 						lbl = 0
 						break
 					end
-					if lbl == 14 then
+					if lbl == 7 then
 						lbl = 0
 						break
 					end
-					break
-				end
-				unreachable()
-			until true
-			if lbl ~= 0 then
-				if lbl == 10 then
-					lbl = 0
-					break
-				end
-				if lbl == 11 then
-					lbl = 0
-					break
-				end
-				if lbl == 13 then
-					lbl = 0
-					break
-				end
-				if lbl == 15 then
-					lbl = 0
-					break
 				end
 			end
-			unreachable()
 		end
 		local v16 = FN[buffer.readu32(MEM, buffer.readu32(MEM, v7 + 4) + 12)](buffer.readu32(MEM, v7), r1, r2)
 		r1 = v16
@@ -5650,28 +4596,8 @@ function F41(v8: number, v9: number, v10: number, v11: number)
 						lbl = 1
 						break
 					end
-					if v21 == 1 then
-						r1 = 1
-						lbl = 2
-						break
-					end
 				else
-					if r7 == 128 then
-						local v79 = buffer.readu16(MEM, r3)
-						local v23 = r3 + 2
-						r3 = v23
-						r3 = v23 + v79
-						local v26 = FN[buffer.readu32(MEM, v9 + 12)](v8, v23, v79)
-						if v26 == 0 then
-							lbl = 3
-							break
-						end
-						if v26 == 1 then
-							r1 = 1
-							lbl = 4
-							break
-						end
-					else
+					if r7 ~= 128 then
 						if r7 == 192 then
 							r4 = v11 + r2 * 8
 							buffer.writeu32(MEM, r0 + -36, 1610612768)
@@ -5681,30 +4607,21 @@ function F41(v8: number, v9: number, v10: number, v11: number)
 							buffer.writeu32(MEM, r0 + -40, v9)
 							r5 = r1 + 4
 							local v33 = if buffer.readu32(MEM, r4) == 0 then 1 else 0
-							if v33 == 0 then
-								local v69 = FN[buffer.readu32(MEM, r4 + 4)](buffer.readu32(MEM, r4), r5)
-								if v69 == 0 then
-									r2 = bit32.bor(r2 + 1, 0)
-									lbl = 5
-									break
-								end
-								if v69 == 1 then
-									r1 = 1
-									lbl = 6
-									break
-								end
-							elseif v33 == 1 then
-								local v85 = SP
-								local fp_84 = v85 - 24
-								SP = fp_84
-								buffer.writeu32(MEM, v85 + -24, 1049681)
-								buffer.writeu32(MEM, v85 + -20, 399)
-								buffer.writeu32(MEM, v85 + -16, fp_84)
-								buffer.writeu32(MEM, v85 + -12, 1052072)
-								buffer.writeu8(MEM, v85 + -8, 0)
-								buffer.writeu8(MEM, v85 + -7, 0)
-								F23(fp_84 + 8)
-								unreachable()
+							if v33 ~= 0 then
+								local v84 = SP
+								local fp_83 = v84 - 24
+								SP = fp_83
+								buffer.writeu32(MEM, v84 + -24, 1049681)
+								buffer.writeu32(MEM, v84 + -20, 399)
+								buffer.writeu32(MEM, v84 + -16, fp_83)
+								buffer.writeu32(MEM, v84 + -12, 1052072)
+								buffer.writeu8(MEM, v84 + -8, 0)
+								buffer.writeu8(MEM, v84 + -7, 0)
+								F23(fp_83 + 8)
+							end
+							local v69 = FN[buffer.readu32(MEM, r4 + 4)](buffer.readu32(MEM, r4), r5)
+							if v69 ~= 0 then
+								break
 							end
 						else
 							r4 = 1610612768
@@ -5730,20 +4647,16 @@ function F41(v8: number, v9: number, v10: number, v11: number)
 								r5 = v11 + r5 * 8
 								local v50 = if buffer.readu32(MEM, r5) == 0 then 1 else 0
 								if v50 == 0 then
-									local v88 = SP
-									local fp_87 = v88 - 24
-									SP = fp_87
-									buffer.writeu32(MEM, v88 + -24, 1049681)
-									buffer.writeu32(MEM, v88 + -20, 399)
-									buffer.writeu32(MEM, v88 + -16, fp_87)
-									buffer.writeu32(MEM, v88 + -12, 1052088)
-									buffer.writeu8(MEM, v88 + -8, 0)
-									buffer.writeu8(MEM, v88 + -7, 0)
-									F23(fp_87 + 8)
-									unreachable()
-								end
-								if v50 ~= 1 then
-									break
+									local v87 = SP
+									local fp_86 = v87 - 24
+									SP = fp_86
+									buffer.writeu32(MEM, v87 + -24, 1049681)
+									buffer.writeu32(MEM, v87 + -20, 399)
+									buffer.writeu32(MEM, v87 + -16, fp_86)
+									buffer.writeu32(MEM, v87 + -12, 1052088)
+									buffer.writeu8(MEM, v87 + -8, 0)
+									buffer.writeu8(MEM, v87 + -7, 0)
+									F23(fp_86 + 8)
 								end
 								r5 = buffer.readu16(MEM, r5 + 4)
 							end
@@ -5751,20 +4664,16 @@ function F41(v8: number, v9: number, v10: number, v11: number)
 								r6 = v11 + r6 * 8
 								local v57 = if buffer.readu32(MEM, r6) == 0 then 1 else 0
 								if v57 == 0 then
-									local v91 = SP
-									local fp_90 = v91 - 24
-									SP = fp_90
-									buffer.writeu32(MEM, v91 + -24, 1049681)
-									buffer.writeu32(MEM, v91 + -20, 399)
-									buffer.writeu32(MEM, v91 + -16, fp_90)
-									buffer.writeu32(MEM, v91 + -12, 1052104)
-									buffer.writeu8(MEM, v91 + -8, 0)
-									buffer.writeu8(MEM, v91 + -7, 0)
-									F23(fp_90 + 8)
-									unreachable()
-								end
-								if v57 ~= 1 then
-									break
+									local v90 = SP
+									local fp_89 = v90 - 24
+									SP = fp_89
+									buffer.writeu32(MEM, v90 + -24, 1049681)
+									buffer.writeu32(MEM, v90 + -20, 399)
+									buffer.writeu32(MEM, v90 + -16, fp_89)
+									buffer.writeu32(MEM, v90 + -12, 1052104)
+									buffer.writeu8(MEM, v90 + -8, 0)
+									buffer.writeu8(MEM, v90 + -7, 0)
+									F23(fp_89 + 8)
 								end
 								r6 = buffer.readu16(MEM, r6 + 4)
 							end
@@ -5776,32 +4685,35 @@ function F41(v8: number, v9: number, v10: number, v11: number)
 							buffer.writeu32(MEM, r0 + -12, v9)
 							r4 = r1 + 32
 							local v63 = if buffer.readu32(MEM, r7) == 0 then 1 else 0
-							if v63 == 0 then
-								local v77 = FN[buffer.readu32(MEM, r7 + 4)](buffer.readu32(MEM, r7), r4)
-								if v77 == 0 then
-									r2 = bit32.bor(r2 + 1, 0)
-									lbl = 7
-									break
-								end
-								if v77 == 1 then
-									r1 = 1
-									lbl = 8
-									break
-								end
-							elseif v63 == 1 then
-								local v94 = SP
-								local fp_93 = v94 - 24
-								SP = fp_93
-								buffer.writeu32(MEM, v94 + -24, 1049681)
-								buffer.writeu32(MEM, v94 + -20, 399)
-								buffer.writeu32(MEM, v94 + -16, fp_93)
-								buffer.writeu32(MEM, v94 + -12, 1052120)
-								buffer.writeu8(MEM, v94 + -8, 0)
-								buffer.writeu8(MEM, v94 + -7, 0)
-								F23(fp_93 + 8)
-								unreachable()
+							if v63 ~= 0 then
+								local v93 = SP
+								local fp_92 = v93 - 24
+								SP = fp_92
+								buffer.writeu32(MEM, v93 + -24, 1049681)
+								buffer.writeu32(MEM, v93 + -20, 399)
+								buffer.writeu32(MEM, v93 + -16, fp_92)
+								buffer.writeu32(MEM, v93 + -12, 1052120)
+								buffer.writeu8(MEM, v93 + -8, 0)
+								buffer.writeu8(MEM, v93 + -7, 0)
+								F23(fp_92 + 8)
+							end
+							local v77 = FN[buffer.readu32(MEM, r7 + 4)](buffer.readu32(MEM, r7), r4)
+							if v77 ~= 0 then
+								break
 							end
 						end
+						r2 = bit32.bor(r2 + 1, 0)
+						lbl = 3
+						break
+					end
+					local v78 = buffer.readu16(MEM, r3)
+					local v23 = r3 + 2
+					r3 = v23
+					r3 = v23 + v78
+					local v26 = FN[buffer.readu32(MEM, v9 + 12)](v8, v23, v78)
+					if v26 == 0 then
+						lbl = 2
+						break
 					end
 				end
 			until true
@@ -5812,34 +4724,15 @@ function F41(v8: number, v9: number, v10: number, v11: number)
 				end
 				if lbl == 2 then
 					lbl = 0
-					break
+					continue
 				end
 				if lbl == 3 then
 					lbl = 0
 					continue
 				end
-				if lbl == 4 then
-					lbl = 0
-					break
-				end
-				if lbl == 5 then
-					lbl = 0
-					continue
-				end
-				if lbl == 6 then
-					lbl = 0
-					break
-				end
-				if lbl == 7 then
-					lbl = 0
-					continue
-				end
-				if lbl == 8 then
-					lbl = 0
-					break
-				end
 			end
-			unreachable()
+			r1 = 1
+			break
 		end
 	end
 	SP = r0
@@ -5851,20 +4744,17 @@ function F42(v0: number, v1: number)
 	local r0: number, r1: number, r2: number = 0, 0, 0
 	r2 = v0 + v1
 	r0 = 0
-	if v0 == r2 then
-		r0 = r0
-	else
+	if v0 ~= r2 then
 		r1 = 0
 		r2 = r2 - v0
 		while true do
-			local v13 = buffer.readu8(MEM, v0 + r1)
-			if v13 > 127 then v13 -= 256 end
-			r0 = r0 + (if not (v13 < -64) then 1 else 0)
+			local v12 = buffer.readu8(MEM, v0 + r1)
+			if v12 > 127 then v12 -= 256 end
+			r0 = r0 + (if not (v12 < -64) then 1 else 0)
 			if r0 > 0xFFFFFFFF then r0 -= 0x100000000 end
-			local v9 = r1 + 1
-			r1 = v9
-			if v9 == r2 then
-				r0 = r0
+			local v8 = r1 + 1
+			r1 = v8
+			if v8 == r2 then
 				break
 			end
 		end
@@ -5876,7 +4766,7 @@ end
 function F43(v9: number, v10: number)
 	local r0: number, r1: number, r2: number, r3: number, r4: number, r5: number, r6: number, r7: number, r8: number, r9: number, r10: number = 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0
 	local lbl = 0
-	r0 = F59(v9, 4)
+	r0 = F58(v9, 4)
 	if v10 < r0 then
 		r3 = v9
 		r4 = v10
@@ -5887,7 +4777,6 @@ function F43(v9: number, v10: number)
 	else
 		if not (r0 <= v10) then
 			F14(1052028, 19, 1053440)
-			unreachable()
 		end
 		local v84 = v9 + r0
 		local v85 = v10 - r0
@@ -5930,7 +4819,6 @@ function F43(v9: number, v10: number)
 						r5 = r3
 						if not (r3 <= r0) then
 							F14(1052028, 19, 1052920)
-							unreachable()
 						end
 						local v95 = r2 - r5
 						r2 = r7 + r5 * 4
@@ -6041,9 +4929,6 @@ function F44(v8: number, v9: number, v10: number)
 				r3 = r2 + 1
 				if r3 > 0xFFFFFFFF then r3 -= 0x100000000 end
 			else
-				if r1 ~= 1 then
-					unreachable()
-				end
 				r3 = r2
 			end
 			r1 = r3
@@ -6094,60 +4979,53 @@ end
 -- std::ptr::swap_nonoverlapping_bytes
 function F45(v0: number, v1: number, v2: number)
 	local r0: number, r1: number, r2: number, r3: number = 0, 0, 0, 0
-	repeat
-		r1 = v2 // 4
-		r0 = v2 % 4
-		local v6 = if r1 == 0 then 0 else 1
-		if v6 == 1 then
-			r2 = 0
-			while r2 < r1 do
-				local v15 = r2
-				r2 = r2 + 1
-				local v18 = v0 + v15 * 4
-				local v20 = v1 + v15 * 4
-				local v21 = buffer.readu32(MEM, v18)
-				buffer.writeu32(MEM, v18, buffer.readu32(MEM, v20))
-				buffer.writeu32(MEM, v20, v21)
-			end
-		elseif v6 ~= 0 then
-			break
+	r1 = v2 // 4
+	r0 = v2 % 4
+	local v6 = if r1 == 0 then 0 else 1
+	if v6 == 1 then
+		r2 = 0
+		while r2 < r1 do
+			local v15 = r2
+			r2 = r2 + 1
+			local v18 = v0 + v15 * 4
+			local v20 = v1 + v15 * 4
+			local v21 = buffer.readu32(MEM, v18)
+			buffer.writeu32(MEM, v18, buffer.readu32(MEM, v20))
+			buffer.writeu32(MEM, v20, v21)
 		end
-		local v8 = if r0 == 0 then 0 else 1
-		if v8 == 1 then
-			local v10 = bit32.bor(r1 * 4, 0)
-			r1 = v0 + v10
-			r2 = v1 + v10
-			r3 = 0
-			if bit32.band(r0, 4) ~= 0 then
-				local v26 = r1 + r3
-				local v27 = r2 + r3
-				local v39 = buffer.readu32(MEM, v26)
-				buffer.writeu32(MEM, v26, buffer.readu32(MEM, v27))
-				buffer.writeu32(MEM, v27, v39)
-				r3 = bit32.bor(r3, 4)
-			end
-			if bit32.band(r0, 2) ~= 0 then
-				local v31 = r1 + r3
-				local v32 = r2 + r3
-				local v41 = buffer.readu16(MEM, v31)
-				buffer.writeu16(MEM, v31, buffer.readu16(MEM, v32))
-				buffer.writeu16(MEM, v32, v41)
-				r3 = bit32.bor(r3, 2)
-			end
-			if bit32.band(r0, 1) ~= 0 then
-				local v36 = r1 + r3
-				local v37 = r2 + r3
-				local v43 = buffer.readu8(MEM, v36)
-				buffer.writeu8(MEM, v36, buffer.readu8(MEM, v37))
-				buffer.writeu8(MEM, v37, v43)
-				r3 = bit32.bor(r3, 1)
-			end
-		elseif v8 ~= 0 then
-			break
+	end
+	local v8 = if r0 == 0 then 0 else 1
+	if v8 == 1 then
+		local v10 = bit32.bor(r1 * 4, 0)
+		r1 = v0 + v10
+		r2 = v1 + v10
+		r3 = 0
+		if bit32.band(r0, 4) ~= 0 then
+			local v26 = r1 + r3
+			local v27 = r2 + r3
+			local v39 = buffer.readu32(MEM, v26)
+			buffer.writeu32(MEM, v26, buffer.readu32(MEM, v27))
+			buffer.writeu32(MEM, v27, v39)
+			r3 = bit32.bor(r3, 4)
 		end
-		return
-	until true
-	unreachable()
+		if bit32.band(r0, 2) ~= 0 then
+			local v31 = r1 + r3
+			local v32 = r2 + r3
+			local v41 = buffer.readu16(MEM, v31)
+			buffer.writeu16(MEM, v31, buffer.readu16(MEM, v32))
+			buffer.writeu16(MEM, v32, v41)
+			r3 = bit32.bor(r3, 2)
+		end
+		if bit32.band(r0, 1) ~= 0 then
+			local v36 = r1 + r3
+			local v37 = r2 + r3
+			local v43 = buffer.readu8(MEM, v36)
+			buffer.writeu8(MEM, v36, buffer.readu8(MEM, v37))
+			buffer.writeu8(MEM, v37, v43)
+			r3 = bit32.bor(r3, 1)
+		end
+	end
+	return
 end
 
 -- core::slice::sort::shared::smallsort::small_sort_general_with_scratch::<(char, usize), {closure@std::slice::<impl [(char, usize)]>::sort_by<{closure@src/lib.rs:20:15: 20:21}>::{closure#0}}>
@@ -6161,26 +5039,25 @@ function F46(v5: number, v6: number, v7: number, v8: number, v9: number)
 		if v12 > 0xFFFFFFFF then v12 -= 0x100000000 end
 		if v8 < v12 then
 			rt_abort()
-			unreachable()
 		end
 		r3 = v6 // 2
 		if 16 <= v6 then
 			local v17 = v7 + v6 * 8
-			F55(v5, v17, v9)
-			F55(v5 + 32, v17 + 32, v9)
-			F56(v17, 8, v7, v9)
+			F54(v5, v17, v9)
+			F54(v5 + 32, v17 + 32, v9)
+			F55(v17, 8, v7, v9)
 			local v19 = v5 + r3 * 8
 			local v23 = v6 + 8
 			if v23 > 0xFFFFFFFF then v23 -= 0x100000000 end
 			local v25 = v7 + v23 * 8
-			F55(v19, v25, v9)
-			F55(v19 + 32, v25 + 32, v9)
-			F56(v25, 8, v7 + r3 * 8, v9)
+			F54(v19, v25, v9)
+			F54(v19 + 32, v25 + 32, v9)
+			F55(v25, 8, v7 + r3 * 8, v9)
 			r2 = 8
 		else
 			if 8 <= v6 then
-				F55(v5, v7, v9)
-				F55(v5 + r3 * 8, v7 + r3 * 8, v9)
+				F54(v5, v7, v9)
+				F54(v5 + r3 * 8, v7 + r3 * 8, v9)
 				r2 = 4
 			else
 				local v60 = buffer.readu32(MEM, v5 + 4)
@@ -6201,7 +5078,7 @@ function F46(v5: number, v6: number, v7: number, v8: number, v9: number)
 		while true do
 			r4 = r0 + 24
 			if not (0 < buffer.readu32(MEM, r1 + -68) - buffer.readu32(MEM, r1 + -72)) then
-				F56(v7, v6, v5, v9)
+				F55(v7, v6, v5, v9)
 				break
 			end
 			local v42 = buffer.readu32(MEM, r1 + -72)
@@ -6337,14 +5214,13 @@ function F49(v2: number, v3: number, v4: number)
 		buffer.writeu32(MEM, v20 + -144, fp_19 + 8)
 		buffer.writeu32(MEM, v20 + -140, 9)
 		F14(1054082, fp_19 + 32, 1053552)
-		unreachable()
 	end
 	SP = r4
 	r3 = SP
 	local v6 = r2 + 4
 	r2 = r3 - 16
-	local v8 = buffer.readu32(MEM, v2 + 4)
 	local v7 = buffer.readu32(MEM, v2)
+	local v8 = buffer.readu32(MEM, v2 + 4)
 	SP = r2
 	buffer.writeu8(MEM, r0 + -16, 255)
 	buffer.writeu32(MEM, r3 + -8, v6)
@@ -6354,15 +5230,11 @@ function F49(v2: number, v3: number, v4: number)
 	local v27 = F41(r2, 1053972, v7, v8)
 	if v27 == 0 then
 		if (if buffer.readu8(MEM, r3 + -16) == 255 then 0 else 1) ~= 0 then
-			F62(r2)
+			F61(r2)
 		end
 	else
-		if v27 ~= 1 then
-			unreachable()
-		end
 		if (if buffer.readu8(MEM, r3 + -16) == 255 then 0 else 1) == 0 then
 			F14(1053316, 173, 1053996)
-			unreachable()
 		end
 		local v36 = buffer.readu32(MEM, r3 + -12)
 		buffer.writeu32(MEM, r0 + -16, buffer.readu32(MEM, r3 + -16))
@@ -6370,7 +5242,7 @@ function F49(v2: number, v3: number, v4: number)
 	end
 	SP = r3
 	if (if buffer.readu8(MEM, r0 + -16) == 255 then 0 else 1) ~= 0 then
-		F62(r1)
+		F61(r1)
 	end
 	buffer.writeu8(MEM, v4 + 8, 0)
 	local v9 = buffer.readu32(MEM, v3)
@@ -6378,7 +5250,7 @@ function F49(v2: number, v3: number, v4: number)
 	r1 = r1 + 12
 	buffer.writeu32(MEM, r0 + -4, v9)
 	if (if v9 == 0 then 0 else 1) ~= 0 then
-		F67(r1)
+		F66(r1)
 	end
 	SP = r0
 	return
@@ -6387,7 +5259,6 @@ end
 -- <std::io::StdoutLock<'_> as std::io::Write>::write_all
 function F50(ret_0: number, v1: number, v2: number, v3: number)
 	local r0: number, r1: number, r2: number, r3: number, r4: number, r5: number, r6: number = 0, 0, 0, 0, 0, 0, 0
-	local lbl = 0
 	r2 = 0
 	r0 = buffer.readu32(MEM, v1)
 	if buffer.readi32(MEM, r0 + 16) ~= 0 then
@@ -6397,125 +5268,75 @@ function F50(ret_0: number, v1: number, v2: number, v3: number)
 		buffer.writeu32(MEM, v9 + -24, fp_8)
 		buffer.writeu32(MEM, v9 + -20, 11)
 		F14(1053608, fp_8, 1053420)
-		unreachable()
 	end
 	repeat
-		repeat
-			buffer.writei32(MEM, r0 + 16, -1)
-			r2 = r0 + 20
-			r1 = SP
-			r3 = r1 - 192
-			SP = r3
-			r4, r5 = F64(10, v2, v3)
-			local v14 = r4
-			if v14 > 0x7FFFFFFF then v14 -= 0x100000000 end
-			if v14 == 0 then
-				repeat
-					r3 = r3 + 8
-					r4 = buffer.readu32(MEM, r2 + 4)
-					r5 = buffer.readu32(MEM, r2 + 8)
-					if 1 <= r5 then
-						if buffer.readu8(MEM, r4 + (r5 - 1)) == 10 then
-							F66(r3, r2)
-							break
-						end
+		buffer.writei32(MEM, r0 + 16, -1)
+		r2 = r0 + 20
+		r1 = SP
+		r3 = r1 - 192
+		SP = r3
+		r4, r5 = F63(10, v2, v3)
+		local v14 = r4
+		if v14 > 0x7FFFFFFF then v14 -= 0x100000000 end
+		if v14 == 0 then
+			repeat
+				r3 = r3 + 8
+				r4 = buffer.readu32(MEM, r2 + 4)
+				r5 = buffer.readu32(MEM, r2 + 8)
+				if 1 <= r5 then
+					if buffer.readu8(MEM, r4 + (r5 - 1)) == 10 then
+						F65(r3, r2)
+						break
 					end
-					buffer.writeu8(MEM, r1 + -184, 255)
-				until true
-				local v20 = if buffer.readu8(MEM, r1 + -184) == 255 then 0 else 1
-				if v20 == 0 then
-					F65(ret_0, r2, v2, v3)
-					lbl = 1
+				end
+				buffer.writeu8(MEM, r1 + -184, 255)
+			until true
+			local v20 = if buffer.readu8(MEM, r1 + -184) == 255 then 0 else 1
+			if v20 == 0 then
+				F64(ret_0, r2, v2, v3)
+			else
+				local v35 = buffer.readu32(MEM, r1 + -180)
+				buffer.writeu32(MEM, ret_0, buffer.readu32(MEM, r1 + -184))
+				buffer.writeu32(MEM, ret_0 + 4, v35)
+			end
+		else
+			r4 = r5 + 1
+			if r4 > 0xFFFFFFFF then r4 -= 0x100000000 end
+			if not (r4 <= v3) then
+				F14(1052028, 19, 1053752)
+			end
+			r5 = v2 + r4
+			r6 = v3 - r4
+			if buffer.readu32(MEM, r2 + 8) == 0 then
+				rt_write(1, v2, r4)
+				buffer.writeu8(MEM, r1 + -160, 255)
+				local v25 = if buffer.readu8(MEM, r1 + -160) == 255 then 0 else 1
+				if v25 ~= 0 then
+					local v37 = buffer.readu32(MEM, r1 + -156)
+					buffer.writeu32(MEM, ret_0, buffer.readu32(MEM, r1 + -160))
+					buffer.writeu32(MEM, ret_0 + 4, v37)
 					break
 				end
-				if v20 == 1 then
-					local v35 = buffer.readu32(MEM, r1 + -180)
-					buffer.writeu32(MEM, ret_0, buffer.readu32(MEM, r1 + -184))
-					buffer.writeu32(MEM, ret_0 + 4, v35)
-					lbl = 2
+			else
+				F64(r3 + 56, r2, v2, r4)
+				local v29 = if buffer.readu8(MEM, r1 + -136) == 255 then 0 else 1
+				if v29 ~= 0 then
+					local v39 = buffer.readu32(MEM, r1 + -132)
+					buffer.writeu32(MEM, ret_0, buffer.readu32(MEM, r1 + -136))
+					buffer.writeu32(MEM, ret_0 + 4, v39)
 					break
 				end
-			elseif v14 == 1 then
-				r4 = r5 + 1
-				if r4 > 0xFFFFFFFF then r4 -= 0x100000000 end
-				if not (r4 <= v3) then
-					F14(1052028, 19, 1053752)
-					unreachable()
+				F65(r3 + 80, r2)
+				local v32 = if buffer.readu8(MEM, r1 + -112) == 255 then 0 else 1
+				if v32 ~= 0 then
+					local v41 = buffer.readu32(MEM, r1 + -108)
+					buffer.writeu32(MEM, ret_0, buffer.readu32(MEM, r1 + -112))
+					buffer.writeu32(MEM, ret_0 + 4, v41)
+					break
 				end
-				r5 = v2 + r4
-				r6 = v3 - r4
-				if buffer.readu32(MEM, r2 + 8) == 0 then
-					rt_write(1, v2, r4)
-					buffer.writeu8(MEM, r1 + -160, 255)
-					local v25 = if buffer.readu8(MEM, r1 + -160) == 255 then 0 else 1
-					if v25 ~= 0 then
-						if v25 ~= 1 then
-							break
-						end
-						local v37 = buffer.readu32(MEM, r1 + -156)
-						buffer.writeu32(MEM, ret_0, buffer.readu32(MEM, r1 + -160))
-						buffer.writeu32(MEM, ret_0 + 4, v37)
-						lbl = 3
-						break
-					end
-				else
-					F65(r3 + 56, r2, v2, r4)
-					local v29 = if buffer.readu8(MEM, r1 + -136) == 255 then 0 else 1
-					if v29 ~= 0 then
-						if v29 ~= 1 then
-							break
-						end
-						local v39 = buffer.readu32(MEM, r1 + -132)
-						buffer.writeu32(MEM, ret_0, buffer.readu32(MEM, r1 + -136))
-						buffer.writeu32(MEM, ret_0 + 4, v39)
-						lbl = 5
-						break
-					end
-					F66(r3 + 80, r2)
-					local v32 = if buffer.readu8(MEM, r1 + -112) == 255 then 0 else 1
-					if v32 ~= 0 then
-						if v32 ~= 1 then
-							break
-						end
-						local v41 = buffer.readu32(MEM, r1 + -108)
-						buffer.writeu32(MEM, ret_0, buffer.readu32(MEM, r1 + -112))
-						buffer.writeu32(MEM, ret_0 + 4, v41)
-						lbl = 4
-						break
-					end
-				end
-				F65(ret_0, r2, r5, r6)
-				lbl = 6
-				break
 			end
-		until true
-		if lbl ~= 0 then
-			if lbl == 1 then
-				lbl = 0
-				break
-			end
-			if lbl == 2 then
-				lbl = 0
-				break
-			end
-			if lbl == 3 then
-				lbl = 0
-				break
-			end
-			if lbl == 4 then
-				lbl = 0
-				break
-			end
-			if lbl == 5 then
-				lbl = 0
-				break
-			end
-			if lbl == 6 then
-				lbl = 0
-				break
-			end
+			F64(ret_0, r2, r5, r6)
 		end
-		unreachable()
 	until true
 	SP = r1
 	local v54 = buffer.readi32(MEM, r0 + 16) + 1
@@ -6524,116 +5345,8 @@ function F50(ret_0: number, v1: number, v2: number, v3: number)
 	return
 end
 
--- core::fmt::num::imp::<impl u32>::_fmt_inner
-function F51(v2: number, v3: number, v4: number)
-	local r0: number, r1: number, r2: number, r3: number, r4: number = 0, 0, 0, 0, 0
-	r0 = v4
-	r1 = v2
-	while true do
-		if not (999 < r1) then
-			if 9 < r1 then
-				r3 = r0 - 2
-				if r3 < 0 then r3 += 0x100000000 end
-				r0 = r3
-				r2 = r1 % 100
-				r1 = r1 // 100
-				if not (r3 < v4) then
-					oob(v4, r3, "/rust/core/src/fmt/num.rs", 231, 21)
-				end
-				r3 = v3 + r3
-				r2 = r2 * 2
-				if not (r2 < 200) then
-					oob(200, r2, "/rust/core/src/fmt/num.rs", 231, 43)
-				end
-				buffer.writeu8(MEM, r3, buffer.readu8(MEM, buffer.readu32(MEM, 1050148) + r2))
-				r3 = r0 + 1
-				if r3 > 0xFFFFFFFF then r3 -= 0x100000000 end
-				if not (r3 < v4) then
-					oob(v4, r3, "/rust/core/src/fmt/num.rs", 232, 21)
-				end
-				r3 = v3 + r3
-				r2 = r2 + 1
-				if not (r2 < 200) then
-					oob(200, r2, "/rust/core/src/fmt/num.rs", 232, 43)
-				end
-				buffer.writeu8(MEM, r3, buffer.readu8(MEM, buffer.readu32(MEM, 1050148) + r2))
-			end
-			repeat
-				if r1 == 0 then
-					if v2 ~= 0 then
-						break
-					end
-				end
-				r2 = r0 - 1
-				if r2 < 0 then r2 += 0x100000000 end
-				r0 = r2
-				r3 = bit32.band(r1, 15)
-				if not (r2 < v4) then
-					oob(v4, r2, "/rust/core/src/fmt/num.rs", 248, 21)
-				end
-				r1 = v3 + r2
-				r2 = r3 * 2 + 1
-				if not (r2 < 200) then
-					oob(200, r2, "/rust/core/src/fmt/num.rs", 248, 39)
-				end
-				buffer.writeu8(MEM, r1, buffer.readu8(MEM, buffer.readu32(MEM, 1050148) + r2))
-			until true
-			return r0
-		end
-		r0 = r0 - 4
-		if r0 < 0 then r0 += 0x100000000 end
-		local v6 = r1 % 10000
-		r1 = r1 // 10000
-		r3 = v6 // 100
-		r2 = v6 % 100
-		r4 = r0
-		if not (r0 < v4) then
-			oob(v4, r4, "/rust/core/src/fmt/num.rs", 213, 21)
-		end
-		r4 = v3 + r4
-		r3 = r3 * 2
-		if not (r3 < 200) then
-			oob(200, r3, "/rust/core/src/fmt/num.rs", 213, 43)
-		end
-		buffer.writeu8(MEM, r4, buffer.readu8(MEM, buffer.readu32(MEM, 1050148) + r3))
-		r4 = r0 + 1
-		if r4 > 0xFFFFFFFF then r4 -= 0x100000000 end
-		if not (r4 < v4) then
-			oob(v4, r4, "/rust/core/src/fmt/num.rs", 214, 21)
-		end
-		r4 = v3 + r4
-		r3 = r3 + 1
-		if not (r3 < 200) then
-			oob(200, r3, "/rust/core/src/fmt/num.rs", 214, 43)
-		end
-		buffer.writeu8(MEM, r4, buffer.readu8(MEM, buffer.readu32(MEM, 1050148) + r3))
-		r3 = r0 + 2
-		if r3 > 0xFFFFFFFF then r3 -= 0x100000000 end
-		if not (r3 < v4) then
-			oob(v4, r3, "/rust/core/src/fmt/num.rs", 215, 21)
-		end
-		r3 = v3 + r3
-		r2 = r2 * 2
-		if not (r2 < 200) then
-			oob(200, r2, "/rust/core/src/fmt/num.rs", 215, 43)
-		end
-		buffer.writeu8(MEM, r3, buffer.readu8(MEM, buffer.readu32(MEM, 1050148) + r2))
-		r3 = r0 + 3
-		if r3 > 0xFFFFFFFF then r3 -= 0x100000000 end
-		if not (r3 < v4) then
-			oob(v4, r3, "/rust/core/src/fmt/num.rs", 216, 21)
-		end
-		r3 = v3 + r3
-		r2 = r2 + 1
-		if not (r2 < 200) then
-			oob(200, r2, "/rust/core/src/fmt/num.rs", 216, 43)
-		end
-		buffer.writeu8(MEM, r3, buffer.readu8(MEM, buffer.readu32(MEM, 1050148) + r2))
-	end
-end
-
 -- <core::hash::sip::Hasher<core::hash::sip::Sip13Rounds> as std::hash::Hasher>::write
-function F52(v2: number, v3: number, v4: number)
+function F51(v2: number, v3: number, v4: number)
 	local r0: number, r1: number, r2: number, r3: number, r4: number, r5: number = 0, 0, 0, 0, 0, 0
 	repeat
 		local v7 = buffer.readu32(MEM, v2 + 56) + v4
@@ -6737,160 +5450,141 @@ function F52(v2: number, v3: number, v4: number)
 end
 
 -- hashbrown::raw::RawTableInner::new_uninitialized::<std::alloc::Global>
-function F53(ret_0: number, v4: number, v5: number, v6: number, v7: number, v8: number)
+function F52(ret_0: number, v4: number, v5: number, v6: number, v7: number, v8: number)
 	local r0: number, r1: number, r2: number, r3: number, r4: number, r5: number, r6: number, r7: number = 0, 0, 0, 0, 0, 0, 0, 0
-	r2 = 0
-	r3 = 0
-	r1 = 0
-	r5 = 0
-	r0 = v7
-	r4 = imul32(v5, v7)
-	if r4 ~= v5 * v7 then
+	repeat
+		r5 = 0
+		r1 = 0
+		r2 = 0
 		r3 = 0
-	else
-		r3 = v6 - 1
-		if r3 < 0 then r3 += 0x100000000 end
-		local v44 = r4 + r3
-		local v45 = v44
-		if v45 > 0xFFFFFFFF then v45 -= 0x100000000 end
-		if v45 ~= v44 then
-			r3 = 0
-		else
-			r4 = bit32.band(r4 + r3, 0xFFFFFFFF - r3)
-			r6 = v7 + 8
-			if r6 > 0xFFFFFFFF then r6 -= 0x100000000 end
-			local v52 = r4 + r6
-			if bit32.bor(v52, 0) ~= v52 then
-				r3 = 0
-			else
-				r6 = r4 + r6
-				local v57 = 0x7FFFFFFF - r3
-				if v57 < 0 then v57 += 0x100000000 end
-				if v57 < r6 then
-					r3 = 0
-				else
-					r3 = v6
-					r2 = r6
-					r5 = r4
+		r0 = v7
+		r4 = imul32(v5, v7)
+		if r4 == v5 * v7 then
+			r3 = v6 - 1
+			if r3 < 0 then r3 += 0x100000000 end
+			local v44 = r4 + r3
+			local v45 = v44
+			if v45 > 0xFFFFFFFF then v45 -= 0x100000000 end
+			if v45 == v44 then
+				r4 = bit32.band(r4 + r3, 0xFFFFFFFF - r3)
+				r6 = v7 + 8
+				if r6 > 0xFFFFFFFF then r6 -= 0x100000000 end
+				local v52 = r4 + r6
+				if bit32.bor(v52, 0) == v52 then
+					r6 = r4 + r6
+					local v57 = 0x7FFFFFFF - r3
+					if v57 < 0 then v57 += 0x100000000 end
+					if not (v57 < r6) then
+						r3 = v6
+						r2 = r6
+						r5 = r4
+						break
+					end
 				end
 			end
 		end
-	end
-	repeat
-		local v10 = if r3 == 0 then 0 else 1
-		if v10 == 1 then
-			r3 = r3
-			r4 = r2
-			r5 = r5
+		r3 = 0
+	until true
+	local v10 = if r3 == 0 then 0 else 1
+	if v10 == 1 then
+		r3 = r3
+		r4 = r2
+		r5 = r5
+		if r2 == 0 then
+			r6 = r3
+			r7 = 0
+		else
+			r2 = rt_alloc(r4, r3)
 			if r2 == 0 then
-				r6 = r3
+				r6 = 0
 				r7 = 0
 			else
-				r2 = rt_alloc(r4, r3)
-				if r2 == 0 then
-					r6 = 0
-					r7 = 0
-				else
-					r6 = r2
-					r7 = r4
-				end
+				r6 = r2
+				r7 = r4
 			end
-			r2 = r6
-			r7 = r7
-			local v27 = if r6 == 0 then 1 else 0
-			if v27 == 0 then
-				if r7 ~= r4 then
-					r0 = r7 - 8
-					if r0 < 0 then r0 += 0x100000000 end
-					r3 = v5 + 1
-					if r3 > 0xFFFFFFFF then r3 -= 0x100000000 end
-					if r3 == 0 then
-						trap("attempt to divide by zero", "/crates/hashbrown-0.17.1/src/raw.rs", 1542, 13)
-					end
-					local v32 = 31 - bit32.countlz(r0 // r3)
-					if v32 < 0 then v32 += 0x100000000 end
-					r4 = bit32.lshift(1, bit32.band(v32, 31))
-					r0 = r4
-					r5 = imul32(v5, r4)
-					if r5 == v5 * r4 then
-						r3 = v6 - 1
-						if r3 < 0 then r3 += 0x100000000 end
-						local v74 = r5 + r3
-						local v75 = v74
-						if v75 > 0xFFFFFFFF then v75 -= 0x100000000 end
-						if v75 == v74 then
-							r5 = bit32.band(r5 + r3, 0xFFFFFFFF - r3)
-							r4 = r4 + 8
-							if r4 > 0xFFFFFFFF then r4 -= 0x100000000 end
-							local v82 = r5 + r4
-							if bit32.bor(v82, 0) == v82 then
-								local v87 = 0x7FFFFFFF - r3
-								if v87 < 0 then v87 += 0x100000000 end
-								if not (v87 < r5 + r4) then
-									r1 = r5
-								end
+		end
+		r2 = r6
+		r7 = r7
+		local v27 = if r6 == 0 then 1 else 0
+		if v27 == 0 then
+			if r7 ~= r4 then
+				r0 = r7 - 8
+				if r0 < 0 then r0 += 0x100000000 end
+				r3 = v5 + 1
+				if r3 > 0xFFFFFFFF then r3 -= 0x100000000 end
+				if r3 == 0 then
+					trap("attempt to divide by zero", "/crates/hashbrown-0.17.1/src/raw.rs", 1542, 13)
+				end
+				local v32 = 31 - bit32.countlz(r0 // r3)
+				if v32 < 0 then v32 += 0x100000000 end
+				r4 = bit32.lshift(1, bit32.band(v32, 31))
+				r0 = r4
+				r5 = imul32(v5, r4)
+				if r5 == v5 * r4 then
+					r3 = v6 - 1
+					if r3 < 0 then r3 += 0x100000000 end
+					local v74 = r5 + r3
+					local v75 = v74
+					if v75 > 0xFFFFFFFF then v75 -= 0x100000000 end
+					if v75 == v74 then
+						r5 = bit32.band(r5 + r3, 0xFFFFFFFF - r3)
+						r4 = r4 + 8
+						if r4 > 0xFFFFFFFF then r4 -= 0x100000000 end
+						local v82 = r5 + r4
+						if bit32.bor(v82, 0) == v82 then
+							local v87 = 0x7FFFFFFF - r3
+							if v87 < 0 then v87 += 0x100000000 end
+							if not (v87 < r5 + r4) then
+								r1 = r5
 							end
 						end
 					end
-					r5 = r1
 				end
-				r1 = r2 + r5
-				r2 = bit32.bor(r0 - 1, 0)
-				local v24 = bit32.bor(r0 - 1, 0)
-				r0 = v24
-				if not (v24 < 8) then
-					r0 = bit32.bor(bit32.bor(r0 + 1, 0) // 8 * 7, 0)
-				end
-				buffer.writeu32(MEM, ret_0, r1)
-				buffer.writeu32(MEM, ret_0 + 4, r2)
-				buffer.writeu32(MEM, ret_0 + 8, r0)
-				buffer.writeu32(MEM, ret_0 + 12, 0)
-				break
+				r5 = r1
 			end
-			if v27 == 1 then
-				if v8 == 0 then
-					buffer.writeu32(MEM, ret_0 + 4, r3)
-					buffer.writeu32(MEM, ret_0 + 8, r4)
-					buffer.writeu32(MEM, ret_0, 0)
-					break
-				end
-				if v8 ~= 1 then
-					unreachable()
-				end
+			r1 = r2 + r5
+			r2 = bit32.bor(r0 - 1, 0)
+			local v24 = bit32.bor(r0 - 1, 0)
+			r0 = v24
+			if not (v24 < 8) then
+				r0 = bit32.bor(bit32.bor(r0 + 1, 0) // 8 * 7, 0)
+			end
+			buffer.writeu32(MEM, ret_0, r1)
+			buffer.writeu32(MEM, ret_0 + 4, r2)
+			buffer.writeu32(MEM, ret_0 + 8, r0)
+			buffer.writeu32(MEM, ret_0 + 12, 0)
+		else
+			if v8 ~= 0 then
 				r0 = 0
 				r1 = 0
-				r0 = r3
-				r1 = r4
+				r1 = r3
+				r0 = r4
 				r2 = buffer.readu32(MEM, 1053492)
 				if r2 == 0 then
 					r2 = 10
 				else
 					r2 = r2
 				end
-				FN[r2](r0, r1)
+				FN[r2](r1, r0)
 				rt_abort()
-				unreachable()
 			end
-		elseif v10 == 0 then
-			if v8 == 0 then
-				buffer.writeu32(MEM, ret_0 + 4, 0)
-				buffer.writeu32(MEM, ret_0 + 8, 0)
-				buffer.writeu32(MEM, ret_0, 0)
-				break
-			end
-			if v8 ~= 1 then
-				unreachable()
-			end
-			F14(1051875, 57, 1051904)
-			unreachable()
+			buffer.writeu32(MEM, ret_0 + 4, r3)
+			buffer.writeu32(MEM, ret_0 + 8, r4)
+			buffer.writeu32(MEM, ret_0, 0)
 		end
-		unreachable()
-	until true
+	else
+		if v8 ~= 0 then
+			F14(1051875, 57, 1051904)
+		end
+		buffer.writeu32(MEM, ret_0 + 4, 0)
+		buffer.writeu32(MEM, ret_0 + 8, 0)
+		buffer.writeu32(MEM, ret_0, 0)
+	end
 	return
 end
 
 -- alloc::raw_vec::RawVecInner::finish_grow
-function F54(ret_0: number, v3: number, v4: number, v5: number, v6: number)
+function F53(ret_0: number, v3: number, v4: number, v5: number, v6: number)
 	local r0: number, r1: number, r2: number, r3: number, r4: number, r5: number = 0, 0, 0, 0, 0, 0
 	repeat
 		r0 = imul32(v6, v4)
@@ -6899,65 +5593,62 @@ function F54(ret_0: number, v3: number, v4: number, v5: number, v6: number)
 				repeat
 					if v6 ~= 0 then
 						if buffer.readu32(MEM, v3) ~= 0 then
-							r1 = v6 * buffer.readu32(MEM, v3)
-							r2 = buffer.readu32(MEM, v3 + 4)
-							if r1 == 0 then
-								if r0 == 0 then
-									r1 = v5
-									r2 = 0
-								else
-									r1 = rt_alloc(r0, v5)
-									if r1 == 0 then
-										r1 = 0
-										r2 = 0
-									else
-										r1 = r1
-										r2 = r0
-									end
-								end
-								r1 = r1
-								r2 = r2
-							else
-								if v5 == v5 then
-									r1 = rt_realloc(r2, r1, v5, r0)
-									if r1 == 0 then
-										r1 = 0
-										r2 = 0
-									else
-										r1 = r1
-										r2 = r0
-									end
-								else
+							repeat
+								r1 = v6 * buffer.readu32(MEM, v3)
+								r2 = buffer.readu32(MEM, v3 + 4)
+								if r1 == 0 then
 									if r0 == 0 then
-										r5 = v5
-										r4 = 0
+										r1 = v5
+										r2 = 0
 									else
-										r3 = rt_alloc(r0, v5)
-										if r3 == 0 then
-											r5 = 0
+										r1 = rt_alloc(r0, v5)
+										if r1 == 0 then
+											r1 = 0
+											r2 = 0
+										else
+											r1 = r1
+											r2 = r0
+										end
+									end
+									r1 = r1
+									r2 = r2
+								else
+									if v5 == v5 then
+										r1 = rt_realloc(r2, r1, v5, r0)
+										if r1 ~= 0 then
+											r1 = r1
+											r2 = r0
+											break
+										end
+									else
+										if r0 == 0 then
+											r5 = v5
 											r4 = 0
 										else
-											r5 = r3
-											r4 = r0
+											r3 = rt_alloc(r0, v5)
+											if r3 == 0 then
+												r5 = 0
+												r4 = 0
+											else
+												r5 = r3
+												r4 = r0
+											end
+										end
+										r3 = r5
+										r4 = r4
+										local v32 = if r5 == 0 then 1 else 0
+										if v32 == 0 then
+											buffer.copy(MEM, r3, MEM, r2, r1)
+											rt_dealloc(r2, r1, v5)
+											r1 = r3
+											r2 = r4
+											break
 										end
 									end
-									r3 = r5
-									r4 = r4
-									local v32 = if r5 == 0 then 1 else 0
-									if v32 == 0 then
-										buffer.copy(MEM, r3, MEM, r2, r1)
-										rt_dealloc(r2, r1, v5)
-										r1 = r3
-										r2 = r4
-									else
-										if v32 ~= 1 then
-											unreachable()
-										end
-										r1 = 0
-										r2 = 0
-									end
+									r1 = 0
+									r2 = 0
 								end
-							end
+							until true
 							r1 = r1
 							r2 = r2
 							break
@@ -6986,9 +5677,6 @@ function F54(ret_0: number, v3: number, v4: number, v5: number, v6: number)
 					buffer.writeu32(MEM, ret_0, 0)
 					break
 				end
-				if v11 ~= 1 then
-					unreachable()
-				end
 				buffer.writeu32(MEM, ret_0 + 4, v5)
 				buffer.writeu32(MEM, ret_0 + 8, r0)
 				buffer.writeu32(MEM, ret_0, 1)
@@ -7003,7 +5691,7 @@ function F54(ret_0: number, v3: number, v4: number, v5: number, v6: number)
 end
 
 -- core::slice::sort::shared::smallsort::sort4_stable::<(char, usize), {closure@std::slice::<impl [(char, usize)]>::sort_by<{closure@src/lib.rs:20:15: 20:21}>::{closure#0}}>
-function F55(v0: number, v1: number, v2: number)
+function F54(v0: number, v1: number, v2: number)
 	local r0: number, r1: number, r2: number, r3: number, r4: boolean, r5: boolean, r6: number, r7: number = 0, 0, 0, 0, false, false, 0, 0
 	local v29 = buffer.readu32(MEM, v0 + 4)
 	local v30 = buffer.readu32(MEM, v0 + 12)
@@ -7092,7 +5780,7 @@ function F55(v0: number, v1: number, v2: number)
 end
 
 -- core::slice::sort::shared::smallsort::bidirectional_merge::<(char, usize), {closure@std::slice::<impl [(char, usize)]>::sort_by<{closure@src/lib.rs:20:15: 20:21}>::{closure#0}}>
-function F56(v8: number, v9: number, v10: number, v11: number)
+function F55(v8: number, v9: number, v10: number, v11: number)
 	local r0: number, r1: number, r2: number, r3: number, r4: number, r5: number, r6: number, r7: number, r8: number, r9: number, r10: number, r11: boolean, r12: boolean = 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, false, false
 	r4 = v10
 	r3 = v9 // 2
@@ -7131,7 +5819,6 @@ function F56(v8: number, v9: number, v10: number, v11: number)
 				end
 			end
 			F14(1053833, 153, 1053912)
-			unreachable()
 		end
 		r2 = r2 + 1
 		r8 = r0
@@ -7204,7 +5891,7 @@ function F56(v8: number, v9: number, v10: number, v11: number)
 end
 
 -- std::sync::Once::call_once_force::<{closure@std::sync::OnceLock<std::sync::ReentrantLock<std::cell::RefCell<std::io::LineWriter<std::io::stdio::StdoutRaw>>>>::initialize<{closure@std::sync::OnceLock<std::sync::ReentrantLock<std::cell::RefCell<std::io::LineWriter<std::io::stdio::StdoutRaw>>>>::get_or_init<{closure@std::io::stdout::{closure#0}}>::{closure#0}}, !>::{closure#0}}>::{closure#0}
-function F57(v1: number, v2: number)
+function F56(v1: number, v2: number)
 	local r0: number, r1: number, r2: number, r3: number = 0, 0, 0, 0
 	local v3 = buffer.readu32(MEM, v1)
 	r0 = buffer.readu32(MEM, v3)
@@ -7213,10 +5900,6 @@ function F57(v1: number, v2: number)
 	local v6 = if r0 == 0 then 0 else 1
 	if v6 == 0 then
 		F14(1053928, 87, 1053536)
-		unreachable()
-	end
-	if v6 ~= 1 then
-		unreachable()
 	end
 	r3 = SP
 	r2 = r3 - 40
@@ -7244,38 +5927,29 @@ function F57(v1: number, v2: number)
 		SP = r3
 		return
 	end
-	if v12 ~= 1 then
-		unreachable()
-	end
 	r2 = buffer.readu32(MEM, r1 + -12)
 	r3 = buffer.readu32(MEM, r1 + -8)
 	local v18 = if r2 == 0 then 0 else 1
 	if v18 == 0 then
 		F14(1049500, 35, 1049520)
-		unreachable()
-	end
-	if v18 ~= 1 then
-		unreachable()
 	end
 	r0 = 0
 	r1 = 0
-	r0 = r2
-	r1 = r3
+	r1 = r2
+	r0 = r3
 	r2 = buffer.readu32(MEM, 1053492)
 	if r2 == 0 then
 		r2 = 10
 	else
 		r2 = r2
 	end
-	FN[r2](r0, r1)
+	FN[r2](r1, r0)
 	rt_abort()
-	unreachable()
 end
 
 -- std::thread::current_id
-function F58()
+function F57()
 	local r0: number, r1: number, r2: number, r3: number, r4: number, r5: number = 0, 0, 0, 0, 0, 0
-	local lbl = 0
 	r0 = SP
 	r1 = r0 - 8
 	SP = r1
@@ -7287,9 +5961,6 @@ function F58()
 			r1 = 0
 			r2 = 0
 		else
-			if v33 ~= 1 then
-				unreachable()
-			end
 			local v34 = buffer.readu32(MEM, r0 + -8)
 			r1 = buffer.readu32(MEM, v34 + 8)
 			r2 = buffer.readu32(MEM, v34 + 12)
@@ -7300,63 +5971,132 @@ function F58()
 		r1 = 0
 		r3 = 0
 	end
-	repeat
-		SP = r0
-		r0 = r1
-		r2 = r3
-		local v4, v5 = sub64(r1, r3, 0, 0)
-		local v9 = if v5 == 0 and v4 <= 0 then v4 else 1
-		if v9 == 1 then
+	SP = r0
+	r0 = r1
+	r2 = r3
+	local v4, v5 = sub64(r1, r3, 0, 0)
+	local v9 = if v5 == 0 and v4 <= 0 then v4 else 1
+	if v9 == 1 then
+		r0 = r0
+		r1 = r2
+	else
+		r0 = buffer.readu32(MEM, 1053568)
+		r1 = bit32.bor(bit32.lshift(buffer.readu32(MEM, 1053572), 0) + (r0 - r0) * 2.3283064365386963e-10, 0)
+		local v17, v18 = sub64(r0, r1, 0, 0)
+		local v22 = if v18 == 0 and v17 <= 0 then v17 else 1
+		if v22 == 0 then
+			r2 = buffer.readu32(MEM, 1054224)
+			r3 = buffer.readu32(MEM, 1054228)
+			while true do
+				r0 = r2
+				r1 = r3
+				local v42, v43, v44 = addo64(r2, r3, 1, 0, false)
+				if v44 ~= 0 then
+					F14(1054468, 111, 1054524)
+				end
+				local v52 = r0 + 1
+				r0 = v52
+				if r0 > 0xFFFFFFFF then r0 -= 0x100000000 end
+				r1 = r1 + (v52 - r0) * 2.3283064365386963e-10
+				if r1 > 0xFFFFFFFF then r1 -= 0x100000000 end
+				if r1 < 0 then r1 += 0x100000000 end
+				r5 = buffer.readu32(MEM, 1054224)
+				r4 = buffer.readu32(MEM, 1054228)
+				local v69 = r5 == r2 and r4 == r3
+				buffer.writeu32(MEM, 1054224, if v69 then r0 else r5)
+				buffer.writeu32(MEM, 1054228, if v69 then r1 else r4)
+				if v69 then
+					r3 = r5
+					r4 = r4
+					r2 = 0
+				else
+					r3 = r5
+					r4 = r4
+					r2 = 1
+				end
+				r3 = r3
+				r4 = r4
+				if r2 == 0 then
+					local v46, v47 = sub64(r0, r1, 0, 0)
+					local v51 = if v47 == 0 and v46 <= 0 then v46 else 1
+					if v51 == 0 then
+						F14(1053928, 87, 1054232)
+					end
+					buffer.writeu32(MEM, 1053568, r0)
+					buffer.writeu32(MEM, 1053572, bit32.rshift(r1, 0))
+					r0 = r0
+					r1 = r1
+					break
+				end
+				r2 = r3
+				r3 = r4
+			end
+		else
 			r0 = r0
-			r1 = r2
-			break
+			r1 = r1
 		end
-		if v9 == 0 then
-			r0 = buffer.readu32(MEM, 1053568)
-			r1 = bit32.bor(bit32.lshift(buffer.readu32(MEM, 1053572), 0) + (r0 - r0) * 2.3283064365386963e-10, 0)
-			local v17, v18 = sub64(r0, r1, 0, 0)
-			local v22 = if v18 == 0 and v17 <= 0 then v17 else 1
-			if v22 == 0 then
-				r2 = buffer.readu32(MEM, 1054224)
-				r3 = buffer.readu32(MEM, 1054228)
+	end
+	return r0, r1
+end
+
+-- std::ptr::align_offset::<u8>
+function F58(v2: number, v3: number)
+	local r0: number, r1: number, r2: number, r3: number, r4: number, r5: number, r6: number, r7: number = 0, 0, 0, 0, 0, 0, 0, 0
+	local lbl = 0
+	repeat
+		r4 = v3 - 1
+		if v3 % 1 == 0 then
+			local v8 = v2 + r4
+			if v8 > 0xFFFFFFFF then v8 -= 0x100000000 end
+			if v8 < 0 then v8 += 0x100000000 end
+			local v10 = 0 - v3
+			if v10 < 0 then v10 += 0x100000000 end
+			r0 = bit32.bor(bit32.band(v8, v10) - v2, 0)
+			if v2 % 1 == 0 then
+				r0 = r0 // 1
+				break
+			end
+		else
+			local v17 = bit32.countrz(1)
+			r3 = v17
+			r0 = bit32.countrz(v3)
+			if not (v17 < r0) then
+				r3 = r0
+			end
+			if bit32.band(v2, bit32.lshift(1, r3) - 1) == 0 then
+				r0 = bit32.rshift(v3, r3)
+				r1 = r0 - 1
+				r2 = bit32.rshift(bit32.band(1, r4), r3)
+				r3 = r0 - bit32.rshift(bit32.band(v2, r4), r3)
+				r4 = SP
+				r6 = r4 - 8
+				SP = r6
+				r5 = r0 - 1
+				local v53 = buffer.readu32(MEM, 1054216)
+				buffer.writeu32(MEM, r4 + -8, buffer.readu32(MEM, 1054212))
+				buffer.writeu32(MEM, r4 + -4, v53)
+				r7 = bit32.rshift(bit32.band(r2, 15), 1)
+				if not (r7 < 8) then
+					oob(8, r7, "/rust/core/src/ptr/mod.rs", 2274, 27)
+				end
+				r6 = buffer.readu8(MEM, r6 + r7)
+				r7 = 16
 				while true do
-					r0 = r2
-					r1 = r3
-					local v42, v43, v44 = addo64(r2, r3, 1, 0, false)
-					if v44 ~= 0 then
-						F14(1054468, 111, 1054524)
-						unreachable()
-					end
-					local v52 = r0 + 1
-					r0 = v52
-					if r0 > 0xFFFFFFFF then r0 -= 0x100000000 end
-					r1 = r1 + (v52 - r0) * 2.3283064365386963e-10
-					if r1 > 0xFFFFFFFF then r1 -= 0x100000000 end
-					if r1 < 0 then r1 += 0x100000000 end
-					r2, r4, r5, r3 = F70(1054224, r2, r3, r0, r1, 0, 0)
-					local v62 = r2
-					if v62 > 0x7FFFFFFF then v62 -= 0x100000000 end
-					if v62 == 0 then
-						local v46, v47 = sub64(r0, r1, 0, 0)
-						local v51 = if v47 == 0 and v46 <= 0 then v46 else 1
-						if v51 == 0 then
-							F14(1053928, 87, 1054232)
-							unreachable()
+					if not (r0 <= r7) then
+						local v46 = 2 - imul32(r2, r6)
+						if v46 < 0 then v46 += 0x100000000 end
+						r6 = imul32(r6, v46)
+						local v49 = imul32(r7, r7)
+						local v50 = v49 ~= r7 * r7
+						r7 = v49
+						if not v50 then
+							continue
 						end
-						if v51 == 1 then
-							buffer.writeu32(MEM, 1053568, r0)
-							buffer.writeu32(MEM, 1053572, bit32.rshift(r1, 0))
-							r0 = r0
-							r1 = r1
-							lbl = 1
-							break
-						end
-					elseif v62 == 1 then
-						r2 = r5
-						r3 = r3
-						continue
 					end
-					unreachable()
+					SP = r4
+					r0 = bit32.band(imul32(r3, bit32.band(r6, r5)), r1)
+					lbl = 1
+					break
 				end
 				if lbl ~= 0 then
 					if lbl == 1 then
@@ -7364,95 +6104,27 @@ function F58()
 						break
 					end
 				end
-			elseif v22 == 1 then
-				r0 = r0
-				r1 = r1
-				break
 			end
 		end
-		unreachable()
+		r0 = 0xFFFFFFFF
 	until true
-	return r0, r1
-end
-
--- std::ptr::align_offset::<u8>
-function F59(v2: number, v3: number)
-	local r0: number, r1: number, r2: number, r3: number, r4: number, r5: number, r6: number, r7: number = 0, 0, 0, 0, 0, 0, 0, 0
-	r4 = v3 - 1
-	if v3 % 1 == 0 then
-		local v8 = v2 + r4
-		if v8 > 0xFFFFFFFF then v8 -= 0x100000000 end
-		if v8 < 0 then v8 += 0x100000000 end
-		local v10 = 0 - v3
-		if v10 < 0 then v10 += 0x100000000 end
-		r0 = bit32.bor(bit32.band(v8, v10) - v2, 0)
-		if v2 % 1 == 0 then
-			r0 = r0 // 1
-		else
-			r0 = 0xFFFFFFFF
-		end
-	else
-		local v17 = bit32.countrz(1)
-		r3 = v17
-		r0 = bit32.countrz(v3)
-		if not (v17 < r0) then
-			r3 = r0
-		end
-		if bit32.band(v2, bit32.lshift(1, r3) - 1) == 0 then
-			r0 = bit32.rshift(v3, r3)
-			r1 = r0 - 1
-			r2 = bit32.rshift(bit32.band(1, r4), r3)
-			r3 = r0 - bit32.rshift(bit32.band(v2, r4), r3)
-			r4 = SP
-			r6 = r4 - 8
-			SP = r6
-			r5 = r0 - 1
-			local v53 = buffer.readu32(MEM, 1054216)
-			buffer.writeu32(MEM, r4 + -8, buffer.readu32(MEM, 1054212))
-			buffer.writeu32(MEM, r4 + -4, v53)
-			r7 = bit32.rshift(bit32.band(r2, 15), 1)
-			if not (r7 < 8) then
-				oob(8, r7, "/rust/core/src/ptr/mod.rs", 2274, 27)
-			end
-			r6 = buffer.readu8(MEM, r6 + r7)
-			r7 = 16
-			while true do
-				if not (r0 <= r7) then
-					local v46 = 2 - imul32(r2, r6)
-					if v46 < 0 then v46 += 0x100000000 end
-					r6 = imul32(r6, v46)
-					local v49 = imul32(r7, r7)
-					local v50 = v49 ~= r7 * r7
-					r7 = v49
-					if not v50 then
-						continue
-					end
-				end
-				SP = r4
-				r0 = bit32.band(imul32(r3, bit32.band(r6, r5)), r1)
-				break
-			end
-		else
-			r0 = 0xFFFFFFFF
-		end
-	end
 	return r0
 end
 
 -- <&dyn std::fmt::Debug as std::fmt::Debug>::fmt
-FT[60] = function(v0: number, v1: number)
+FT[59] = function(v0: number, v1: number)
 	local v5 = FN[buffer.readu32(MEM, buffer.readu32(MEM, v0 + 4) + 12)](buffer.readu32(MEM, v0), v1)
 	return v5
 end
 
 -- std::alloc::default_alloc_error_hook
-FT[61] = function(v0: number, v1: number)
+FT[60] = function(v0: number, v1: number)
 	buffer.writeu8(MEM, 1053832, 1)
 	return
 end
 
 -- std::ptr::drop_glue::<std::io::Error> - shim(Some(std::io::Error))
-function F62(v0: number)
+function F61(v0: number)
 	local r0: number, r1: number, r2: number = 0, 0, 0
 	local v1 = buffer.readu8(MEM, v0)
 	if v1 ~= 0 and v1 ~= 1 and v1 ~= 2 then
@@ -7477,31 +6149,30 @@ function F62(v0: number)
 end
 
 -- <std::cell::BorrowMutError as std::fmt::Display>::fmt
-FT[63] = function(v0: number, v1: number)
+FT[62] = function(v0: number, v1: number)
 	local v2 = F40(v1, 1054141, 24)
 	return v2
 end
 
 -- core::slice::memchr::memrchr
-function F64(v5: number, v6: number, v7: number)
+function F63(v5: number, v6: number, v7: number)
 	local r0: number, r1: number, r2: number, r3: number, r4: number, r5: number, r6: number, r7: number, r8: number, r9: number, r10: boolean = 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, false
 	local lbl = 0
 	r3 = 0
-	r4 = 0
 	r8 = 0
+	r4 = 0
 	r9 = 0
 	r0 = SP
 	r1 = r0 - 24
 	SP = r1
 	buffer.writeu8(MEM, r0 + -24, v5)
-	r2 = F59(v6, 4)
+	r2 = F58(v6, 4)
 	if v7 < r2 then
 		r2 = v7
 		r3 = 0
 	else
 		if not (r2 <= v7) then
 			F14(1052028, 19, 1054252)
-			unreachable()
 		end
 		local v54 = (v7 - r2) % 8
 		r2 = r2
@@ -7523,7 +6194,6 @@ function F64(v5: number, v6: number, v7: number)
 			buffer.writeu32(MEM, r1 + -184, r0 + 4)
 			buffer.writeu32(MEM, r1 + -180, 3)
 			F14(1048719, r0 + 32, 1054168)
-			unreachable()
 		end
 		if v7 < v7 then
 			buffer.writeu32(MEM, r1 + -216, v7)
@@ -7533,7 +6203,6 @@ function F64(v5: number, v6: number, v7: number)
 			buffer.writeu32(MEM, r1 + -136, r0 + 12)
 			buffer.writeu32(MEM, r1 + -132, 3)
 			F14(1048776, r0 + 80, 1054168)
-			unreachable()
 		end
 		if v7 < r4 then
 			buffer.writeu32(MEM, r1 + -208, r4)
@@ -7543,7 +6212,6 @@ function F64(v5: number, v6: number, v7: number)
 			buffer.writeu32(MEM, r1 + -88, r0 + 20)
 			buffer.writeu32(MEM, r1 + -84, 3)
 			F14(1048831, r0 + 128, 1054168)
-			unreachable()
 		end
 		buffer.writeu32(MEM, r1 + -200, v7)
 		buffer.writeu32(MEM, r1 + -196, v7)
@@ -7552,21 +6220,20 @@ function F64(v5: number, v6: number, v7: number)
 		buffer.writeu32(MEM, r1 + -40, r0 + 28)
 		buffer.writeu32(MEM, r1 + -36, 3)
 		F14(1048776, r0 + 176, 1054168)
-		unreachable()
 	end
 	local v43 = v6 + r4
 	local v44 = v43 + (v7 - r4)
-	r8 = v43
-	r9 = v44
+	r9 = v43
+	r8 = v44
 	r7 = 0
 	r7 = r1
 	r4 = v44 - v43
 	while true do
-		if r8 == r9 then
+		if r9 == r8 then
 			r6 = 0
 		else
-			local v81 = r9 + -1
-			r9 = v81
+			local v81 = r8 + -1
+			r8 = v81
 			r6 = v81
 		end
 		r5 = r6
@@ -7580,9 +6247,6 @@ function F64(v5: number, v6: number, v7: number)
 			r5 = r4
 			r4 = 1
 		else
-			if v76 ~= 0 then
-				unreachable()
-			end
 			r4 = 0
 			r5 = 0
 		end
@@ -7593,9 +6257,6 @@ function F64(v5: number, v6: number, v7: number)
 				if r2 > 0xFFFFFFFF then r2 -= 0x100000000 end
 				r1 = 1
 			else
-				if r4 ~= 0 then
-					unreachable()
-				end
 				buffer.fill(MEM, r1 + 20, buffer.readu8(MEM, r0 + -24), 4)
 				r4 = buffer.readu32(MEM, r0 + -4)
 				while true do
@@ -7618,17 +6279,17 @@ function F64(v5: number, v6: number, v7: number)
 					if not (r3 < 0) then
 						if r3 <= v7 then
 							local v46 = v6 + r3
-							r4 = v6
-							r3 = v46
+							r3 = v6
+							r4 = v46
 							r2 = 0
 							r2 = r1
 							r1 = v46 - v6
 							while true do
-								if r4 == r3 then
+								if r3 == r4 then
 									r6 = 0
 								else
-									local v96 = r3 + -1
-									r3 = v96
+									local v96 = r4 + -1
+									r4 = v96
 									r6 = v96
 								end
 								r5 = r6
@@ -7642,9 +6303,6 @@ function F64(v5: number, v6: number, v7: number)
 									r2 = r1
 									r1 = 1
 								else
-									if v91 ~= 0 then
-										unreachable()
-									end
 									r1 = 0
 									r2 = 0
 								end
@@ -7673,7 +6331,6 @@ function F64(v5: number, v6: number, v7: number)
 						buffer.writeu32(MEM, r1 + -184, r0 + 4)
 						buffer.writeu32(MEM, r1 + -180, 3)
 						F14(1048719, r0 + 32, 1054184)
-						unreachable()
 					end
 					if v7 < r2 then
 						buffer.writeu32(MEM, r1 + -216, r2)
@@ -7683,7 +6340,6 @@ function F64(v5: number, v6: number, v7: number)
 						buffer.writeu32(MEM, r1 + -136, r0 + 12)
 						buffer.writeu32(MEM, r1 + -132, 3)
 						F14(1048776, r0 + 80, 1054184)
-						unreachable()
 					end
 					if r2 < 0 then
 						buffer.writeu32(MEM, r1 + -208, 0)
@@ -7693,7 +6349,6 @@ function F64(v5: number, v6: number, v7: number)
 						buffer.writeu32(MEM, r1 + -88, r0 + 20)
 						buffer.writeu32(MEM, r1 + -84, 3)
 						F14(1048831, r0 + 128, 1054184)
-						unreachable()
 					end
 					buffer.writeu32(MEM, r1 + -200, r2)
 					buffer.writeu32(MEM, r1 + -196, v7)
@@ -7702,7 +6357,6 @@ function F64(v5: number, v6: number, v7: number)
 					buffer.writeu32(MEM, r1 + -40, r0 + 28)
 					buffer.writeu32(MEM, r1 + -36, 3)
 					F14(1048776, r0 + 176, 1054184)
-					unreachable()
 				end
 			end
 		until true
@@ -7712,7 +6366,7 @@ function F64(v5: number, v6: number, v7: number)
 end
 
 -- <std::io::BufWriter<std::io::stdio::StdoutRaw> as std::io::Write>::write_all
-function F65(ret_0: number, v1: number, v2: number, v3: number)
+function F64(ret_0: number, v1: number, v2: number, v3: number)
 	local r0: number, r1: number = 0, 0
 	local v7 = buffer.readu32(MEM, v1) - buffer.readu32(MEM, v1 + 8)
 	if v7 < 0 then v7 += 0x100000000 end
@@ -7731,12 +6385,9 @@ function F65(ret_0: number, v1: number, v2: number, v3: number)
 			local v19 = buffer.readu32(MEM, v1) - buffer.readu32(MEM, v1 + 8)
 			if v19 < 0 then v19 += 0x100000000 end
 			if v19 < v3 then
-				F66(r0 + 8, v1)
+				F65(r0 + 8, v1)
 				local v24 = if buffer.readu8(MEM, r1 + -40) == 255 then 0 else 1
 				if v24 ~= 0 then
-					if v24 ~= 1 then
-						unreachable()
-					end
 					local v33 = buffer.readu32(MEM, r1 + -36)
 					buffer.writeu32(MEM, ret_0, buffer.readu32(MEM, r1 + -40))
 					buffer.writeu32(MEM, ret_0 + 4, v33)
@@ -7763,7 +6414,7 @@ function F65(ret_0: number, v1: number, v2: number, v3: number)
 end
 
 -- std::io::BufWriter::<std::io::stdio::StdoutRaw>::flush_buf
-function F66(ret_2: number, v3: number)
+function F65(ret_2: number, v3: number)
 	local r0: number, r1: number, r2: number, r3: number, r4: number, r5: boolean = 0, 0, 0, 0, 0, false
 	local lbl = 0
 	r1 = SP
@@ -7774,7 +6425,7 @@ function F66(ret_2: number, v3: number)
 	while true do
 		if buffer.readu32(MEM, buffer.readu32(MEM, r1 + -48) + 8) <= buffer.readu32(MEM, r1 + -44) then
 			buffer.writeu8(MEM, ret_2, 255)
-			F69(r0)
+			F68(r0)
 		else
 			buffer.writeu8(MEM, v3 + 12, 1)
 			local v24 = buffer.readu32(MEM, r1 + -48)
@@ -7793,7 +6444,6 @@ function F66(ret_2: number, v3: number)
 					buffer.writeu32(MEM, r1 + -184, r0 + 4)
 					buffer.writeu32(MEM, r1 + -180, 3)
 					F14(1048719, r0 + 32, 1054300)
-					unreachable()
 				end
 				if r3 < r3 then
 					buffer.writeu32(MEM, r1 + -216, r3)
@@ -7803,7 +6453,6 @@ function F66(ret_2: number, v3: number)
 					buffer.writeu32(MEM, r1 + -136, r0 + 12)
 					buffer.writeu32(MEM, r1 + -132, 3)
 					F14(1048776, r0 + 80, 1054300)
-					unreachable()
 				end
 				if r3 < r2 then
 					buffer.writeu32(MEM, r1 + -208, r2)
@@ -7813,7 +6462,6 @@ function F66(ret_2: number, v3: number)
 					buffer.writeu32(MEM, r1 + -88, r0 + 20)
 					buffer.writeu32(MEM, r1 + -84, 3)
 					F14(1048831, r0 + 128, 1054300)
-					unreachable()
 				end
 				buffer.writeu32(MEM, r1 + -200, r3)
 				buffer.writeu32(MEM, r1 + -196, r3)
@@ -7822,100 +6470,75 @@ function F66(ret_2: number, v3: number)
 				buffer.writeu32(MEM, r1 + -40, r0 + 28)
 				buffer.writeu32(MEM, r1 + -36, 3)
 				F14(1048776, r0 + 176, 1054300)
-				unreachable()
 			end
 			repeat
-				repeat
-					local v29 = r3 - r2
-					rt_write(1, r4 + r2, v29)
-					buffer.writeu32(MEM, r1 + -36, v29)
-					buffer.writeu8(MEM, r1 + -40, 255)
-					buffer.writeu8(MEM, v3 + 12, 0)
-					local v10 = if buffer.readu8(MEM, r1 + -40) == 255 then 0 else 1
-					if v10 == 0 then
-						if buffer.readu32(MEM, r1 + -36) == 0 then
-							buffer.writeu32(MEM, r1 + -4, 1054200)
-							buffer.writeu8(MEM, r1 + -8, 2)
-							buffer.writeu32(MEM, ret_2, buffer.readu32(MEM, r1 + -8))
-							buffer.writeu32(MEM, ret_2 + 4, 1054200)
-							lbl = 1
-							break
-						end
-						local v16 = buffer.readu32(MEM, r1 + -44) + buffer.readu32(MEM, r1 + -36)
-						if v16 > 0xFFFFFFFF then v16 -= 0x100000000 end
-						buffer.writeu32(MEM, r1 + -44, v16)
+				local v29 = r3 - r2
+				rt_write(1, r4 + r2, v29)
+				buffer.writeu32(MEM, r1 + -36, v29)
+				buffer.writeu8(MEM, r1 + -40, 255)
+				buffer.writeu8(MEM, v3 + 12, 0)
+				local v10 = if buffer.readu8(MEM, r1 + -40) == 255 then 0 else 1
+				if v10 == 0 then
+					if buffer.readu32(MEM, r1 + -36) == 0 then
+						buffer.writeu32(MEM, r1 + -4, 1054200)
+						buffer.writeu8(MEM, r1 + -8, 2)
+						buffer.writeu32(MEM, ret_2, buffer.readu32(MEM, r1 + -8))
+						buffer.writeu32(MEM, ret_2 + 4, 1054200)
+						break
+					end
+					local v16 = buffer.readu32(MEM, r1 + -44) + buffer.readu32(MEM, r1 + -36)
+					if v16 > 0xFFFFFFFF then v16 -= 0x100000000 end
+					buffer.writeu32(MEM, r1 + -44, v16)
+				else
+					r2 = SP
+					local v49 = buffer.readu8(MEM, r1 + -40)
+					if v49 == 0 then
+						buffer.writei32(MEM, r2 + -4, buffer.readi32(MEM, r1 + -36))
+						buffer.writeu8(MEM, r2 + -8, 0)
+						r5 = false
+					elseif v49 == 1 then
+						buffer.writeu8(MEM, r2 + -7, buffer.readu8(MEM, r1 + -39))
+						buffer.writeu8(MEM, r2 + -8, 1)
+						r5 = buffer.readu8(MEM, r2 + -7) == 35
+					elseif v49 == 2 then
+						local v52 = buffer.readu32(MEM, r1 + -36)
+						buffer.writeu32(MEM, r2 + -4, v52)
+						buffer.writeu8(MEM, r2 + -8, 2)
+						r5 = buffer.readu8(MEM, v52 + 8) == 35
 					else
-						if v10 ~= 1 then
-							break
-						end
-						r2 = SP
-						local v49 = buffer.readu8(MEM, r1 + -40)
-						if v49 == 0 then
-							buffer.writei32(MEM, r2 + -4, buffer.readi32(MEM, r1 + -36))
-							buffer.writeu8(MEM, r2 + -8, 0)
-							r5 = false
-						elseif v49 == 1 then
-							buffer.writeu8(MEM, r2 + -7, buffer.readu8(MEM, r1 + -39))
-							buffer.writeu8(MEM, r2 + -8, 1)
-							r5 = buffer.readu8(MEM, r2 + -7) == 35
-						elseif v49 == 2 then
-							local v52 = buffer.readu32(MEM, r1 + -36)
-							buffer.writeu32(MEM, r2 + -4, v52)
-							buffer.writeu8(MEM, r2 + -8, 2)
-							r5 = buffer.readu8(MEM, v52 + 8) == 35
-						else
-							if v49 ~= 3 then
-								unreachable()
-							end
-							local v50 = buffer.readu32(MEM, r1 + -36)
-							buffer.writeu32(MEM, r2 + -4, v50)
-							buffer.writeu8(MEM, r2 + -8, 3)
-							r5 = buffer.readu8(MEM, v50 + 8) == 35
-						end
-						SP = r2
-						if not r5 then
-							local v23 = buffer.readu32(MEM, r1 + -36)
-							buffer.writeu32(MEM, ret_2, buffer.readu32(MEM, r1 + -40))
-							buffer.writeu32(MEM, ret_2 + 4, v23)
-							lbl = 2
-							break
-						end
+						local v50 = buffer.readu32(MEM, r1 + -36)
+						buffer.writeu32(MEM, r2 + -4, v50)
+						buffer.writeu8(MEM, r2 + -8, 3)
+						r5 = buffer.readu8(MEM, v50 + 8) == 35
 					end
-					local v20 = if buffer.readu8(MEM, r1 + -40) == 255 then 0 else 1
-					if v20 == 1 then
-						F62(r0 + 8)
-						lbl = 3
+					SP = r2
+					if not r5 then
+						local v23 = buffer.readu32(MEM, r1 + -36)
+						buffer.writeu32(MEM, ret_2, buffer.readu32(MEM, r1 + -40))
+						buffer.writeu32(MEM, ret_2 + 4, v23)
 						break
 					end
-					if v20 == 0 then
-						lbl = 4
-						break
-					end
-				until true
-				if lbl ~= 0 then
-					if lbl == 1 then
-						lbl = 0
-						break
-					end
-					if lbl == 2 then
-						lbl = 0
-						break
-					end
+				end
+				local v20 = if buffer.readu8(MEM, r1 + -40) == 255 then 0 else 1
+				if v20 ~= 1 then
+					lbl = 2
 					break
 				end
-				unreachable()
+				F61(r0 + 8)
+				lbl = 1
+				break
 			until true
 			if lbl ~= 0 then
-				if lbl == 3 then
+				if lbl == 1 then
 					lbl = 0
 					continue
 				end
-				if lbl == 4 then
+				if lbl == 2 then
 					lbl = 0
 					continue
 				end
 			end
-			F69(r0)
+			F68(r0)
 		end
 		SP = r1
 		return
@@ -7923,7 +6546,7 @@ function F66(ret_2: number, v3: number)
 end
 
 -- <std::sync::Arc<std::sync::Mutex<std::vec::Vec<u8>>> as std::ops::Drop>::drop
-function F67(v0: number)
+function F66(v0: number)
 	local r0: number, r1: number, r2: number = 0, 0, 0
 	local v1 = buffer.readu32(MEM, v0)
 	local v2 = buffer.readu32(MEM, v1)
@@ -7955,13 +6578,13 @@ function F67(v0: number)
 end
 
 -- <std::fmt::Arguments<'_> as std::fmt::Display>::fmt
-FT[68] = function(v0: number, v1: number)
+FT[67] = function(v0: number, v1: number)
 	local v6 = F41(buffer.readu32(MEM, v1), buffer.readu32(MEM, v1 + 4), buffer.readu32(MEM, v0), buffer.readu32(MEM, v0 + 4))
 	return v6
 end
 
 -- std::ptr::drop_glue::<std::io::BufWriter<W>::flush_buf::BufGuard<'_>> - shim(Some(std::io::BufWriter<W>::flush_buf::BufGuard<'_>))
-function F69(v0: number)
+function F68(v0: number)
 	local r0: number, r1: number, r2: number, r3: number = 0, 0, 0, 0
 	if 0 < buffer.readu32(MEM, v0 + 4) then
 		local v3 = buffer.readu32(MEM, v0)
@@ -7970,14 +6593,13 @@ function F69(v0: number)
 		r0 = v4 - v5
 		if r0 < 0 then r0 += 0x100000000 end
 		r1 = buffer.readu32(MEM, v3 + 4)
-		r2, r3 = F71(v4, 0, v5, 2, 0)
+		r2, r3 = F69(v4, 0, v5, 2, 0)
 		r3 = r3 - r2
 		if r3 < 0 then r3 += 0x100000000 end
 		local v13 = v4 - r3
 		if v13 < 0 then v13 += 0x100000000 end
 		if not (0 <= v13) then
 			F14(1054704, 43, 1054688)
-			unreachable()
 		end
 		buffer.copy(MEM, r1, MEM, r1 + r2, r3)
 		r1 = buffer.readu32(MEM, v0)
@@ -7988,509 +6610,200 @@ function F69(v0: number)
 	return
 end
 
--- std::sync::atomic::atomic_compare_exchange_weak::<u64>
-function F70(v7: number, v8: number, v9: number, v10: number, v11: number, v12: number, v13: number)
-	local r0: number, r1: boolean, r2: number, r3: number, r4: number = 0, false, 0, 0, 0
-	local lbl = 0
-	repeat
-		repeat
-			if v12 == 0 then
-				if v13 == 0 then
-					local v112 = buffer.readu32(MEM, v7)
-					local v113 = buffer.readu32(MEM, v7 + 4)
-					local v116 = v112 == v8 and v113 == v9
-					buffer.writeu32(MEM, v7, if v116 then v10 else v112)
-					buffer.writeu32(MEM, v7 + 4, if v116 then v11 else v113)
-					r2 = v112
-					r0 = v113
-					r1 = v116
-					lbl = 1
-					break
-				end
-				if v13 == 2 then
-					local v105 = buffer.readu32(MEM, v7)
-					local v106 = buffer.readu32(MEM, v7 + 4)
-					local v109 = v105 == v8 and v106 == v9
-					buffer.writeu32(MEM, v7, if v109 then v10 else v105)
-					buffer.writeu32(MEM, v7 + 4, if v109 then v11 else v106)
-					r2 = v105
-					r0 = v106
-					r1 = v109
-					lbl = 2
-					break
-				end
-				if v13 == 4 then
-					local v98 = buffer.readu32(MEM, v7)
-					local v99 = buffer.readu32(MEM, v7 + 4)
-					local v102 = v98 == v8 and v99 == v9
-					buffer.writeu32(MEM, v7, if v102 then v10 else v98)
-					buffer.writeu32(MEM, v7 + 4, if v102 then v11 else v99)
-					r2 = v98
-					r0 = v99
-					r1 = v102
-					lbl = 3
-					break
-				end
-			elseif v12 == 1 then
-				if v13 == 0 then
-					local v70 = buffer.readu32(MEM, v7)
-					local v71 = buffer.readu32(MEM, v7 + 4)
-					local v74 = v70 == v8 and v71 == v9
-					buffer.writeu32(MEM, v7, if v74 then v10 else v70)
-					buffer.writeu32(MEM, v7 + 4, if v74 then v11 else v71)
-					r2 = v70
-					r0 = v71
-					r1 = v74
-					lbl = 4
-					break
-				end
-				if v13 == 2 then
-					local v63 = buffer.readu32(MEM, v7)
-					local v64 = buffer.readu32(MEM, v7 + 4)
-					local v67 = v63 == v8 and v64 == v9
-					buffer.writeu32(MEM, v7, if v67 then v10 else v63)
-					buffer.writeu32(MEM, v7 + 4, if v67 then v11 else v64)
-					r2 = v63
-					r0 = v64
-					r1 = v67
-					lbl = 5
-					break
-				end
-				if v13 == 4 then
-					local v56 = buffer.readu32(MEM, v7)
-					local v57 = buffer.readu32(MEM, v7 + 4)
-					local v60 = v56 == v8 and v57 == v9
-					buffer.writeu32(MEM, v7, if v60 then v10 else v56)
-					buffer.writeu32(MEM, v7 + 4, if v60 then v11 else v57)
-					r2 = v56
-					r0 = v57
-					r1 = v60
-					lbl = 6
-					break
-				end
-			elseif v12 == 2 then
-				if v13 == 0 then
-					local v91 = buffer.readu32(MEM, v7)
-					local v92 = buffer.readu32(MEM, v7 + 4)
-					local v95 = v91 == v8 and v92 == v9
-					buffer.writeu32(MEM, v7, if v95 then v10 else v91)
-					buffer.writeu32(MEM, v7 + 4, if v95 then v11 else v92)
-					r2 = v91
-					r0 = v92
-					r1 = v95
-					lbl = 7
-					break
-				end
-				if v13 == 2 then
-					local v84 = buffer.readu32(MEM, v7)
-					local v85 = buffer.readu32(MEM, v7 + 4)
-					local v88 = v84 == v8 and v85 == v9
-					buffer.writeu32(MEM, v7, if v88 then v10 else v84)
-					buffer.writeu32(MEM, v7 + 4, if v88 then v11 else v85)
-					r2 = v84
-					r0 = v85
-					r1 = v88
-					lbl = 8
-					break
-				end
-				if v13 == 4 then
-					local v77 = buffer.readu32(MEM, v7)
-					local v78 = buffer.readu32(MEM, v7 + 4)
-					local v81 = v77 == v8 and v78 == v9
-					buffer.writeu32(MEM, v7, if v81 then v10 else v77)
-					buffer.writeu32(MEM, v7 + 4, if v81 then v11 else v78)
-					r2 = v77
-					r0 = v78
-					r1 = v81
-					lbl = 9
-					break
-				end
-			elseif v12 == 3 then
-				if v13 == 0 then
-					local v49 = buffer.readu32(MEM, v7)
-					local v50 = buffer.readu32(MEM, v7 + 4)
-					local v53 = v49 == v8 and v50 == v9
-					buffer.writeu32(MEM, v7, if v53 then v10 else v49)
-					buffer.writeu32(MEM, v7 + 4, if v53 then v11 else v50)
-					r2 = v49
-					r0 = v50
-					r1 = v53
-					lbl = 10
-					break
-				end
-				if v13 == 2 then
-					local v42 = buffer.readu32(MEM, v7)
-					local v43 = buffer.readu32(MEM, v7 + 4)
-					local v46 = v42 == v8 and v43 == v9
-					buffer.writeu32(MEM, v7, if v46 then v10 else v42)
-					buffer.writeu32(MEM, v7 + 4, if v46 then v11 else v43)
-					r2 = v42
-					r0 = v43
-					r1 = v46
-					lbl = 11
-					break
-				end
-				if v13 == 4 then
-					local v35 = buffer.readu32(MEM, v7)
-					local v36 = buffer.readu32(MEM, v7 + 4)
-					local v39 = v35 == v8 and v36 == v9
-					buffer.writeu32(MEM, v7, if v39 then v10 else v35)
-					buffer.writeu32(MEM, v7 + 4, if v39 then v11 else v36)
-					r2 = v35
-					r0 = v36
-					r1 = v39
-					lbl = 12
-					break
-				end
-			else
-				if v12 ~= 4 then
-					break
-				end
-				if v13 == 0 then
-					local v28 = buffer.readu32(MEM, v7)
-					local v29 = buffer.readu32(MEM, v7 + 4)
-					local v32 = v28 == v8 and v29 == v9
-					buffer.writeu32(MEM, v7, if v32 then v10 else v28)
-					buffer.writeu32(MEM, v7 + 4, if v32 then v11 else v29)
-					r2 = v28
-					r0 = v29
-					r1 = v32
-					lbl = 13
-					break
-				end
-				if v13 == 2 then
-					local v21 = buffer.readu32(MEM, v7)
-					local v22 = buffer.readu32(MEM, v7 + 4)
-					local v25 = v21 == v8 and v22 == v9
-					buffer.writeu32(MEM, v7, if v25 then v10 else v21)
-					buffer.writeu32(MEM, v7 + 4, if v25 then v11 else v22)
-					r2 = v21
-					r0 = v22
-					r1 = v25
-					lbl = 14
-					break
-				end
-				if v13 == 4 then
-					local v14 = buffer.readu32(MEM, v7)
-					local v15 = buffer.readu32(MEM, v7 + 4)
-					local v18 = v14 == v8 and v15 == v9
-					buffer.writeu32(MEM, v7, if v18 then v10 else v14)
-					buffer.writeu32(MEM, v7 + 4, if v18 then v11 else v15)
-					r2 = v14
-					r0 = v15
-					r1 = v18
-					lbl = 15
-					break
-				end
-			end
-			if v13 == 1 then
-				F14(1054540, 105, 1054592)
-				unreachable()
-			end
-			if v13 == 3 then
-				F14(1054608, 123, 1054672)
-				unreachable()
-			end
-		until true
-		if lbl ~= 0 then
-			if lbl == 1 then
-				lbl = 0
-				break
-			end
-			if lbl == 2 then
-				lbl = 0
-				break
-			end
-			if lbl == 3 then
-				lbl = 0
-				break
-			end
-			if lbl == 4 then
-				lbl = 0
-				break
-			end
-			if lbl == 5 then
-				lbl = 0
-				break
-			end
-			if lbl == 6 then
-				lbl = 0
-				break
-			end
-			if lbl == 7 then
-				lbl = 0
-				break
-			end
-			if lbl == 8 then
-				lbl = 0
-				break
-			end
-			if lbl == 9 then
-				lbl = 0
-				break
-			end
-			if lbl == 10 then
-				lbl = 0
-				break
-			end
-			if lbl == 11 then
-				lbl = 0
-				break
-			end
-			if lbl == 12 then
-				lbl = 0
-				break
-			end
-			if lbl == 13 then
-				lbl = 0
-				break
-			end
-			if lbl == 14 then
-				lbl = 0
-				break
-			end
-			if lbl == 15 then
-				lbl = 0
-				break
-			end
-		end
-		unreachable()
-	until true
-	r2 = r2
-	r3 = r0
-	if r1 then
-		r0 = r2
-		r4 = r3
-		r2 = 0
-		r3 = 0
-	else
-		r0 = r2
-		r4 = r3
-		r2 = 1
-		r3 = 0
-	end
-	return r2, r3, r0, r4
-end
-
 -- core::slice::index::into_slice_range
-function F71(v2: number, v3: number, v4: number, v5: number, v6: number)
+function F69(v2: number, v3: number, v4: number, v5: number, v6: number)
 	local r0: number, r1: number, r2: number, r3: number, r4: number = 0, 0, 0, 0, 0
-	repeat
-		local v7 = v5
-		if v7 > 0x7FFFFFFF then v7 -= 0x100000000 end
-		if v7 == 0 then
-			if v2 <= v6 then
-				r1 = SP
-				r0 = r1 - 224
-				SP = r0
-				if v2 < 0 then
-					buffer.writeu32(MEM, r1 + -224, 0)
-					buffer.writeu32(MEM, r1 + -220, v2)
-					buffer.writeu32(MEM, r1 + -192, r0)
-					buffer.writeu32(MEM, r1 + -188, 3)
-					buffer.writeu32(MEM, r1 + -184, r0 + 4)
-					buffer.writeu32(MEM, r1 + -180, 3)
-					F14(1048719, r0 + 32, 1054728)
-					unreachable()
-				end
-				if v2 < v6 then
-					buffer.writeu32(MEM, r1 + -216, v6)
-					buffer.writeu32(MEM, r1 + -212, v2)
-					buffer.writeu32(MEM, r1 + -144, r0 + 8)
-					buffer.writeu32(MEM, r1 + -140, 3)
-					buffer.writeu32(MEM, r1 + -136, r0 + 12)
-					buffer.writeu32(MEM, r1 + -132, 3)
-					F14(1048776, r0 + 80, 1054728)
-					unreachable()
-				end
-				if v6 < 0 then
-					buffer.writeu32(MEM, r1 + -208, 0)
-					buffer.writeu32(MEM, r1 + -204, v6)
-					buffer.writeu32(MEM, r1 + -96, r0 + 16)
-					buffer.writeu32(MEM, r1 + -92, 3)
-					buffer.writeu32(MEM, r1 + -88, r0 + 20)
-					buffer.writeu32(MEM, r1 + -84, 3)
-					F14(1048831, r0 + 128, 1054728)
-					unreachable()
-				end
-				buffer.writeu32(MEM, r1 + -200, v6)
-				buffer.writeu32(MEM, r1 + -196, v2)
-				buffer.writeu32(MEM, r1 + -48, r0 + 24)
-				buffer.writeu32(MEM, r1 + -44, 3)
-				buffer.writeu32(MEM, r1 + -40, r0 + 28)
-				buffer.writeu32(MEM, r1 + -36, 3)
-				F14(1048776, r0 + 176, 1054728)
-				unreachable()
+	local v7 = v5
+	if v7 > 0x7FFFFFFF then v7 -= 0x100000000 end
+	if v7 == 0 then
+		if v2 <= v6 then
+			r1 = SP
+			r0 = r1 - 224
+			SP = r0
+			if v2 < 0 then
+				buffer.writeu32(MEM, r1 + -224, 0)
+				buffer.writeu32(MEM, r1 + -220, v2)
+				buffer.writeu32(MEM, r1 + -192, r0)
+				buffer.writeu32(MEM, r1 + -188, 3)
+				buffer.writeu32(MEM, r1 + -184, r0 + 4)
+				buffer.writeu32(MEM, r1 + -180, 3)
+				F14(1048719, r0 + 32, 1054728)
 			end
-			r2 = v6 + 1
-		elseif v7 == 1 then
-			r2 = v6
 			if v2 < v6 then
-				r2 = r2
-				r1 = SP
-				r0 = r1 - 224
-				SP = r0
-				if v2 < 0 then
-					buffer.writeu32(MEM, r1 + -224, 0)
-					buffer.writeu32(MEM, r1 + -220, v2)
-					buffer.writeu32(MEM, r1 + -192, r0)
-					buffer.writeu32(MEM, r1 + -188, 3)
-					buffer.writeu32(MEM, r1 + -184, r0 + 4)
-					buffer.writeu32(MEM, r1 + -180, 3)
-					F14(1048719, r0 + 32, 1054744)
-					unreachable()
-				end
-				if v2 < r2 then
-					buffer.writeu32(MEM, r1 + -216, r2)
-					buffer.writeu32(MEM, r1 + -212, v2)
-					buffer.writeu32(MEM, r1 + -144, r0 + 8)
-					buffer.writeu32(MEM, r1 + -140, 3)
-					buffer.writeu32(MEM, r1 + -136, r0 + 12)
-					buffer.writeu32(MEM, r1 + -132, 3)
-					F14(1048776, r0 + 80, 1054744)
-					unreachable()
-				end
-				if r2 < 0 then
-					buffer.writeu32(MEM, r1 + -208, 0)
-					buffer.writeu32(MEM, r1 + -204, r2)
-					buffer.writeu32(MEM, r1 + -96, r0 + 16)
-					buffer.writeu32(MEM, r1 + -92, 3)
-					buffer.writeu32(MEM, r1 + -88, r0 + 20)
-					buffer.writeu32(MEM, r1 + -84, 3)
-					F14(1048831, r0 + 128, 1054744)
-					unreachable()
-				end
-				buffer.writeu32(MEM, r1 + -200, r2)
-				buffer.writeu32(MEM, r1 + -196, v2)
-				buffer.writeu32(MEM, r1 + -48, r0 + 24)
-				buffer.writeu32(MEM, r1 + -44, 3)
-				buffer.writeu32(MEM, r1 + -40, r0 + 28)
-				buffer.writeu32(MEM, r1 + -36, 3)
-				F14(1048776, r0 + 176, 1054744)
-				unreachable()
+				buffer.writeu32(MEM, r1 + -216, v6)
+				buffer.writeu32(MEM, r1 + -212, v2)
+				buffer.writeu32(MEM, r1 + -144, r0 + 8)
+				buffer.writeu32(MEM, r1 + -140, 3)
+				buffer.writeu32(MEM, r1 + -136, r0 + 12)
+				buffer.writeu32(MEM, r1 + -132, 3)
+				F14(1048776, r0 + 80, 1054728)
 			end
-		else
-			if v7 ~= 2 then
-				break
+			if v6 < 0 then
+				buffer.writeu32(MEM, r1 + -208, 0)
+				buffer.writeu32(MEM, r1 + -204, v6)
+				buffer.writeu32(MEM, r1 + -96, r0 + 16)
+				buffer.writeu32(MEM, r1 + -92, 3)
+				buffer.writeu32(MEM, r1 + -88, r0 + 20)
+				buffer.writeu32(MEM, r1 + -84, 3)
+				F14(1048831, r0 + 128, 1054728)
 			end
-			r2 = v2
+			buffer.writeu32(MEM, r1 + -200, v6)
+			buffer.writeu32(MEM, r1 + -196, v2)
+			buffer.writeu32(MEM, r1 + -48, r0 + 24)
+			buffer.writeu32(MEM, r1 + -44, 3)
+			buffer.writeu32(MEM, r1 + -40, r0 + 28)
+			buffer.writeu32(MEM, r1 + -36, 3)
+			F14(1048776, r0 + 176, 1054728)
 		end
-		local v11 = v3
-		if v11 > 0x7FFFFFFF then v11 -= 0x100000000 end
-		if v11 == 0 then
-			r0 = v4
+		r2 = v6 + 1
+	elseif v7 == 1 then
+		r2 = v6
+		if v2 < v6 then
+			r2 = r2
+			r1 = SP
+			r0 = r1 - 224
+			SP = r0
+			if v2 < 0 then
+				buffer.writeu32(MEM, r1 + -224, 0)
+				buffer.writeu32(MEM, r1 + -220, v2)
+				buffer.writeu32(MEM, r1 + -192, r0)
+				buffer.writeu32(MEM, r1 + -188, 3)
+				buffer.writeu32(MEM, r1 + -184, r0 + 4)
+				buffer.writeu32(MEM, r1 + -180, 3)
+				F14(1048719, r0 + 32, 1054744)
+			end
+			if v2 < r2 then
+				buffer.writeu32(MEM, r1 + -216, r2)
+				buffer.writeu32(MEM, r1 + -212, v2)
+				buffer.writeu32(MEM, r1 + -144, r0 + 8)
+				buffer.writeu32(MEM, r1 + -140, 3)
+				buffer.writeu32(MEM, r1 + -136, r0 + 12)
+				buffer.writeu32(MEM, r1 + -132, 3)
+				F14(1048776, r0 + 80, 1054744)
+			end
+			if r2 < 0 then
+				buffer.writeu32(MEM, r1 + -208, 0)
+				buffer.writeu32(MEM, r1 + -204, r2)
+				buffer.writeu32(MEM, r1 + -96, r0 + 16)
+				buffer.writeu32(MEM, r1 + -92, 3)
+				buffer.writeu32(MEM, r1 + -88, r0 + 20)
+				buffer.writeu32(MEM, r1 + -84, 3)
+				F14(1048831, r0 + 128, 1054744)
+			end
+			buffer.writeu32(MEM, r1 + -200, r2)
+			buffer.writeu32(MEM, r1 + -196, v2)
+			buffer.writeu32(MEM, r1 + -48, r0 + 24)
+			buffer.writeu32(MEM, r1 + -44, 3)
+			buffer.writeu32(MEM, r1 + -40, r0 + 28)
+			buffer.writeu32(MEM, r1 + -36, 3)
+			F14(1048776, r0 + 176, 1054744)
+		end
+	else
+		r2 = v2
+	end
+	local v11 = v3
+	if v11 > 0x7FFFFFFF then v11 -= 0x100000000 end
+	if v11 == 0 then
+		r0 = v4
+		if r2 < v4 then
+			r1 = r0
+			r4 = r2
+			r3 = SP
+			r2 = r3 - 224
+			SP = r2
+			if v2 < r0 then
+				buffer.writeu32(MEM, r3 + -224, r1)
+				buffer.writeu32(MEM, r3 + -220, v2)
+				buffer.writeu32(MEM, r3 + -192, r2)
+				buffer.writeu32(MEM, r3 + -188, 3)
+				buffer.writeu32(MEM, r3 + -184, r2 + 4)
+				buffer.writeu32(MEM, r3 + -180, 3)
+				F14(1048719, r2 + 32, 1054776)
+			end
+			if v2 < r4 then
+				buffer.writeu32(MEM, r3 + -216, r4)
+				buffer.writeu32(MEM, r3 + -212, v2)
+				buffer.writeu32(MEM, r3 + -144, r2 + 8)
+				buffer.writeu32(MEM, r3 + -140, 3)
+				buffer.writeu32(MEM, r3 + -136, r2 + 12)
+				buffer.writeu32(MEM, r3 + -132, 3)
+				F14(1048776, r2 + 80, 1054776)
+			end
+			if r4 < r1 then
+				buffer.writeu32(MEM, r3 + -208, r1)
+				buffer.writeu32(MEM, r3 + -204, r4)
+				buffer.writeu32(MEM, r3 + -96, r2 + 16)
+				buffer.writeu32(MEM, r3 + -92, 3)
+				buffer.writeu32(MEM, r3 + -88, r2 + 20)
+				buffer.writeu32(MEM, r3 + -84, 3)
+				F14(1048831, r2 + 128, 1054776)
+			end
+			buffer.writeu32(MEM, r3 + -200, r4)
+			buffer.writeu32(MEM, r3 + -196, v2)
+			buffer.writeu32(MEM, r3 + -48, r2 + 24)
+			buffer.writeu32(MEM, r3 + -44, 3)
+			buffer.writeu32(MEM, r3 + -40, r2 + 28)
+			buffer.writeu32(MEM, r3 + -36, 3)
+			F14(1048776, r2 + 176, 1054776)
+		end
+	elseif v11 == 1 then
+		if r2 <= v4 then
+			r2 = r2
+			r1 = SP
+			r0 = r1 - 224
+			SP = r0
+			if v2 < v4 then
+				buffer.writeu32(MEM, r1 + -224, v4)
+				buffer.writeu32(MEM, r1 + -220, v2)
+				buffer.writeu32(MEM, r1 + -192, r0)
+				buffer.writeu32(MEM, r1 + -188, 3)
+				buffer.writeu32(MEM, r1 + -184, r0 + 4)
+				buffer.writeu32(MEM, r1 + -180, 3)
+				F14(1048719, r0 + 32, 1054760)
+			end
+			if v2 < r2 then
+				buffer.writeu32(MEM, r1 + -216, r2)
+				buffer.writeu32(MEM, r1 + -212, v2)
+				buffer.writeu32(MEM, r1 + -144, r0 + 8)
+				buffer.writeu32(MEM, r1 + -140, 3)
+				buffer.writeu32(MEM, r1 + -136, r0 + 12)
+				buffer.writeu32(MEM, r1 + -132, 3)
+				F14(1048776, r0 + 80, 1054760)
+			end
 			if r2 < v4 then
-				r1 = r0
-				r4 = r2
-				r3 = SP
-				r2 = r3 - 224
-				SP = r2
-				if v2 < r0 then
-					buffer.writeu32(MEM, r3 + -224, r1)
-					buffer.writeu32(MEM, r3 + -220, v2)
-					buffer.writeu32(MEM, r3 + -192, r2)
-					buffer.writeu32(MEM, r3 + -188, 3)
-					buffer.writeu32(MEM, r3 + -184, r2 + 4)
-					buffer.writeu32(MEM, r3 + -180, 3)
-					F14(1048719, r2 + 32, 1054776)
-					unreachable()
-				end
-				if v2 < r4 then
-					buffer.writeu32(MEM, r3 + -216, r4)
-					buffer.writeu32(MEM, r3 + -212, v2)
-					buffer.writeu32(MEM, r3 + -144, r2 + 8)
-					buffer.writeu32(MEM, r3 + -140, 3)
-					buffer.writeu32(MEM, r3 + -136, r2 + 12)
-					buffer.writeu32(MEM, r3 + -132, 3)
-					F14(1048776, r2 + 80, 1054776)
-					unreachable()
-				end
-				if r4 < r1 then
-					buffer.writeu32(MEM, r3 + -208, r1)
-					buffer.writeu32(MEM, r3 + -204, r4)
-					buffer.writeu32(MEM, r3 + -96, r2 + 16)
-					buffer.writeu32(MEM, r3 + -92, 3)
-					buffer.writeu32(MEM, r3 + -88, r2 + 20)
-					buffer.writeu32(MEM, r3 + -84, 3)
-					F14(1048831, r2 + 128, 1054776)
-					unreachable()
-				end
-				buffer.writeu32(MEM, r3 + -200, r4)
-				buffer.writeu32(MEM, r3 + -196, v2)
-				buffer.writeu32(MEM, r3 + -48, r2 + 24)
-				buffer.writeu32(MEM, r3 + -44, 3)
-				buffer.writeu32(MEM, r3 + -40, r2 + 28)
-				buffer.writeu32(MEM, r3 + -36, 3)
-				F14(1048776, r2 + 176, 1054776)
-				unreachable()
+				buffer.writeu32(MEM, r1 + -208, v4)
+				buffer.writeu32(MEM, r1 + -204, r2)
+				buffer.writeu32(MEM, r1 + -96, r0 + 16)
+				buffer.writeu32(MEM, r1 + -92, 3)
+				buffer.writeu32(MEM, r1 + -88, r0 + 20)
+				buffer.writeu32(MEM, r1 + -84, 3)
+				F14(1048831, r0 + 128, 1054760)
 			end
-		elseif v11 == 1 then
-			if r2 <= v4 then
-				r2 = r2
-				r1 = SP
-				r0 = r1 - 224
-				SP = r0
-				if v2 < v4 then
-					buffer.writeu32(MEM, r1 + -224, v4)
-					buffer.writeu32(MEM, r1 + -220, v2)
-					buffer.writeu32(MEM, r1 + -192, r0)
-					buffer.writeu32(MEM, r1 + -188, 3)
-					buffer.writeu32(MEM, r1 + -184, r0 + 4)
-					buffer.writeu32(MEM, r1 + -180, 3)
-					F14(1048719, r0 + 32, 1054760)
-					unreachable()
-				end
-				if v2 < r2 then
-					buffer.writeu32(MEM, r1 + -216, r2)
-					buffer.writeu32(MEM, r1 + -212, v2)
-					buffer.writeu32(MEM, r1 + -144, r0 + 8)
-					buffer.writeu32(MEM, r1 + -140, 3)
-					buffer.writeu32(MEM, r1 + -136, r0 + 12)
-					buffer.writeu32(MEM, r1 + -132, 3)
-					F14(1048776, r0 + 80, 1054760)
-					unreachable()
-				end
-				if r2 < v4 then
-					buffer.writeu32(MEM, r1 + -208, v4)
-					buffer.writeu32(MEM, r1 + -204, r2)
-					buffer.writeu32(MEM, r1 + -96, r0 + 16)
-					buffer.writeu32(MEM, r1 + -92, 3)
-					buffer.writeu32(MEM, r1 + -88, r0 + 20)
-					buffer.writeu32(MEM, r1 + -84, 3)
-					F14(1048831, r0 + 128, 1054760)
-					unreachable()
-				end
-				buffer.writeu32(MEM, r1 + -200, r2)
-				buffer.writeu32(MEM, r1 + -196, v2)
-				buffer.writeu32(MEM, r1 + -48, r0 + 24)
-				buffer.writeu32(MEM, r1 + -44, 3)
-				buffer.writeu32(MEM, r1 + -40, r0 + 28)
-				buffer.writeu32(MEM, r1 + -36, 3)
-				F14(1048776, r0 + 176, 1054760)
-				unreachable()
-			end
-			r0 = v4 + 1
-		else
-			if v11 ~= 2 then
-				break
-			end
-			r0 = 0
+			buffer.writeu32(MEM, r1 + -200, r2)
+			buffer.writeu32(MEM, r1 + -196, v2)
+			buffer.writeu32(MEM, r1 + -48, r0 + 24)
+			buffer.writeu32(MEM, r1 + -44, 3)
+			buffer.writeu32(MEM, r1 + -40, r0 + 28)
+			buffer.writeu32(MEM, r1 + -36, 3)
+			F14(1048776, r0 + 176, 1054760)
 		end
-		return r0, r2
-	until true
-	unreachable()
+		r0 = v4 + 1
+	else
+		r0 = 0
+	end
+	return r0, r2
 end
 
 -- std::ptr::drop_glue::<std::io::default_write_fmt::Adapter<'_, std::vec::Vec<u8>>> - shim(Some(std::io::default_write_fmt::Adapter<'_, std::vec::Vec<u8>>))
-FT[72] = function(v0: number)
+FT[70] = function(v0: number)
 	if (if buffer.readu8(MEM, v0) == 255 then 0 else 1) ~= 0 then
-		F62(v0)
+		F61(v0)
 	end
 	return
 end
 
 -- <std::io::default_write_fmt::Adapter<'_, std::vec::Vec<u8>> as std::fmt::Write>::write_str
-FT[73] = function(v2: number, v3: number, v4: number)
+FT[71] = function(v2: number, v3: number, v4: number)
 	local r0: number, r1: number, r2: number, r3: number = 0, 0, 0, 0
 	r0 = SP
 	r1 = buffer.readu32(MEM, v2 + 8)
@@ -8513,11 +6826,8 @@ FT[73] = function(v2: number, v3: number, v4: number)
 	if v8 == 0 then
 		r1 = 0
 	else
-		if v8 ~= 1 then
-			unreachable()
-		end
 		if (if buffer.readu8(MEM, v2) == 255 then 0 else 1) ~= 0 then
-			F62(v2)
+			F61(v2)
 		end
 		local v10 = buffer.readu32(MEM, r0 + -12)
 		buffer.writeu32(MEM, v2, buffer.readu32(MEM, r0 + -16))
@@ -8529,13 +6839,13 @@ FT[73] = function(v2: number, v3: number, v4: number)
 end
 
 -- <std::io::default_write_fmt::Adapter<'_, std::vec::Vec<u8>> as std::fmt::Write>::write_char
-FT[74] = function(v2: number, v3: number)
+FT[72] = function(v2: number, v3: number)
 	local r0: number, r1: number, r2: number, r3: number, r4: number, r5: number = 0, 0, 0, 0, 0, 0
 	r0 = SP
 	local fp_0 = r0 - 8
 	SP = fp_0
 	buffer.fill(MEM, fp_0, 0, 4)
-	r2, r4 = F95(v3, fp_0, 4)
+	r2, r4 = F92(v3, fp_0, 4)
 	r1 = SP
 	r3 = buffer.readu32(MEM, v2 + 8)
 	r4 = r2 + r4 - r2
@@ -8557,11 +6867,8 @@ FT[74] = function(v2: number, v3: number)
 	if v11 == 0 then
 		r2 = 0
 	else
-		if v11 ~= 1 then
-			unreachable()
-		end
 		if (if buffer.readu8(MEM, v2) == 255 then 0 else 1) ~= 0 then
-			F62(v2)
+			F61(v2)
 		end
 		local v13 = buffer.readu32(MEM, r1 + -12)
 		buffer.writeu32(MEM, v2, buffer.readu32(MEM, r1 + -16))
@@ -8574,13 +6881,13 @@ FT[74] = function(v2: number, v3: number)
 end
 
 -- <std::io::default_write_fmt::Adapter<'_, std::vec::Vec<u8>> as std::fmt::Write>::write_fmt
-FT[75] = function(v0: number, v1: number, v2: number)
+FT[73] = function(v0: number, v1: number, v2: number)
 	local v3 = F41(v0, 1053972, v1, v2)
 	return v3
 end
 
 -- <&bool as std::fmt::Debug>::fmt
-FT[76] = function(v0: number, v1: number)
+FT[74] = function(v0: number, v1: number)
 	local r0: number, r1: number = 0, 0
 	if buffer.readu8(MEM, buffer.readu32(MEM, v0)) ~= 0 then
 		r0 = 1056231
@@ -8594,7 +6901,7 @@ FT[76] = function(v0: number, v1: number)
 end
 
 -- <core::fmt::builders::PadAdapter<'_, '_> as std::fmt::Write>::write_str
-FT[77] = function(v3: number, v4: number, v5: number)
+FT[75] = function(v3: number, v4: number, v5: number)
 	local r0: number, r1: number, r2: number, r3: number, r4: number, r5: number, r6: number, r7: boolean = 0, 0, 0, 0, 0, 0, 0, false
 	local lbl = 0
 	r0 = SP
@@ -8604,7 +6911,7 @@ FT[77] = function(v3: number, v4: number, v5: number)
 	r2 = r3 - 16
 	SP = r2
 	buffer.fill(MEM, r2, 0, 4)
-	r4, r5 = F95(10, r2, 4)
+	r4, r5 = F92(10, r2, 4)
 	if 255 < r5 then
 		buffer.writeu8(MEM, r3 + -8, 2)
 		local v38 = SP
@@ -8619,7 +6926,6 @@ FT[77] = function(v3: number, v4: number, v5: number)
 		buffer.writeu32(MEM, v38 + -40, fp_37 + 8)
 		buffer.writeu32(MEM, v38 + -36, 9)
 		F14(1053483, fp_37 + 16, 1056068)
-		unreachable()
 	end
 	local v36 = buffer.readu32(MEM, r3 + -16)
 	buffer.writeu32(MEM, r0 + -28, v4)
@@ -8654,7 +6960,7 @@ FT[77] = function(v3: number, v4: number, v5: number)
 			r5 = 0
 		else
 			r5 = buffer.readu32(MEM, r0 + -108)
-			F97(r4, r3)
+			F94(r4, r3)
 			local v47 = buffer.readu32(MEM, r2 + -16)
 			if v47 > 0x7FFFFFFF then v47 -= 0x100000000 end
 			if v47 == 0 then
@@ -8688,9 +6994,6 @@ FT[77] = function(v3: number, v4: number, v5: number)
 				r4 = r4
 				r5 = r3
 			else
-				if v47 ~= 1 then
-					unreachable()
-				end
 				local v48 = buffer.readu32(MEM, r2 + -8)
 				local v49 = buffer.readu32(MEM, r0 + -84)
 				buffer.writeu32(MEM, r0 + -84, v48)
@@ -8698,31 +7001,23 @@ FT[77] = function(v3: number, v4: number, v5: number)
 				r5 = v48 - v49
 			end
 		end
-		repeat
+		SP = r2
+		r3 = r4
+		r2 = r5
+		local v22 = if r4 == 0 then 0 else 1
+		if v22 == 0 then
+			r1 = 0
+		else
 			repeat
-				SP = r2
-				r3 = r4
-				r2 = r5
-				local v22 = if r4 == 0 then 0 else 1
-				if v22 == 0 then
-					r1 = 0
-					lbl = 2
-					break
-				end
-				if v22 == 1 then
-					if buffer.readu8(MEM, buffer.readu32(MEM, v3 + 8)) ~= 0 then
-						local v14 = FN[buffer.readu32(MEM, buffer.readu32(MEM, v3 + 4) + 12)](buffer.readu32(MEM, v3), 1055994, 4)
-						if v14 ~= 0 then
-							if v14 ~= 1 then
-								break
-							end
-							r1 = 1
-							lbl = 3
-							break
-						end
+				if buffer.readu8(MEM, buffer.readu32(MEM, v3 + 8)) ~= 0 then
+					local v14 = FN[buffer.readu32(MEM, buffer.readu32(MEM, v3 + 4) + 12)](buffer.readu32(MEM, v3), 1055994, 4)
+					if v14 ~= 0 then
+						break
 					end
+				end
+				repeat
 					buffer.fill(MEM, r1 + 148, 0, 4)
-					r5, r6 = F95(10, r1 + 148, 4)
+					r5, r6 = F92(10, r1 + 148, 4)
 					if r6 <= r2 then
 						r4 = r2 - r6
 						if r4 < 0 then r4 += 0x100000000 end
@@ -8738,7 +7033,6 @@ FT[77] = function(v3: number, v4: number, v5: number)
 								buffer.writeu32(MEM, r1 + -184, r0 + 4)
 								buffer.writeu32(MEM, r1 + -180, 3)
 								F14(1048719, r0 + 32, 1056084)
-								unreachable()
 							end
 							if r2 < r2 then
 								buffer.writeu32(MEM, r1 + -216, r2)
@@ -8748,7 +7042,6 @@ FT[77] = function(v3: number, v4: number, v5: number)
 								buffer.writeu32(MEM, r1 + -136, r0 + 12)
 								buffer.writeu32(MEM, r1 + -132, 3)
 								F14(1048776, r0 + 80, 1056084)
-								unreachable()
 							end
 							if r2 < r4 then
 								buffer.writeu32(MEM, r1 + -208, r4)
@@ -8758,7 +7051,6 @@ FT[77] = function(v3: number, v4: number, v5: number)
 								buffer.writeu32(MEM, r1 + -88, r0 + 20)
 								buffer.writeu32(MEM, r1 + -84, 3)
 								F14(1048831, r0 + 128, 1056084)
-								unreachable()
 							end
 							buffer.writeu32(MEM, r1 + -200, r2)
 							buffer.writeu32(MEM, r1 + -196, r2)
@@ -8767,54 +7059,31 @@ FT[77] = function(v3: number, v4: number, v5: number)
 							buffer.writeu32(MEM, r1 + -40, r0 + 28)
 							buffer.writeu32(MEM, r1 + -36, 3)
 							F14(1048776, r0 + 176, 1056084)
-							unreachable()
 						end
 						local v72 = r2 - r4
 						r4 = r3 + r4
 						if r6 == v72 then
 							local v91 = memcmp(r5, r4, r6)
 							r7 = v91 == 0
-						else
-							r7 = false
+							break
 						end
-					else
-						r7 = false
 					end
-					buffer.writeu8(MEM, buffer.readu32(MEM, v3 + 8), if r7 then 1 else 0)
-					local v27 = FN[buffer.readu32(MEM, buffer.readu32(MEM, v3 + 4) + 12)](buffer.readu32(MEM, v3), r3, r2)
-					if v27 == 0 then
-						lbl = 4
-						break
-					end
-					if v27 == 1 then
-						r1 = 1
-						lbl = 5
-						break
-					end
+					r7 = false
+				until true
+				buffer.writeu8(MEM, buffer.readu32(MEM, v3 + 8), if r7 then 1 else 0)
+				local v27 = FN[buffer.readu32(MEM, buffer.readu32(MEM, v3 + 4) + 12)](buffer.readu32(MEM, v3), r3, r2)
+				if v27 == 0 then
+					lbl = 2
+					break
 				end
 			until true
 			if lbl ~= 0 then
 				if lbl == 2 then
 					lbl = 0
-					break
+					continue
 				end
-				if lbl == 3 then
-					lbl = 0
-					break
-				end
-				if lbl == 5 then
-					lbl = 0
-					break
-				end
-				break
 			end
-			unreachable()
-		until true
-		if lbl ~= 0 then
-			if lbl == 4 then
-				lbl = 0
-				continue
-			end
+			r1 = 1
 		end
 		SP = r0
 		return r1
@@ -8822,15 +7091,12 @@ FT[77] = function(v3: number, v4: number, v5: number)
 end
 
 -- <core::fmt::builders::PadAdapter<'_, '_> as std::fmt::Write>::write_char
-FT[78] = function(v1: number, v2: number)
+FT[76] = function(v1: number, v2: number)
 	local r0: number = 0
 	repeat
 		if buffer.readu8(MEM, buffer.readu32(MEM, v1 + 8)) ~= 0 then
 			local v8 = FN[buffer.readu32(MEM, buffer.readu32(MEM, v1 + 4) + 12)](buffer.readu32(MEM, v1), 1055994, 4)
 			if v8 ~= 0 then
-				if v8 ~= 1 then
-					unreachable()
-				end
 				r0 = 1
 				break
 			end
@@ -8843,21 +7109,13 @@ FT[78] = function(v1: number, v2: number)
 end
 
 -- <core::fmt::builders::PadAdapter<'_, '_> as std::fmt::Write>::write_fmt
-FT[79] = function(v0: number, v1: number, v2: number)
+FT[77] = function(v0: number, v1: number, v2: number)
 	local v3 = F41(v0, 1053512, v1, v2)
 	return v3
 end
 
--- std::ptr::drop_glue::<std::io::default_write_fmt::Adapter<'_, std::io::StdoutLock<'_>>> - shim(Some(std::io::default_write_fmt::Adapter<'_, std::io::StdoutLock<'_>>))
-FT[80] = function(v0: number)
-	if (if buffer.readu8(MEM, v0) == 255 then 0 else 1) ~= 0 then
-		F62(v0)
-	end
-	return
-end
-
 -- <std::io::default_write_fmt::Adapter<'_, std::io::StdoutLock<'_>> as std::fmt::Write>::write_str
-FT[81] = function(v3: number, v4: number, v5: number)
+FT[78] = function(v3: number, v4: number, v5: number)
 	local r0: number, r1: number = 0, 0
 	r0 = SP
 	local fp_0 = r0 - 16
@@ -8867,11 +7125,8 @@ FT[81] = function(v3: number, v4: number, v5: number)
 	if v9 == 0 then
 		r1 = 0
 	else
-		if v9 ~= 1 then
-			unreachable()
-		end
 		if (if buffer.readu8(MEM, v3) == 255 then 0 else 1) ~= 0 then
-			F62(v3)
+			F61(v3)
 		end
 		local v11 = buffer.readu32(MEM, r0 + -12)
 		buffer.writeu32(MEM, v3, buffer.readu32(MEM, r0 + -16))
@@ -8883,13 +7138,13 @@ FT[81] = function(v3: number, v4: number, v5: number)
 end
 
 -- <std::io::default_write_fmt::Adapter<'_, std::io::StdoutLock<'_>> as std::fmt::Write>::write_char
-FT[82] = function(v2: number, v3: number)
+FT[79] = function(v2: number, v3: number)
 	local r0: number, r1: number, r2: number = 0, 0, 0
 	r0 = SP
 	local fp_0 = r0 - 8
 	SP = fp_0
 	buffer.fill(MEM, fp_0, 0, 4)
-	local v4, v5 = F95(v3, fp_0, 4)
+	local v4, v5 = F92(v3, fp_0, 4)
 	r1 = SP
 	local fp_6 = r1 - 16
 	SP = fp_6
@@ -8898,11 +7153,8 @@ FT[82] = function(v2: number, v3: number)
 	if v12 == 0 then
 		r2 = 0
 	else
-		if v12 ~= 1 then
-			unreachable()
-		end
 		if (if buffer.readu8(MEM, v2) == 255 then 0 else 1) ~= 0 then
-			F62(v2)
+			F61(v2)
 		end
 		local v14 = buffer.readu32(MEM, r1 + -12)
 		buffer.writeu32(MEM, v2, buffer.readu32(MEM, r1 + -16))
@@ -8915,19 +7167,19 @@ FT[82] = function(v2: number, v3: number)
 end
 
 -- <std::io::default_write_fmt::Adapter<'_, std::io::StdoutLock<'_>> as std::fmt::Write>::write_fmt
-FT[83] = function(v0: number, v1: number, v2: number)
+FT[80] = function(v0: number, v1: number, v2: number)
 	local v3 = F41(v0, 1053292, v1, v2)
 	return v3
 end
 
 -- <std::fmt::Error as std::fmt::Debug>::fmt
-FT[84] = function(v0: number, v1: number)
+FT[81] = function(v0: number, v1: number)
 	local v5 = FN[buffer.readu32(MEM, buffer.readu32(MEM, v1 + 4) + 12)](buffer.readu32(MEM, v1), 1055998, 5)
 	return v5
 end
 
 -- <std::string::String as std::fmt::Write>::write_str
-FT[85] = function(v0: number, v1: number, v2: number)
+FT[82] = function(v0: number, v1: number, v2: number)
 	local r0: number, r1: number = 0, 0
 	r0 = v1 + v2 - v1
 	r1 = buffer.readu32(MEM, v0 + 8)
@@ -8947,7 +7199,7 @@ FT[85] = function(v0: number, v1: number, v2: number)
 end
 
 -- <std::string::String as std::fmt::Write>::write_char
-FT[86] = function(v0: number, v1: number)
+FT[83] = function(v0: number, v1: number)
 	local r0: number, r1: number, r2: number, r3: number, r4: number, r5: number, r6: number, r7: number = 0, 0, 0, 0, 0, 0, 0, 0
 	r1 = buffer.readu32(MEM, v0 + 8)
 	if v1 < 128 then
@@ -9011,24 +7263,24 @@ FT[86] = function(v0: number, v1: number)
 end
 
 -- <std::string::String as std::fmt::Write>::write_fmt
-FT[87] = function(v0: number, v1: number, v2: number)
+FT[84] = function(v0: number, v1: number, v2: number)
 	local v3 = F41(v0, 1052936, v1, v2)
 	return v3
 end
 
 -- <{closure@std::io::stdio::OUTPUT_CAPTURE::{closure#0}} as std::ops::FnOnce<(std::option::Option<&mut std::option::Option<std::cell::Cell<std::option::Option<std::sync::Arc<std::sync::Mutex<std::vec::Vec<u8>>>>>>>,)>>::call_once - shim
-FT[88] = function(v0: number)
+FT[85] = function(v0: number)
 	return 1056100
 end
 
 -- <&(char, usize) as std::fmt::Debug>::fmt
-FT[89] = function(v0: number, v1: number)
-	local v3 = F96(buffer.readu32(MEM, v0), v1)
+FT[86] = function(v0: number, v1: number)
+	local v3 = F93(buffer.readu32(MEM, v0), v1)
 	return v3
 end
 
 -- <{closure@hashbrown::raw::RawTable<(char, usize)>::reserve_rehash<{closure@hashbrown::map::make_hasher<char, usize, std::hash::RandomState>::{closure#0}}>::{closure#0}} as std::ops::FnOnce<(&mut hashbrown::raw::RawTableInner, usize)>>::call_once - shim(vtable)
-FT[90] = function(v0: number, v1: number, v2: number)
+FT[87] = function(v0: number, v1: number, v2: number)
 	local v5 = v2
 	if v5 > 0x7FFFFFFF then v5 -= 0x100000000 end
 	local v11, v12 = F6(buffer.readu32(MEM, buffer.readu32(MEM, v0)), buffer.readu32(MEM, v1) + (0 - v5) * 8 + -8)
@@ -9036,7 +7288,7 @@ FT[90] = function(v0: number, v1: number, v2: number)
 end
 
 -- hashbrown::raw::RawTable::<(char, usize)>::reserve_rehash::<{closure@hashbrown::map::make_hasher<char, usize, std::hash::RandomState>::{closure#0}}>::{closure#0}
-FT[91] = function(v0: number, v1: number, v2: number)
+FT[88] = function(v0: number, v1: number, v2: number)
 	local v5 = v2
 	if v5 > 0x7FFFFFFF then v5 -= 0x100000000 end
 	local v11, v12 = F6(buffer.readu32(MEM, buffer.readu32(MEM, v0)), buffer.readu32(MEM, v1) + (0 - v5) * 8 + -8)
@@ -9044,33 +7296,33 @@ FT[91] = function(v0: number, v1: number, v2: number)
 end
 
 -- <{closure@hashbrown::raw::RawTable<(char, usize)>::find<{closure@hashbrown::rustc_entry::<impl hashbrown::map::HashMap<char, usize, std::hash::RandomState>>::rustc_entry::{closure#0}}>::{closure#0}} as std::ops::FnOnce<(usize,)>>::call_once - shim(vtable)
-FT[92] = function(v0: number, v1: number)
+FT[89] = function(v0: number, v1: number)
 	local v5 = v1
 	if v5 > 0x7FFFFFFF then v5 -= 0x100000000 end
 	return buffer.readu32(MEM, buffer.readu32(MEM, buffer.readu32(MEM, v0 + 4)) + (0 - v5) * 8 + -8) == buffer.readu32(MEM, buffer.readu32(MEM, buffer.readu32(MEM, v0)))
 end
 
 -- hashbrown::raw::RawTable::<(char, usize)>::find::<{closure@hashbrown::rustc_entry::<impl hashbrown::map::HashMap<char, usize, std::hash::RandomState>>::rustc_entry::{closure#0}}>::{closure#0}
-FT[93] = function(v0: number, v1: number)
+FT[90] = function(v0: number, v1: number)
 	local v5 = v1
 	if v5 > 0x7FFFFFFF then v5 -= 0x100000000 end
 	return buffer.readu32(MEM, buffer.readu32(MEM, buffer.readu32(MEM, v0 + 4)) + (0 - v5) * 8 + -8) == buffer.readu32(MEM, buffer.readu32(MEM, buffer.readu32(MEM, v0)))
 end
 
 -- <{closure@std::hash::RandomState::new::KEYS::{closure#0}} as std::ops::FnOnce<(std::option::Option<&mut std::option::Option<std::cell::Cell<(u64, u64)>>>,)>>::call_once - shim
-FT[94] = function(v0: number)
+FT[91] = function(v0: number)
 	local r0: number = 0
 	if buffer.readu8(MEM, 1056152) == 1 then
 		r0 = 1056136
 	else
-		local v4 = F98(1056136, v0)
+		local v4 = F95(1056136, v0)
 		r0 = v4
 	end
 	return r0
 end
 
 -- std::char::encode_utf8_raw
-function F95(v1: number, v2: number, v3: number)
+function F92(v1: number, v2: number, v3: number)
 	local r0: number, r1: number, r2: number, r3: number, r4: number, r5: number = 0, 0, 0, 0, 0, 0
 	if v1 < 128 then
 		r0 = 1
@@ -9099,7 +7351,6 @@ function F95(v1: number, v2: number, v3: number)
 		buffer.writeu32(MEM, v9 + -60, fp_8 + 8)
 		buffer.writeu32(MEM, v9 + -56, 3)
 		F14(1056160, fp_8 + 12, 1056004)
-		unreachable()
 	end
 	if v1 < 128 then
 		r1 = 1
@@ -9138,7 +7389,7 @@ function F95(v1: number, v2: number, v3: number)
 end
 
 -- <(char, usize) as std::fmt::Debug>::fmt
-function F96(v2: number, v3: number)
+function F93(v2: number, v3: number)
 	local r0: number, r1: number, r2: number = 0, 0, 0
 	r0 = SP
 	r1 = r0 - 24
@@ -9153,12 +7404,9 @@ function F96(v2: number, v3: number)
 	r2 = r1 + 12
 	local v12 = buffer.readu8(MEM, r0 + -16)
 	if v12 == 0 then
-		local v16 = F100(r1, r2, 1056104)
+		local v16 = F97(r1, r2, 1056104)
 		r2 = v16
 	else
-		if v12 ~= 1 then
-			unreachable()
-		end
 		r2 = 1
 	end
 	buffer.writeu8(MEM, r0 + -16, r2)
@@ -9168,12 +7416,9 @@ function F96(v2: number, v3: number)
 	r2 = r1 + 16
 	local v18 = buffer.readu8(MEM, r0 + -16)
 	if v18 == 0 then
-		local v22 = F100(r1, r2, 1056120)
+		local v22 = F97(r1, r2, 1056120)
 		r1 = v22
 	else
-		if v18 ~= 1 then
-			unreachable()
-		end
 		r1 = 1
 	end
 	buffer.writeu8(MEM, r0 + -16, r1)
@@ -9190,9 +7435,6 @@ function F96(v2: number, v3: number)
 							local v35 = buffer.readu32(MEM, r0 + -20)
 							local v40 = FN[buffer.readu32(MEM, buffer.readu32(MEM, v35 + 4) + 12)](buffer.readu32(MEM, v35), 1056362, 1)
 							if v40 ~= 0 then
-								if v40 ~= 1 then
-									unreachable()
-								end
 								r1 = 1
 								break
 							end
@@ -9205,9 +7447,6 @@ function F96(v2: number, v3: number)
 			until true
 			r1 = r1
 		else
-			if v25 ~= 1 then
-				unreachable()
-			end
 			r1 = 1
 		end
 		buffer.writeu8(MEM, r0 + -16, r1)
@@ -9218,7 +7457,7 @@ function F96(v2: number, v3: number)
 end
 
 -- <std::str::pattern::CharSearcher<'_> as std::str::pattern::Searcher<'_>>::next_match
-function F97(ret_0: number, v1: number)
+function F94(ret_0: number, v1: number)
 	local r0: number, r1: number, r2: number, r3: number, r4: number = 0, 0, 0, 0, 0
 	local lbl = 0
 	while true do
@@ -9254,7 +7493,7 @@ function F97(ret_0: number, v1: number)
 							r3 = bit32.bor(r3 + 1, 0)
 						end
 					else
-						local v55, v56 = F101(r2, r1, r0)
+						local v55, v56 = F98(r2, r1, r0)
 						r0 = v55
 						r1 = v56
 					end
@@ -9262,9 +7501,6 @@ function F97(ret_0: number, v1: number)
 					local v7 = r0
 					if v7 > 0x7FFFFFFF then v7 -= 0x100000000 end
 					if v7 ~= 1 then
-						if v7 ~= 0 then
-							unreachable()
-						end
 						buffer.writeu32(MEM, v1 + 12, buffer.readu32(MEM, v1 + 16))
 						buffer.writeu32(MEM, ret_0, 0)
 						break
@@ -9324,7 +7560,6 @@ function F97(ret_0: number, v1: number)
 						buffer.writeu32(MEM, r1 + -136, r0 + 12)
 						buffer.writeu32(MEM, r1 + -132, 3)
 						F14(1048776, r0 + 80, 1056240)
-						unreachable()
 					end
 					if r2 < 0 then
 						buffer.writeu32(MEM, r1 + -208, 0)
@@ -9334,7 +7569,6 @@ function F97(ret_0: number, v1: number)
 						buffer.writeu32(MEM, r1 + -88, r0 + 20)
 						buffer.writeu32(MEM, r1 + -84, 3)
 						F14(1048831, r0 + 128, 1056240)
-						unreachable()
 					end
 					buffer.writeu32(MEM, r1 + -200, r2)
 					buffer.writeu32(MEM, r1 + -196, 4)
@@ -9343,7 +7577,6 @@ function F97(ret_0: number, v1: number)
 					buffer.writeu32(MEM, r1 + -40, r0 + 28)
 					buffer.writeu32(MEM, r1 + -36, 3)
 					F14(1048776, r0 + 176, 1056240)
-					unreachable()
 				end
 			end
 			buffer.writeu32(MEM, ret_0, 0)
@@ -9375,50 +7608,33 @@ function F97(ret_0: number, v1: number)
 end
 
 -- std::thread::local_impl::LazyStorage::<std::cell::Cell<(u64, u64)>>::initialize::<fn() -> std::cell::Cell<(u64, u64)> {std::hash::RandomState::new::KEYS::__rust_std_internal_init_fn}>
-function F98(v4: number, v5: number)
+function F95(v4: number, v5: number)
 	local r0: number, r1: number, r2: number, r3: number = 0, 0, 0, 0
-	local lbl = 0
 	repeat
-		repeat
-			r2 = 0
-			r1 = 0
-			r0 = 0
-			r3 = 0
-			local v7 = if v5 == 0 then 0 else 1
-			if v7 == 0 then
-				break
-			end
-			if v7 == 1 then
-				r0 = buffer.readu32(MEM, v5 + 8)
-				r1 = buffer.readu32(MEM, v5 + 12)
-				r3 = buffer.readu32(MEM, v5 + 16)
-				r2 = buffer.readu32(MEM, v5 + 20)
-				local v13 = buffer.readu32(MEM, v5)
-				buffer.writeu32(MEM, v5, 0)
-				buffer.writeu32(MEM, v5 + 4, 0)
-				buffer.writeu32(MEM, v5 + 8, 0)
-				buffer.writeu32(MEM, v5 + 12, 0)
-				buffer.writeu32(MEM, v5 + 16, 0)
-				buffer.writeu32(MEM, v5 + 20, 0)
-				local v10 = v13
-				if v10 > 0x7FFFFFFF then v10 -= 0x100000000 end
-				if v10 == 0 then
-					break
-				end
-				if v10 == 1 then
-					r0 = r0
-					r1 = r1
-					r3 = r3
-					r2 = r2
-					lbl = 1
-					break
-				end
-			end
-			unreachable()
-		until true
-		if lbl ~= 0 then
-			if lbl == 1 then
-				lbl = 0
+		r2 = 0
+		r1 = 0
+		r3 = 0
+		r0 = 0
+		local v7 = if v5 == 0 then 0 else 1
+		if v7 ~= 0 then
+			r0 = buffer.readu32(MEM, v5 + 8)
+			r1 = buffer.readu32(MEM, v5 + 12)
+			r3 = buffer.readu32(MEM, v5 + 16)
+			r2 = buffer.readu32(MEM, v5 + 20)
+			local v13 = buffer.readu32(MEM, v5)
+			buffer.writeu32(MEM, v5, 0)
+			buffer.writeu32(MEM, v5 + 4, 0)
+			buffer.writeu32(MEM, v5 + 8, 0)
+			buffer.writeu32(MEM, v5 + 12, 0)
+			buffer.writeu32(MEM, v5 + 16, 0)
+			buffer.writeu32(MEM, v5 + 20, 0)
+			local v10 = v13
+			if v10 > 0x7FFFFFFF then v10 -= 0x100000000 end
+			if v10 ~= 0 then
+				r0 = r0
+				r1 = r1
+				r3 = r3
+				r2 = r2
 				break
 			end
 		end
@@ -9435,22 +7651,18 @@ function F98(v4: number, v5: number)
 		r2 = r3
 		local v26 = if r3 == 0 then 1 else 0
 		if v26 ~= 0 then
-			if v26 ~= 1 then
-				unreachable()
-			end
 			r0 = 0
 			r1 = 0
-			r0 = 1
 			r1 = 1
+			r0 = 1
 			r2 = buffer.readu32(MEM, 1053492)
 			if r2 == 0 then
 				r2 = 10
 			else
 				r2 = r2
 			end
-			FN[r2](r0, r1)
+			FN[r2](r1, r0)
 			rt_abort()
-			unreachable()
 		end
 		buffer.writeu8(MEM, r2, 0)
 		rt_dealloc(r2, 1, 1)
@@ -9466,7 +7678,6 @@ function F98(v4: number, v5: number)
 	end
 	if buffer.readu8(MEM, v4 + 16) == 2 then
 		F14(1056256, 125, 1056320)
-		unreachable()
 	end
 	buffer.writeu32(MEM, v4, r0)
 	buffer.writeu32(MEM, v4 + 4, r1)
@@ -9477,7 +7688,7 @@ function F98(v4: number, v5: number)
 end
 
 -- core::fmt::num::<impl std::fmt::UpperHex for u32>::fmt
-FT[99] = function(v4: number, v5: number)
+FT[96] = function(v4: number, v5: number)
 	local r0: number, r1: number, r2: number, r3: number, r4: number, r5: number = 0, 0, 0, 0, 0, 0
 	r1 = SP
 	r0 = r1 - 16
@@ -9509,7 +7720,7 @@ FT[99] = function(v4: number, v5: number)
 end
 
 -- std::fmt::DebugTuple::<'_, '_>::field_with::<{closure@std::fmt::DebugTuple<'_, '_>::field::{closure#0}}>::{closure#0}
-function F100(v5: number, v6: number, v7: number)
+function F97(v5: number, v6: number, v7: number)
 	local r0: number, r1: number, r2: number = 0, 0, 0
 	local lbl = 0
 	repeat
@@ -9533,21 +7744,11 @@ function F100(v5: number, v6: number, v7: number)
 					lbl = 1
 					break
 				end
-				if v39 == 1 then
-					r1 = 1
-					lbl = 2
-					break
-				end
 			else
 				if buffer.readu32(MEM, v5) == 0 then
 					local v14 = buffer.readu32(MEM, v5 + 4)
 					local v25 = FN[buffer.readu32(MEM, buffer.readu32(MEM, v14 + 4) + 12)](buffer.readu32(MEM, v14), 1056364, 2)
 					if v25 ~= 0 then
-						if v25 ~= 1 then
-							break
-						end
-						r1 = 1
-						lbl = 3
 						break
 					end
 				end
@@ -9571,13 +7772,9 @@ function F100(v5: number, v6: number, v7: number)
 					buffer.writeu8(MEM, v34 + -8, 0)
 					buffer.writeu8(MEM, v34 + -7, 0)
 					F23(fp_33 + 8)
-					unreachable()
 				end
-				if v29 ~= 1 then
-					unreachable()
-				end
-				local v30 = buffer.readu32(MEM, r2 + 8)
 				local v31 = buffer.readu16(MEM, r2 + 12)
+				local v30 = buffer.readu32(MEM, r2 + 8)
 				local v32 = buffer.readu16(MEM, r2 + 14)
 				buffer.writeu32(MEM, r0 + -16, r1)
 				buffer.writeu32(MEM, r0 + -12, 1053512)
@@ -9588,12 +7785,7 @@ function F100(v5: number, v6: number, v7: number)
 				if v47 == 0 then
 					local v43 = FN[buffer.readu32(MEM, buffer.readu32(MEM, r0 + -12) + 12)](buffer.readu32(MEM, r0 + -16), 1053083, 2)
 					r1 = v43
-					lbl = 4
-					break
-				end
-				if v47 == 1 then
-					r1 = 1
-					lbl = 5
+					lbl = 2
 					break
 				end
 			end
@@ -9607,27 +7799,15 @@ function F100(v5: number, v6: number, v7: number)
 				lbl = 0
 				break
 			end
-			if lbl == 3 then
-				lbl = 0
-				break
-			end
-			if lbl == 4 then
-				lbl = 0
-				break
-			end
-			if lbl == 5 then
-				lbl = 0
-				break
-			end
 		end
-		unreachable()
+		r1 = 1
 	until true
 	SP = r0
 	return r1
 end
 
 -- core::slice::memchr::memchr_aligned::runtime
-function F101(v7: number, v8: number, v9: number)
+function F98(v7: number, v8: number, v9: number)
 	local r0: number, r1: number, r2: number, r3: number, r4: number, r5: number, r6: boolean = 0, 0, 0, 0, 0, 0, false
 	local lbl = 0
 	r0 = SP
@@ -9635,11 +7815,10 @@ function F101(v7: number, v8: number, v9: number)
 	SP = r3
 	if popcnt(4) ~= 1 then
 		F14(1056384, 83, 1056428)
-		unreachable()
 	end
 	repeat
 		repeat
-			local v60 = F59(v8, 4)
+			local v60 = F58(v8, 4)
 			r1 = v60
 			if 0 < v60 then
 				if v9 < r1 then
@@ -9686,7 +7865,6 @@ function F101(v7: number, v8: number, v9: number)
 					buffer.writeu32(MEM, r1 + -184, r0 + 4)
 					buffer.writeu32(MEM, r1 + -180, 3)
 					F14(1048719, r0 + 32, 1056368)
-					unreachable()
 				end
 				if v9 < r2 then
 					buffer.writeu32(MEM, r1 + -216, r2)
@@ -9696,7 +7874,6 @@ function F101(v7: number, v8: number, v9: number)
 					buffer.writeu32(MEM, r1 + -136, r0 + 12)
 					buffer.writeu32(MEM, r1 + -132, 3)
 					F14(1048776, r0 + 80, 1056368)
-					unreachable()
 				end
 				if r2 < 0 then
 					buffer.writeu32(MEM, r1 + -208, 0)
@@ -9706,7 +7883,6 @@ function F101(v7: number, v8: number, v9: number)
 					buffer.writeu32(MEM, r1 + -88, r0 + 20)
 					buffer.writeu32(MEM, r1 + -84, 3)
 					F14(1048831, r0 + 128, 1056368)
-					unreachable()
 				end
 				buffer.writeu32(MEM, r1 + -200, r2)
 				buffer.writeu32(MEM, r1 + -196, v9)
@@ -9715,7 +7891,6 @@ function F101(v7: number, v8: number, v9: number)
 				buffer.writeu32(MEM, r1 + -40, r0 + 28)
 				buffer.writeu32(MEM, r1 + -36, 3)
 				F14(1048776, r0 + 176, 1056368)
-				unreachable()
 			end
 		until true
 		if lbl ~= 0 then
@@ -9783,13 +7958,13 @@ function F101(v7: number, v8: number, v9: number)
 end
 
 -- <&usize as std::fmt::Debug>::fmt
-FT[102] = function(v0: number, v1: number)
-	local v3 = F105(buffer.readu32(MEM, v0), v1)
+FT[99] = function(v0: number, v1: number)
+	local v3 = F102(buffer.readu32(MEM, v0), v1)
 	return v3
 end
 
 -- <&char as std::fmt::Debug>::fmt
-FT[103] = function(v0: number, v1: number)
+FT[100] = function(v0: number, v1: number)
 	local r0: number, r1: number, r2: number = 0, 0, 0
 	repeat
 		r2 = buffer.readu32(MEM, v0)
@@ -9798,7 +7973,7 @@ FT[103] = function(v0: number, v1: number)
 		SP = r1
 		local v10 = FN[buffer.readu32(MEM, buffer.readu32(MEM, v1 + 4) + 16)](buffer.readu32(MEM, v1), 39)
 		if v10 == 0 then
-			F106(r1, buffer.readu32(MEM, r2), true, true, false)
+			F103(r1, buffer.readu32(MEM, r2), true, true, false)
 			r2 = buffer.readu8(MEM, r0 + -3)
 			if 128 < r2 then
 				local v21 = FN[buffer.readu32(MEM, buffer.readu32(MEM, v1 + 4) + 16)](buffer.readu32(MEM, v1), buffer.readu32(MEM, r0 + -16))
@@ -9813,22 +7988,15 @@ FT[103] = function(v0: number, v1: number)
 				r1 = v29
 				break
 			end
-			if r1 == 1 then
-				r1 = 1
-				break
-			end
-		elseif v10 == 1 then
-			r1 = 1
-			break
 		end
-		unreachable()
+		r1 = 1
 	until true
 	SP = r0
 	return r1
 end
 
 -- <std::num::TryFromIntError as std::fmt::Debug>::fmt
-FT[104] = function(v2: number, v3: number)
+FT[101] = function(v2: number, v3: number)
 	local r0: number, r1: number, r2: number, r3: number = 0, 0, 0, 0
 	r0 = SP
 	r2 = r0 - 8
@@ -9844,12 +8012,9 @@ FT[104] = function(v2: number, v3: number)
 	buffer.writeu8(MEM, r1 + -7, 0)
 	local v11 = buffer.readu8(MEM, r1 + -8)
 	if v11 == 0 then
-		local v15 = F100(r3, r2, 1056584)
+		local v15 = F97(r3, r2, 1056584)
 		r2 = v15
 	else
-		if v11 ~= 1 then
-			unreachable()
-		end
 		r2 = 1
 	end
 	buffer.writeu8(MEM, r1 + -8, r2)
@@ -9866,9 +8031,6 @@ FT[104] = function(v2: number, v3: number)
 							local v28 = buffer.readu32(MEM, r1 + -12)
 							local v33 = FN[buffer.readu32(MEM, buffer.readu32(MEM, v28 + 4) + 12)](buffer.readu32(MEM, v28), 1056362, 1)
 							if v33 ~= 0 then
-								if v33 ~= 1 then
-									unreachable()
-								end
 								r2 = 1
 								break
 							end
@@ -9881,9 +8043,6 @@ FT[104] = function(v2: number, v3: number)
 			until true
 			r2 = r2
 		else
-			if v18 ~= 1 then
-				unreachable()
-			end
 			r2 = 1
 		end
 		buffer.writeu8(MEM, r1 + -8, r2)
@@ -9895,7 +8054,7 @@ FT[104] = function(v2: number, v3: number)
 end
 
 -- core::fmt::num::<impl std::fmt::Debug for usize>::fmt
-function F105(v1: number, v2: number)
+function F102(v1: number, v2: number)
 	local r0: number, r1: number, r2: number, r3: number, r4: number, r5: number = 0, 0, 0, 0, 0, 0
 	if bit32.band(buffer.readu32(MEM, v2 + 8), 0x2000000) == 0 then
 		if bit32.band(buffer.readu32(MEM, v2 + 8), 0x4000000) == 0 then
@@ -9975,7 +8134,7 @@ function F105(v1: number, v2: number)
 end
 
 -- std::char::methods::<impl char>::escape_debug_ext
-function F106(ret_2: number, v3: number, v4: boolean, v5: boolean, v6: boolean)
+function F103(ret_2: number, v3: number, v4: boolean, v5: boolean, v6: boolean)
 	local r0: number, r1: number, r2: boolean, r3: number = 0, 0, false, 0
 	local lbl = 0
 	repeat
@@ -10235,7 +8394,7 @@ function F106(ret_2: number, v3: number, v4: boolean, v5: boolean, v6: boolean)
 				if v4 then
 					if 767 < v3 then
 						if 768 <= v3 then
-							local v107 = F108(v3, 1056920, 1057052)
+							local v107 = F105(v3, 1056920, 1057052)
 							if v107 then
 								break
 							end
@@ -10244,38 +8403,38 @@ function F106(ret_2: number, v3: number, v4: boolean, v5: boolean, v6: boolean)
 				end
 				if 172 < v3 then
 					if 173 <= v3 then
-						local v108 = F109(v3, 1057820, 1057868)
+						local v108 = F106(v3, 1057820, 1057868)
 						if v108 then
 							break
 						end
 					end
 					if 173 <= v3 then
-						local v109 = F110(v3, 1057904, 1057948)
+						local v109 = F107(v3, 1057904, 1057948)
 						if v109 then
 							break
 						end
 					end
 				end
 				repeat
-					if 0 <= v3 then
-						if v3 <= 887 then
-							r2 = true
-							break
-						end
-					end
-					if 888 <= v3 then
-						if v3 <= 262141 then
-							if 888 <= v3 then
-								local v96 = FT[111](v3, 1057992, 1058208)
-								r2 = v96
-							else
-								r2 = false
-							end
-							r2 = not r2
-							break
-						end
-					end
 					repeat
+						if 0 <= v3 then
+							if v3 <= 887 then
+								break
+							end
+						end
+						if 888 <= v3 then
+							if v3 <= 262141 then
+								if 888 <= v3 then
+									local v96 = F108(v3, 1057992, 1058208)
+									r2 = v96
+								else
+									r2 = false
+								end
+								r2 = not r2
+								lbl = 2
+								break
+							end
+						end
 						if v3 ~= 917505 then
 							if 917536 <= v3 then
 								if v3 <= 917631 then
@@ -10294,11 +8453,11 @@ function F106(ret_2: number, v3: number, v4: boolean, v5: boolean, v6: boolean)
 							end
 							if 0x100000 <= v3 then
 								r2 = v3 <= 1114109 ~= false
-								lbl = 2
+								lbl = 3
 								break
 							end
 							r2 = false
-							lbl = 3
+							lbl = 4
 							break
 						end
 					until true
@@ -10308,6 +8467,10 @@ function F106(ret_2: number, v3: number, v4: boolean, v5: boolean, v6: boolean)
 							break
 						end
 						if lbl == 3 then
+							lbl = 0
+							break
+						end
+						if lbl == 4 then
 							lbl = 0
 							break
 						end
@@ -10325,18 +8488,18 @@ function F106(ret_2: number, v3: number, v4: boolean, v5: boolean, v6: boolean)
 					buffer.writeu32(MEM, ret_2 + 4, 0)
 					buffer.writeu32(MEM, ret_2 + 8, 0)
 					buffer.writeu32(MEM, ret_2 + 12, v74)
-					lbl = 4
+					lbl = 5
 					break
 				end
 			end
 		until true
 		if lbl ~= 0 then
-			if lbl == 4 then
+			if lbl == 5 then
 				lbl = 0
 				break
 			end
 		end
-		F107(r0 + 362, v3)
+		F104(r0 + 362, v3)
 		local v75 = buffer.readu32(MEM, r1 + -30)
 		local v76 = buffer.readu32(MEM, r1 + -26)
 		local v36 = buffer.readu8(MEM, r1 + -19)
@@ -10362,7 +8525,7 @@ function F106(ret_2: number, v3: number, v4: boolean, v5: boolean, v6: boolean)
 end
 
 -- core::escape::escape_unicode::<10>
-function F107(ret_2: number, v3: number)
+function F104(ret_2: number, v3: number)
 	local r0: number, r1: number, r2: number, r3: number = 0, 0, 0, 0
 	r1 = SP
 	r0 = r1 - 112
@@ -10371,8 +8534,8 @@ function F107(ret_2: number, v3: number)
 	if r2 < 0 then r2 += 0x100000000 end
 	buffer.fill(MEM, r0, 0, 10)
 	local v57 = buffer.readu32(MEM, 1056655)
-	local v56 = buffer.readu32(MEM, 1056651)
 	local v58 = buffer.readu32(MEM, 1056659)
+	local v56 = buffer.readu32(MEM, 1056651)
 	buffer.writeu32(MEM, r1 + -102, buffer.readu32(MEM, 1056647))
 	buffer.writeu32(MEM, r1 + -98, v56)
 	buffer.writeu32(MEM, r1 + -94, v57)
@@ -10382,9 +8545,9 @@ function F107(ret_2: number, v3: number)
 		oob(16, r3, "/rust/core/src/escape.rs", 147, 17)
 	end
 	buffer.writeu8(MEM, r1 + -109, buffer.readu8(MEM, r0 + 10 + r3))
-	local v61 = buffer.readu32(MEM, 1056655)
-	local v62 = buffer.readu32(MEM, 1056659)
 	local v60 = buffer.readu32(MEM, 1056651)
+	local v62 = buffer.readu32(MEM, 1056659)
+	local v61 = buffer.readu32(MEM, 1056655)
 	buffer.writeu32(MEM, r1 + -86, buffer.readu32(MEM, 1056647))
 	buffer.writeu32(MEM, r1 + -82, v60)
 	buffer.writeu32(MEM, r1 + -78, v61)
@@ -10394,9 +8557,9 @@ function F107(ret_2: number, v3: number)
 		oob(16, r3, "/rust/core/src/escape.rs", 148, 17)
 	end
 	buffer.writeu8(MEM, r1 + -108, buffer.readu8(MEM, r0 + 26 + r3))
-	local v64 = buffer.readu32(MEM, 1056651)
 	local v65 = buffer.readu32(MEM, 1056655)
 	local v66 = buffer.readu32(MEM, 1056659)
+	local v64 = buffer.readu32(MEM, 1056651)
 	buffer.writeu32(MEM, r1 + -70, buffer.readu32(MEM, 1056647))
 	buffer.writeu32(MEM, r1 + -66, v64)
 	buffer.writeu32(MEM, r1 + -62, v65)
@@ -10418,9 +8581,9 @@ function F107(ret_2: number, v3: number)
 		oob(16, r3, "/rust/core/src/escape.rs", 150, 17)
 	end
 	buffer.writeu8(MEM, r1 + -106, buffer.readu8(MEM, r0 + 58 + r3))
-	local v74 = buffer.readu32(MEM, 1056659)
-	local v72 = buffer.readu32(MEM, 1056651)
 	local v73 = buffer.readu32(MEM, 1056655)
+	local v72 = buffer.readu32(MEM, 1056651)
+	local v74 = buffer.readu32(MEM, 1056659)
 	buffer.writeu32(MEM, r1 + -38, buffer.readu32(MEM, 1056647))
 	buffer.writeu32(MEM, r1 + -34, v72)
 	buffer.writeu32(MEM, r1 + -30, v73)
@@ -10430,9 +8593,9 @@ function F107(ret_2: number, v3: number)
 		oob(16, r3, "/rust/core/src/escape.rs", 151, 17)
 	end
 	buffer.writeu8(MEM, r1 + -105, buffer.readu8(MEM, r0 + 74 + r3))
-	local v76 = buffer.readu32(MEM, 1056651)
-	local v78 = buffer.readu32(MEM, 1056659)
 	local v77 = buffer.readu32(MEM, 1056655)
+	local v78 = buffer.readu32(MEM, 1056659)
+	local v76 = buffer.readu32(MEM, 1056651)
 	buffer.writeu32(MEM, r1 + -22, buffer.readu32(MEM, 1056647))
 	buffer.writeu32(MEM, r1 + -18, v76)
 	buffer.writeu32(MEM, r1 + -14, v77)
@@ -10471,7 +8634,7 @@ function F107(ret_2: number, v3: number)
 end
 
 -- core::unicode::unicode_data::skip_search::<33, 767>
-function F108(v8: number, v9: number, v10: number)
+function F105(v8: number, v9: number, v10: number)
 	local r0: number, r1: number, r2: number, r3: number, r4: number, r5: number, r6: number = 0, 0, 0, 0, 0, 0, 0
 	r0 = SP
 	local fp_0 = r0 - 8
@@ -10508,9 +8671,6 @@ function F108(v8: number, v9: number, v10: number)
 				r3 = r2 + 1
 				if r3 > 0xFFFFFFFF then r3 -= 0x100000000 end
 			else
-				if r1 ~= 1 then
-					unreachable()
-				end
 				r3 = r2
 			end
 			r1 = r3
@@ -10559,7 +8719,7 @@ function F108(v8: number, v9: number, v10: number)
 end
 
 -- core::unicode::unicode_data::skip_search::<12, 35>
-function F109(v8: number, v9: number, v10: number)
+function F106(v8: number, v9: number, v10: number)
 	local r0: number, r1: number, r2: number, r3: number, r4: number, r5: number, r6: number = 0, 0, 0, 0, 0, 0, 0
 	r0 = SP
 	local fp_0 = r0 - 8
@@ -10596,9 +8756,6 @@ function F109(v8: number, v9: number, v10: number)
 				r3 = r2 + 1
 				if r3 > 0xFFFFFFFF then r3 -= 0x100000000 end
 			else
-				if r1 ~= 1 then
-					unreachable()
-				end
 				r3 = r2
 			end
 			r1 = r3
@@ -10647,7 +8804,7 @@ function F109(v8: number, v9: number, v10: number)
 end
 
 -- core::unicode::unicode_data::skip_search::<11, 43>
-function F110(v8: number, v9: number, v10: number)
+function F107(v8: number, v9: number, v10: number)
 	local r0: number, r1: number, r2: number, r3: number, r4: number, r5: number, r6: number = 0, 0, 0, 0, 0, 0, 0
 	r0 = SP
 	local fp_0 = r0 - 8
@@ -10684,9 +8841,6 @@ function F110(v8: number, v9: number, v10: number)
 				r3 = r2 + 1
 				if r3 > 0xFFFFFFFF then r3 -= 0x100000000 end
 			else
-				if r1 ~= 1 then
-					unreachable()
-				end
 				r3 = r2
 			end
 			r1 = r3
@@ -10735,7 +8889,7 @@ function F110(v8: number, v9: number, v10: number)
 end
 
 -- core::unicode::unicode_data::skip_search::<54, 1461>
-FT[111] = function(v8: number, v9: number, v10: number)
+function F108(v8: number, v9: number, v10: number)
 	local r0: number, r1: number, r2: number, r3: number, r4: number, r5: number, r6: number = 0, 0, 0, 0, 0, 0, 0
 	r0 = SP
 	local fp_0 = r0 - 8
@@ -10772,9 +8926,6 @@ FT[111] = function(v8: number, v9: number, v10: number)
 				r3 = r2 + 1
 				if r3 > 0xFFFFFFFF then r3 -= 0x100000000 end
 			else
-				if r1 ~= 1 then
-					unreachable()
-				end
 				r3 = r2
 			end
 			r1 = r3
@@ -10823,7 +8974,7 @@ FT[111] = function(v8: number, v9: number, v10: number)
 end
 
 -- <&std::num::IntErrorKind as std::fmt::Debug>::fmt
-FT[112] = function(v0: number, v1: number)
+FT[109] = function(v0: number, v1: number)
 	local r0: number, r1: number = 0, 0
 	local v5 = buffer.readu8(MEM, buffer.readu32(MEM, v0))
 	if v5 == 0 then
@@ -10842,9 +8993,6 @@ FT[112] = function(v0: number, v1: number)
 		r0 = 1059683
 		r1 = 4
 	else
-		if v5 ~= 5 then
-			unreachable()
-		end
 		r0 = 1059669
 		r1 = 14
 	end
@@ -10859,42 +9007,42 @@ FN[5] = FT[20]
 FN[6] = FT[21]
 FN[7] = FT[28]
 FN[8] = FT[29]
-FN[9] = FT[60]
-FN[10] = FT[61]
-FN[11] = FT[63]
-FN[12] = FT[68]
-FN[13] = FT[72]
-FN[14] = FT[73]
-FN[15] = FT[74]
-FN[16] = FT[75]
-FN[17] = FT[76]
-FN[18] = FT[77]
-FN[19] = FT[78]
-FN[20] = FT[79]
-FN[21] = FT[80]
-FN[22] = FT[81]
-FN[23] = FT[82]
-FN[24] = FT[83]
-FN[25] = FT[84]
+FN[9] = FT[59]
+FN[10] = FT[60]
+FN[11] = FT[62]
+FN[12] = FT[67]
+FN[13] = FT[70]
+FN[14] = FT[71]
+FN[15] = FT[72]
+FN[16] = FT[73]
+FN[17] = FT[74]
+FN[18] = FT[75]
+FN[19] = FT[76]
+FN[20] = FT[77]
+FN[21] = FT[70]
+FN[22] = FT[78]
+FN[23] = FT[79]
+FN[24] = FT[80]
+FN[25] = FT[81]
 FN[26] = FT[30]
-FN[27] = FT[85]
-FN[28] = FT[86]
-FN[29] = FT[87]
-FN[30] = FT[88]
-FN[31] = FT[89]
-FN[32] = FT[90]
-FN[33] = FT[91]
-FN[34] = FT[92]
-FN[35] = FT[93]
-FN[36] = FT[94]
-FN[37] = FT[99]
-FN[38] = FT[102]
-FN[39] = FT[103]
-FN[40] = FT[104]
-FN[41] = FT[112]
+FN[27] = FT[82]
+FN[28] = FT[83]
+FN[29] = FT[84]
+FN[30] = FT[85]
+FN[31] = FT[86]
+FN[32] = FT[87]
+FN[33] = FT[88]
+FN[34] = FT[89]
+FN[35] = FT[90]
+FN[36] = FT[91]
+FN[37] = FT[96]
+FN[38] = FT[99]
+FN[39] = FT[100]
+FN[40] = FT[101]
+FN[41] = FT[109]
 
 return {
-	fib = FT[0],
+	fib = F0,
 	greet = FT[1],
 	memory = function(): buffer return MEM end,
 }

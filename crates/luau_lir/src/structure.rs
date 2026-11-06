@@ -518,6 +518,17 @@ impl<'a> Lower<'a> {
 
     fn emit_dispatch(&mut self, l: u32, out: &mut Vec<S>) {
         if let Some(entries) = self.dispatch.remove(&l) {
+            // all labels take the same action at this level: one check suffices
+            if let Some(first) = entries.first().map(|e| e.1) {
+                if entries.iter().all(|e| e.1 == first) {
+                    let body = match first {
+                        Some(cont) => vec![S::SetLabel(0), if cont { S::Continue } else { S::Break }],
+                        None => vec![S::Break],
+                    };
+                    out.push(S::If(Cond::LabelSet, body, vec![]));
+                    return;
+                }
+            }
             let mut inner = Vec::new();
             let mut propagate = false;
             for (id, action) in entries {

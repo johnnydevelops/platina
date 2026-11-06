@@ -852,7 +852,8 @@ impl<'a> FnEmitter<'a> {
                 let msg = if es.is_empty() { "\"panic\"".to_string() } else { es.join(" .. ") };
                 self.line(&format!("error({msg}, 0)"));
             }
-            S::Unreachable => self.line("unreachable()"),
+            // only reached after diverging calls (empty unreachable blocks are pruned)
+            S::Unreachable => {}
         }
     }
 

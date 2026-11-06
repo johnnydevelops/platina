@@ -545,9 +545,42 @@ fn dce(f: &mut Function) -> bool {
     changed
 }
 
+/// Branches into `unreachable` blocks are dead (reaching them is UB in Rust): drop them.
+fn prune_unreachable_edges(f: &mut Function) -> bool {
+    let dead: Vec<bool> = f.blocks.iter().map(|b| b.stmts.is_empty() && b.term == Term::Unreachable).collect();
+    let mut changed = false;
+    for b in &mut f.blocks {
+        let new = match &b.term {
+            Term::Br(_, t, e) if dead[*t as usize] && !dead[*e as usize] => Some(Term::Goto(*e)),
+            Term::Br(_, t, e) if dead[*e as usize] && !dead[*t as usize] => Some(Term::Goto(*t)),
+            Term::Br(_, t, e) if dead[*t as usize] && dead[*e as usize] => Some(Term::Unreachable),
+            Term::Switch(x, cases, d) => {
+                let live: Vec<(f64, BlockId)> = cases.iter().copied().filter(|c| !dead[c.1 as usize]).collect();
+                if dead[*d as usize] {
+                    match live.split_last() {
+                        None => Some(Term::Unreachable),
+                        Some((last, rest)) if rest.is_empty() => Some(Term::Goto(last.1)),
+                        Some((last, rest)) => Some(Term::Switch(*x, rest.to_vec(), last.1)),
+                    }
+                } else if live.len() != cases.len() {
+                    Some(if live.is_empty() { Term::Goto(*d) } else { Term::Switch(*x, live, *d) })
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        };
+        if let Some(t) = new {
+            b.term = t;
+            changed = true;
+        }
+    }
+    changed
+}
+
 /// Merge straight-line block chains and thread jumps through empty blocks.
 fn cfg_simplify(f: &mut Function) -> bool {
-    let mut changed = false;
+    let mut changed = prune_unreachable_edges(f);
     let n = f.blocks.len();
     // reachability + predecessor counts
     let mut reach = vec![false; n];
