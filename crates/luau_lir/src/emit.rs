@@ -368,7 +368,7 @@ impl<'a> FnEmitter<'a> {
         }
         // interference
         let mut adj: Vec<std::collections::BTreeSet<VarId>> = vec![Default::default(); n];
-        let mut add = |a: VarId, b: VarId, adj: &mut Vec<std::collections::BTreeSet<VarId>>| {
+        let add = |a: VarId, b: VarId, adj: &mut Vec<std::collections::BTreeSet<VarId>>| {
             if a != b {
                 adj[a as usize].insert(b);
                 adj[b as usize].insert(a);
@@ -734,6 +734,46 @@ impl<'a> FnEmitter<'a> {
         true
     }
 
+    /// Compact trap forms: `oob(len, idx, file, line, col)` for bounds checks and
+    /// `trap(msg, file, line, col)` for constant messages with a location.
+    fn compact_trap(&mut self, parts: &[TrapPart]) -> bool {
+        fn split_loc(s: &str) -> Option<(&str, &str, u32, u32)> {
+            let at = s.rfind(" at ")?;
+            let (msg, loc) = (&s[..at], &s[at + 4..]);
+            let mut it = loc.rsplitn(3, ':');
+            let col: u32 = it.next()?.parse().ok()?;
+            let line: u32 = it.next()?.parse().ok()?;
+            let file = it.next()?;
+            Some((msg, file, line, col))
+        }
+        // merge adjacent constant parts
+        let mut merged: Vec<TrapPart> = vec![];
+        for p in parts {
+            match (merged.last_mut(), p) {
+                (Some(TrapPart::Str(a)), TrapPart::Str(b)) => a.push_str(b),
+                _ => merged.push(p.clone()),
+            }
+        }
+        match merged.as_slice() {
+            [TrapPart::Str(a), TrapPart::Val(len), TrapPart::Str(b), TrapPart::Val(idx), TrapPart::Str(c)]
+                if a == "index out of bounds: the len is " && b == " but the index is " =>
+            {
+                let Some(("", file, line, col)) = split_loc(c) else { return false };
+                let (len, idx) = (self.operand(len).to_string(), self.operand(idx).to_string());
+                self.line(&format!("oob({len}, {idx}, {}, {line}, {col})", lua_string(file.as_bytes())));
+                true
+            }
+            [TrapPart::Str(m)] => match split_loc(m) {
+                Some((msg, file, line, col)) => {
+                    self.line(&format!("trap({}, {}, {line}, {col})", lua_string(msg.as_bytes()), lua_string(file.as_bytes())));
+                    true
+                }
+                None => false,
+            },
+            _ => false,
+        }
+    }
+
     fn jump(&mut self, text: &str, last: bool) {
         if last {
             self.line(text);
@@ -795,6 +835,7 @@ impl<'a> FnEmitter<'a> {
                 let t = if es.is_empty() { "return".to_string() } else { format!("return {}", es.join(", ")) };
                 self.jump(&t, last);
             }
+            S::Trap(parts) if self.compact_trap(parts) => {}
             S::Trap(parts) => {
                 let mut es = Vec::new();
                 for p in parts {
@@ -811,7 +852,7 @@ impl<'a> FnEmitter<'a> {
                 let msg = if es.is_empty() { "\"panic\"".to_string() } else { es.join(" .. ") };
                 self.line(&format!("error({msg}, 0)"));
             }
-            S::Unreachable => self.line("error(\"entered unreachable code\", 0)"),
+            S::Unreachable => self.line("unreachable()"),
         }
     }
 
@@ -898,12 +939,30 @@ pub fn lua_string(bytes: &[u8]) -> String {
             b'\t' => s.push_str("\\t"),
             0x20..=0x7e => s.push(b as char),
             _ => {
-                // use 3-digit decimal escapes so a following digit can't extend them
-                let _ = i;
-                write!(s, "\\{:03}", b).unwrap();
+                // shortest decimal escape that a following digit can't extend
+                let next_digit = bytes.get(i + 1).is_some_and(|n| n.is_ascii_digit());
+                if next_digit {
+                    write!(s, "\\{:03}", b).unwrap();
+                } else {
+                    write!(s, "\\{}", b).unwrap();
+                }
             }
         }
     }
     s.push('"');
     s
+}
+
+/// Base64 (standard alphabet, no padding).
+pub fn base64(bytes: &[u8]) -> String {
+    const A: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(bytes.len() * 4 / 3 + 4);
+    for c in bytes.chunks(3) {
+        let n = (c[0] as u32) << 16 | (*c.get(1).unwrap_or(&0) as u32) << 8 | *c.get(2).unwrap_or(&0) as u32;
+        let k = c.len() + 1;
+        for j in 0..k {
+            out.push(A[((n >> (18 - 6 * j)) & 63) as usize] as char);
+        }
+    }
+    out
 }

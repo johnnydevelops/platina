@@ -138,11 +138,6 @@ pub fn addr_fold(f: &mut Function) -> bool {
     changed
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
-struct Slot {
-    off: i32,
-    mem: Mem,
-}
 
 pub fn promote(f: &mut Function) -> bool {
     let n = f.vars.len();
@@ -263,7 +258,7 @@ pub fn promote(f: &mut Function) -> bool {
     let _ = &slot_ptr;
     // escape analysis per root, and slot inventory
     let roots: Vec<VarId> = (0..n as u32).filter(|v| root_of[*v as usize] == Some((*v, 0))).collect();
-    let mut escaped: HashMap<VarId, bool> = roots.iter().map(|r| (*r, false)).collect();
+    let escaped: HashMap<VarId, bool> = roots.iter().map(|r| (*r, false)).collect();
     let mut slots: HashMap<VarId, HashMap<i32, Mem>> = HashMap::new();
     let dbg = std::env::var("LUAU_DEBUG_PROMOTE").map(|v| f.name.contains(&v)).unwrap_or(false);
     let mut bad = |r: VarId, escaped: &mut HashMap<VarId, bool>| {

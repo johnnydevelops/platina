@@ -5,3 +5,4 @@ edition = "2024"
 description = "Differential test runner: native rustc vs rustc_codegen_luau under Lune"
 
 [dependencies]
+luau_lir = { path = "../luau_lir" }

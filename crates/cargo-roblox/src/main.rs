@@ -90,12 +90,36 @@ fn cargo_metadata(tc: &str, package: Option<&str>) -> Result<(PathBuf, String), 
     Ok((PathBuf::from(target_dir), name))
 }
 
+/// Path prefixes remapped in panic locations: the std sources, the cargo registry, and the
+/// current project.
+fn remaps(tc: &str) -> Vec<(PathBuf, &'static str)> {
+    let mut v = vec![];
+    if let Ok(o) = Command::new("rustc").arg(format!("+{tc}")).args(["--print", "sysroot"]).output() {
+        let sysroot = String::from_utf8_lossy(&o.stdout).trim().to_string();
+        v.push((Path::new(&sysroot).join("lib/rustlib/src/rust/library"), "/rust"));
+    }
+    let cargo_home = env::var("CARGO_HOME").map(PathBuf::from).unwrap_or_else(|_| {
+        PathBuf::from(env::var("HOME").unwrap_or_default()).join(".cargo")
+    });
+    if let Ok(rd) = std::fs::read_dir(cargo_home.join("registry/src")) {
+        for e in rd.flatten() {
+            v.push((e.path(), "/crates"));
+        }
+    }
+    if let Ok(cwd) = env::current_dir() {
+        v.push((cwd, "."));
+    }
+    v
+}
+
 fn build(args: &[String]) -> Result<(), String> {
     let mut release = false;
     let mut out: Option<PathBuf> = None;
     let mut package: Option<String> = None;
     let mut no_std = false;
     let mut verbose = false;
+    let mut minify: Option<bool> = None;
+    let mut tiny = false;
     let mut extra: Vec<String> = vec![];
     let mut it = args.iter();
     while let Some(a) = it.next() {
@@ -105,6 +129,9 @@ fn build(args: &[String]) -> Result<(), String> {
             "-p" | "--package" => package = Some(it.next().ok_or("--package needs a name")?.clone()),
             "--no-std" => no_std = true,
             "-v" | "--verbose" => verbose = true,
+            "--minify" => minify = Some(true),
+            "--no-minify" => minify = Some(false),
+            "--tiny" => tiny = true,
             "--" => {
                 extra.extend(it.by_ref().cloned());
             }
@@ -125,6 +152,13 @@ fn build(args: &[String]) -> Result<(), String> {
     }
     let mut rustflags = env::var("RUSTFLAGS").unwrap_or_default();
     rustflags.push_str(&format!(" -Zcodegen-backend={} -Zalways-encode-mir -Zmir-opt-level=3", backend.display()));
+    if tiny {
+        rustflags.push_str(" -Zunstable-options -Cpanic=immediate-abort");
+    }
+    // short, machine-independent source paths in panic messages
+    for (from, to) in remaps(&tc) {
+        rustflags.push_str(&format!(" --remap-path-prefix={}={}", from.display(), to));
+    }
     let mut cmd = Command::new("cargo");
     cmd.arg(format!("+{tc}"))
         .args(["rustc", "--lib", "--crate-type", "cdylib", "-Zjson-target-spec", "--target"])
@@ -134,10 +168,24 @@ fn build(args: &[String]) -> Result<(), String> {
     if release {
         cmd.arg("--release");
     }
+    if tiny {
+        cmd.arg("-Zbuild-std-features=optimize_for_size");
+    }
     if let Some(p) = &package {
         cmd.args(["-p", p]);
     }
     cmd.args(&extra);
+    // rebuild the final crate whenever the backend changes (all codegen happens there)
+    let fp = std::fs::metadata(&backend)
+        .map(|m| {
+            let t = m.modified().ok().and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map(|d| d.as_nanos()).unwrap_or(0);
+            format!("{:x}{:x}", m.len(), t)
+        })
+        .unwrap_or_default();
+    if !extra.iter().any(|a| a == "--") {
+        cmd.arg("--");
+    }
+    cmd.arg(format!("-Cmetadata=luau{fp}"));
     if verbose {
         eprintln!("running {cmd:?}");
     }
@@ -159,7 +207,9 @@ fn build(args: &[String]) -> Result<(), String> {
             std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
         }
     }
-    std::fs::copy(&artifact, &out).map_err(|e| format!("copy to {}: {e}", out.display()))?;
+    let src = std::fs::read_to_string(&artifact).map_err(|e| e.to_string())?;
+    let src = if minify.unwrap_or(release) { luau_lir::minify::minify(&src) } else { src };
+    std::fs::write(&out, src).map_err(|e| format!("write {}: {e}", out.display()))?;
     let size = std::fs::metadata(&out).map(|m| m.len()).unwrap_or(0);
     eprintln!("    Finished {} ({} KiB)", out.display(), size / 1024);
     Ok(())

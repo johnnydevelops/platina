@@ -19,6 +19,18 @@ cargo roblox build --release            # -> out/<crate>.luau
 cargo roblox build --release -o src/server/Rust.luau
 ```
 
+### Output size
+
+Release builds are minified: declared names are shortened (frequency-ranked), builtins like
+`buffer.readu32` are aliased to short locals (still fast-called by Luau's native codegen),
+whitespace/comments are stripped, repeated strings are stored once, static data is
+base64-packed and source paths in panic messages are shortened (`/rust/...`, `/crates/...`).
+Use `--no-minify` for readable output, or `--tiny` to also drop panic-message formatting.
+
+| crate | readable | minified (default) | `--tiny` |
+| --- | --- | --- | --- |
+| hello (HashMap + println) | 308 KB | 158 KB | 114 KB |
+
 Every `#[unsafe(no_mangle)] pub extern "C" fn` becomes a field of the returned module table:
 
 ```rust

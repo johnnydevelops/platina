@@ -28,6 +28,15 @@ local function popcnt(x: number): number
 	x = bit32.band(x + bit32.rshift(x, 4), 0x0F0F0F0F)
 	return bit32.rshift(imul32(x, 0x01010101), 24)
 end
+local function oob(len: number, idx: number, file: string, line: number, col: number)
+	error(string.format("index out of bounds: the len is %d but the index is %d at %s:%d:%d", len, idx, file, line, col), 0)
+end
+local function trap(msg: string, file: string, line: number, col: number)
+	error(string.format("%s at %s:%d:%d", msg, file, line, col), 0)
+end
+local function unreachable()
+	error("entered unreachable code", 0)
+end
 local function bitrev32(x: number): number
 	local r = 0
 	for _ = 1, 32 do
@@ -633,4 +642,30 @@ local function ftoi128(x: number, signed: boolean): (number, number, number, num
 	end
 	if neg then return neg128(r[1], r[2], r[3], r[4]) end
 	return r[1], r[2], r[3], r[4]
+end
+
+-- static data decoder (base64, no padding)
+local function b64write(at: number, s: string)
+	local dec = table.create(256, 0)
+	local abc = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+	for i = 1, 64 do dec[string.byte(abc, i)] = i - 1 end
+	local n = #s
+	local i = 1
+	while i + 3 <= n do
+		local a, b, c, d = string.byte(s, i, i + 3)
+		local v = dec[a] * 262144 + dec[b] * 4096 + dec[c] * 64 + dec[d]
+		buffer.writeu8(MEM, at, v // 65536)
+		buffer.writeu8(MEM, at + 1, (v // 256) % 256)
+		buffer.writeu8(MEM, at + 2, v % 256)
+		at += 3
+		i += 4
+	end
+	local rem = n - i + 1
+	if rem >= 2 then
+		local a, b = string.byte(s, i, i + 1)
+		local v = dec[a] * 262144 + dec[b] * 4096
+		if rem == 3 then v += dec[string.byte(s, i + 2)] * 64 end
+		buffer.writeu8(MEM, at, v // 65536)
+		if rem == 3 then buffer.writeu8(MEM, at + 1, (v // 256) % 256) end
+	end
 end

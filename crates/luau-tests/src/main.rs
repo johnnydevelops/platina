@@ -85,7 +85,14 @@ fn build_luau_mode(root: &Path, name: &str, glue: &str, std: bool) -> Result<Pat
             "RUSTFLAGS",
             format!("-Zcodegen-backend={} -Zalways-encode-mir -Zmir-opt-level=3", backend.display()),
         ))?;
-    Ok(target_dir.join(format!("luau32-unknown-roblox/release/{name}.luau")))
+    let module = target_dir.join(format!("luau32-unknown-roblox/release/{name}.luau"));
+    if std::env::var("LUAU_TEST_NO_MINIFY").is_err() {
+        let src = std::fs::read_to_string(&module).map_err(|e| e.to_string())?;
+        let min = module.with_extension("min.luau");
+        std::fs::write(&min, luau_lir::minify::minify(&src)).map_err(|e| e.to_string())?;
+        return Ok(min);
+    }
+    Ok(module)
 }
 
 const BENCHES: &[(&str, u32)] =

@@ -2,6 +2,7 @@
 
 pub mod emit;
 pub mod ir;
+pub mod minify;
 pub mod passes;
 pub mod structure;
 
@@ -48,7 +49,13 @@ pub fn emit_program(p: &Program) -> Result<String, String> {
     writeln!(out, "local HEAP_BASE: number = {}", p.heap_base).unwrap();
     out.push_str(PRELUDE);
     if !p.data.is_empty() {
-        writeln!(out, "buffer.writestring(MEM, {}, {})", p.data_base, emit::lua_string(&p.data)).unwrap();
+        let escaped = emit::lua_string(&p.data);
+        let b64 = emit::base64(&p.data);
+        if b64.len() + 2 < escaped.len() {
+            writeln!(out, "b64write({}, \"{}\")", p.data_base, b64).unwrap();
+        } else {
+            writeln!(out, "buffer.writestring(MEM, {}, {})", p.data_base, escaped).unwrap();
+        }
     }
     // hottest functions become locals, the rest go through the FT table
     let counts = call_counts(p);
@@ -65,7 +72,8 @@ pub fn emit_program(p: &Program) -> Result<String, String> {
             names.split(',').count()
         })
         .sum();
-    let budget = MAX_LOCAL_FUNCS.min(190usize.saturating_sub(prelude_locals + 8));
+    // leave room for the minifier's aliases and string table
+    let budget = MAX_LOCAL_FUNCS.min(190usize.saturating_sub(prelude_locals + 8 + minify::MAX_ALIASES + 2));
     for i in order.into_iter().take(budget) {
         local[i] = true;
     }

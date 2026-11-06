@@ -126,7 +126,7 @@ fn dead_frames(f: &mut Function) -> bool {
     let mut escapes = vec![false; n];
     let mut loaded = vec![false; n];
     let mut other_use = vec![false; n]; // any use except SetSp(fp)
-    let mut mark_escape = |o: &Operand, escapes: &mut Vec<bool>| {
+    let mark_escape = |o: &Operand, escapes: &mut Vec<bool>| {
         if let Operand::Var(v) = o {
             escapes[*v as usize] = true;
         }

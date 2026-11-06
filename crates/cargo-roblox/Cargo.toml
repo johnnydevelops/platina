@@ -5,3 +5,4 @@ edition = "2024"
 
 [dependencies]
 serde_json = "1"
+luau_lir = { path = "../luau_lir" }
