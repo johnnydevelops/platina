@@ -99,8 +99,13 @@ pub fn inline_program(p: &mut Program) {
             splice(&mut f, bi, si, &callee);
             changed = true;
         }
+        let had_return = |f: &Function| f.blocks.iter().any(|b| matches!(b.term, Term::Return(_)));
+        let before = had_return(&f);
         if changed {
             super::simplify(&mut f);
+        }
+        if std::env::var("LUAU_DEBUG_COLLAPSE").is_ok() && before && !had_return(&f) {
+            eprintln!("collapse: {} lost all returns after inlining", f.name);
         }
         p.funcs[fi] = f;
     }

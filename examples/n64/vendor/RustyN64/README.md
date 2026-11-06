@@ -1,0 +1,571 @@
+<!-- markdownlint-disable MD033 MD041 -->
+<div align="center">
+
+# RustyN64
+
+> **Precise. Pure. Powerful.**
+
+</div>
+
+<p align="center">
+  <a href="https://github.com/doublegate/RustyN64/actions"><img src="https://github.com/doublegate/RustyN64/workflows/CI/badge.svg" alt="Build Status"></a> <a href="#license"><img src="https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg" alt="License: MIT OR Apache-2.0"></a> <a href="https://github.com/doublegate/RustyN64/releases"><img src="https://img.shields.io/badge/version-v0.7.0-blue.svg" alt="Version"></a> <a href="rust-toolchain.toml"><img src="https://img.shields.io/badge/rust-1.96.0-orange.svg" alt="Rust: 1.96.0"></a><br>
+  <a href="#compatibility-and-accuracy"><img src="https://img.shields.io/badge/status-phase%206%20complete-brightgreen.svg" alt="Status: Phase 6 complete"></a> <a href="#compatibility-and-accuracy"><img src="https://img.shields.io/badge/n64--systemtest-CPU%20%2B%20RSP%200%20fail-brightgreen.svg" alt="n64-systemtest: CPU + RSP 0 fail"></a> <a href="https://doublegate.github.io/RustyN64/"><img src="https://img.shields.io/badge/pages-rustdoc-success.svg" alt="GitHub Pages"></a><br>
+  <a href="#platform-support"><img src="https://img.shields.io/badge/platform-Windows%20%7C%20Linux%20%7C%20macOS-lightgrey.svg" alt="Platform"></a>
+</p>
+
+## Overview
+
+**RustyN64 is a cycle-accurate Nintendo 64 emulator written in pure Rust.** Following the
+lineage of [`RustyNES`](https://github.com/doublegate/RustyNES) and
+[`RustySNES`](https://github.com/doublegate/RustySNES), it targets the ares / CEN64 / Gopher64 /
+ParaLLEl accuracy bar: one canonical 187.5 MHz master-clock timeline co-scheduling three asynchronous
+compute engines, a Bus that owns everything mutable, low-level emulation of the programmable
+coprocessors, and a hard determinism contract.
+
+> ### Status: Phase 6 complete (v0.7.0) — the first playable release (homebrew)
+>
+> **Every core subsystem executes, and the shell presents the real machine.** Phase 1 delivered the
+> complete VR4300 (`n64-systemtest Failed: 0` on CPU/COP0/TLB/COP1, 0-diff golden trace vs ares);
+> Phase 2 the **LLE RSP** (`Failed: 0` on the RSP category, libdragon's `rdpq` microcode booting
+> through the DPC seam); Phase 3 the **LLE RDP rasterizer + VI scan-out** (bit-matching Angrylion
+> across **164 conformance vectors**, a real ROM rendering a committed golden frame); Phase 4 the
+> **AI audio** (the libdragon mixer microcode producing golden PCM on the LLE RSP, a real ROM
+> playing it through the AI); Phase 5 the **cartridge boot + saves** (PI/SI/PIF/CIC + all four save
+> backends, HLE and faithful real-PIF boot). **Phase 6 wires the egui shell to that machine:** the
+> VI scan-out drives the window, the AI drain feeds the audio ring, SI input reaches the game, and
+> the frontend adds save-states / rewind / run-ahead (frontend-side, off by default) and a wasm
+> browser demo.
+>
+> **"Playable" is honestly scoped.** Picture, sound, and control are demonstrated natively on the
+> committed **homebrew** ROMs through the real LLE VI/AI/SI paths, and save-state restore is
+> bit-identical (proven on a booted commercial ROM). A **commercial** title boots and executes real
+> code but does **not** yet reach a rendered frame — the cross-subsystem VI-vblank / RI-register /
+> F3DEX gap tracked as accuracy-ledger **R-18**, deferred to the Phase 3/7 rasterizer + microcode
+> work. Where a subsystem is still a stub it is a no-op `TODO(...)` body rather than a `todo!()`
+> panic, so **a green test run does not mean a subsystem works**.
+>
+> **[`docs/STATUS.md`](docs/STATUS.md) is the single source of truth.** Read it before assuming
+> any feature works.
+
+---
+
+## Why RustyN64?
+
+RustyN64 applies the accuracy-first architecture proven in its two sibling projects to a
+markedly harder machine. The N64 is not an 8- or 16-bit console with a CPU and a video chip: it
+is two large chips on a unified Rambus memory pool, with a programmable SIMD coprocessor running
+game-supplied microcode and a fixed-function rasterizer fed by a command list.
+
+**Key differentiators:**
+
+- **The right timebase for this machine.** The VR4300 cycle is the master tick
+  (`MASTER_HZ = 187_500_000`), the LCM of the 93.75 MHz CPU and 62.5 MHz RCP clocks. Every
+  emulated domain is an **integer divisor** of it: the CPU steps every 2nd tick, the RCP every
+  3rd, COP0 `Count` every 4th, SI every 12th, PIF every 96th — so drift is unrepresentable
+  rather than merely avoided. `master_ticks` is the only counter ever incremented; every other
+  cycle position is derived from it and pinned by a residue invariant test. Only VI and AI,
+  which genuinely run off a different crystal, keep a fractional accumulator (ADR 0006).
+- **LLE, never HLE, in the core.** The N64 let every studio ship custom microcode, so
+  signature-matching HLE is per-game-fragile and mis-renders mid-frame effects. The RSP executes
+  the real instruction stream and the RDP rasterizes the real command list. Audio falls out free,
+  because the audio microcode runs on the same LLE core — there is no per-game audio HLE
+  (ADR 0002).
+- **Determinism as a hard contract.** Same seed, ROM, and input sequence yield a bit-identical
+  framebuffer and audio. Power-on CPU/RCP phase — genuinely indeterminate on hardware — is
+  modeled as a *seeded* parameter rather than live entropy, so it is reproducible and
+  save-stateable (ADR 0004).
+- **Honest status reporting.** This README, `docs/STATUS.md`, and the accuracy tables all
+  distinguish "the oracle ROM is staged" from "the gate passes". The CPU and RSP gates now pass as
+  oracle results with committed runners; every gate that does not yet pass says so plainly.
+- **Safe, modular Rust.** The chip stack is `no_std + alloc` with a one-directional crate graph,
+  so each chip is independently fuzzable and benchmarkable. Every chip crate and `-core` carries
+  `#![forbid(unsafe_code)]`; there is zero `unsafe` in the tree.
+
+---
+
+## Highlights
+
+| Feature | Status |
+| --- | --- |
+| **Canonical 187.5 MHz master clock** | **Working** — one incremented counter; CPU/RCP/`Count` derived from it, seeded power-on phase, reset-preserves-phase; pinned by a residue-invariant test (ADR 0006) |
+| **Bus owns all mutable state** | **Working** — RDRAM + every chip + MI lines; five narrow per-chip traits; `core::mem::take` split-borrow stepping |
+| **One-directional crate graph** | **Working** — exactly one permitted chip-to-chip edge (`rdp` → `cart`, for `RdramBus`) |
+| **ROM format handling** | **Working** — `.z64` / `.n64` / `.v64` detection and byte-order normalization, header parse, save-type and CIC enums |
+| **VR4300 five-stage pipeline** | **Working** — four inter-stage latches, reverse cascade, operand bypass, imprecise load interlock, delay slots and branch-likely (ADR 0007) |
+| **VR4300 MIPS III integer set** | **Working** — incl. the 64-bit `D*` forms, unaligned `LWL`/`LWR`/`LDL`/`LDR`, `LL`/`SC`, and the documented errata reproduced rather than corrected |
+| **COP0, exceptions, interrupts** | **Working** — full register file, exception epilogue and vectors, `ERET`, `Count`/`Compare` timer, MI interrupt line |
+| **TLB + instruction micro-TLB** | **Working** — 32 joint entries, page pairs, 4K–16M sizes, TLB shutdown; a micro-TLB miss is a stall, a JTLB miss an exception |
+| **VR4300 FPU (COP1)** | **Working** — a soft-float core (control, register file, arithmetic, compares, conversions, enabled traps, `BC1`); the VR4300's no-subnormal + inverted-NaN errata reproduced, verified bit-exact against the native operators |
+| **LLE RSP (scalar + vector units)** | **Working** (Phase 2) — the full SU, the 8-lane VU (multiplies, accumulator, clip compares, reciprocals, the vector load/store family, reserved opcodes), SP DMA, and the halt/break/interrupt handshake; `n64-systemtest` RSP category `Failed: 0` |
+| **Real microcode + the RSP→RDP seam** | **Working** (Phase 2) — libdragon's real `rdpq` microcode boots and emits an RDP command list; RSP COP0 `c8`–`c15` route to the DPC register file (the CPU-visible seam) |
+| **LLE RDP + VI scan-out** | **Working** (Phase 3) — FILL / scissor / shaded / textured triangles, the combiner, blender, dither, alpha-compare and coverage bit-match Angrylion across 164 conformance vectors; VI scans the framebuffer out and a real ROM renders a committed golden frame. Perspective/bilinear texturing and an RDP-driven real-ROM frame are later work |
+| **AI audio** | Stub — Phase 4 |
+| **PI/SI DMA, PIF/CIC boot, saves** | Partial — PI DMA runs (pulled forward for n64-systemtest); SI/joybus, PIF/CIC boot, and saves are Phase 5 |
+| **egui shell** | **Working** — presents the real machine (VI scan-out, AI audio drain, SI input) with save-states / rewind / run-ahead (frontend-side, off by default) |
+| **Test-ROM oracle** | **Reporting** — `n64-systemtest` runs and asserts `Failed: 0` on CPU/COP0/TLB/COP1 **and** RSP; Dillon's `basic.z64` passes 5/5; a CPU golden-log 0-diff against ares; krom, 240p and a 66-ROM commercial corpus staged locally |
+| **Hardware reference** | **Working** — offline N64brew Wiki mirror (324 pages, 96 media) rebuilt by a script |
+| **`no_std` chip stack** | **Working** — cross-compiles to `thumbv7em-none-eabihf` |
+| **wasm** | **Working** — a `#[wasm_bindgen(start)]` browser entry point runs a homebrew ROM and blits the VI scan-out to a 2D canvas (`trunk build`); the full in-browser shell is roadmap |
+| **Netplay / RetroAchievements** | Placeholder crates — Phase 8 |
+
+---
+
+## Features
+
+### Emulation core
+
+- **One canonical master clock.** A single 187.5 MHz counter is the *only* incremented cycle
+  position in the core; the VR4300 (÷2), the RCP (÷3) and COP0 `Count` (÷4) are all **derived**
+  from it, so they cannot drift apart (ADR 0006). A residue-invariant test in the default test
+  path is what keeps it that way. "Lockstep" here means *not catch-up*: an RCP event — a DP-done
+  IRQ, an SP halt, an AI buffer drain — is visible to the very next CPU step, which is what makes
+  mid-frame coprocessor effects work without per-quirk patches.
+- **A cycle-accurate five-stage pipeline.** The VR4300 is four inter-stage latches advanced one
+  PClock per step in reverse stage order (`WB → DC → EX → RF → IC`), so the reverse order *is*
+  the latching (ADR 0007). `DC` is the cycle the scheduler interleaves the RCP around — the
+  reason a device can observe the bus partway through an instruction, which a
+  one-`tick`-per-instruction CPU cannot express at all.
+- **The MIPS III integer set, COP0, the TLB and the exception model.** Delay slots and
+  branch-likely nullification, the imprecise load-delay interlock, the operand bypass network,
+  `LL`/`SC`, a 32-entry TLB with its two-entry instruction micro-TLB, and the documented VR4300
+  errata **reproduced rather than corrected** — each pinned by a named test that fails if someone
+  "fixes" it.
+- **The Bus owns everything mutable.** `rustyn64-core::Bus` holds RDRAM (8 MiB: 4 MiB base plus
+  Expansion Pak), the RSP, RDP, AI, cart, controllers, and the MI interrupt lines. The CPU
+  borrows `&mut Bus`; each chip sees only the narrow trait it needs. Chips are stepped with a
+  `core::mem::take` split-borrow — no allocation, no `Rc`/`RefCell`.
+- **One cart model, no board tiering.** Unlike the NES with its hundreds of mappers, the N64 has
+  a single cart parameterized by save type, CIC variant, and region — so there is no board tier
+  matrix and no honesty gate here (ADR 0003).
+
+### Test infrastructure
+
+The oracle is staged ahead of the emulator, so accuracy work is graded from day one rather than
+retrofitted:
+
+- **`n64-systemtest`** (MIT, committed) — the strict CPU/COP0/TLB/RSP gate. Self-judging: it
+  reports `Failed: 0` itself, so no image comparison is needed. Built from source, since upstream
+  publishes no prebuilt ROM. It now reports `Failed: 0` on both the CPU/COP0/TLB/COP1 and the RSP
+  categories (Phase 1 and Phase 2 exit criteria); the remaining suite-wide failures are
+  cart/PIF/MI (Phase 5) and the residual RDP-category assertions.
+- **External corpora** (gitignored) — PeterLemon/krom (196 ROMs), Dillon's n64-tests (26), the
+  240p Test Suite (built from source in a container), and a 66-ROM commercial regression corpus
+  organized by save type, with save types resolved by MD5 against the mupen64plus catalog
+  rather than guessed.
+- **Three-layer ROM guard** — commercial ROMs cannot enter the repository. `.gitignore` covers
+  the ordinary case, a pre-commit hook covers `git add -f` (which bypasses `.gitignore`
+  silently) and renamed files (via a size ceiling), and a CI job re-scans the whole tracked tree
+  server-side. Verified against a real bypass attempt, not assumed.
+- **Offline hardware reference** — an N64brew Wiki mirror with parallel HTML, Markdown, and
+  wikitext trees, so register-level detail is greppable without a network round-trip.
+
+---
+
+## Quick Start
+
+### Build from source
+
+**Prerequisites:**
+
+- **Rust 1.96.0** — pinned via `rust-toolchain.toml` and auto-installed by
+  [rustup](https://rustup.rs).
+- **Linux desktop dependencies** for `winit` / `wgpu` / `cpal` / `egui` (see below).
+- **Git.**
+
+```bash
+# Clone the repository
+git clone https://github.com/doublegate/RustyN64.git
+cd RustyN64
+
+# Build the workspace (release)
+cargo build --release --workspace
+
+# Run — the shell boots the ROM and presents the real machine (picture, sound,
+# input). Homebrew renders a real frame; a commercial title boots but does not
+# yet show a frame (ledger R-18).
+cargo full-run path/to/rom.z64
+```
+
+**Always run a release build.** `cargo full-run` (and `cargo full-build`) are aliases
+for `--release -p rustyn64-frontend --features full`, and the `--release` is not
+cosmetic: a debug build of this emulator is **8.7x slower** — 0.82 FPS against 7.18 on
+the same ROM, measured as two runs each on one tree (`docs/performance.md` §Measured). A
+plain `cargo run` looks like an emulation defect rather than a build-profile choice,
+which has already happened once.
+
+`cargo full-run` ends in `--`, so **everything after it goes to the emulator**, not to
+cargo: `cargo full-run path/to/rom.z64` works, and a leading-dash emulator flag survives.
+The cost is that cargo's own flags do not — for `--verbose`, `--jobs`, or `--target`, spell
+the command out as `cargo run --release -p rustyn64-frontend --features full`.
+
+Never use `--all-features` on this workspace — mutually-exclusive backend features cannot
+resolve. CI uses explicit feature sets.
+
+### Quality gates
+
+All of these gate in CI and must be green:
+
+```bash
+cargo fmt --all --check
+cargo clippy --workspace --all-targets -- -D warnings   # NEVER --all-features
+cargo test --workspace
+cargo test --workspace --features test-roms
+RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
+cargo build -p rustyn64-core --target thumbv7em-none-eabihf --no-default-features
+bash scripts/check_no_roms.sh
+```
+
+### Platform-specific dependencies
+
+**Ubuntu / Debian:**
+
+```bash
+sudo apt-get install -y libxkbcommon-dev libwayland-dev libxkbcommon-x11-dev libasound2-dev libudev-dev
+```
+
+**CachyOS / Arch:**
+
+```bash
+sudo pacman -S --needed libxkbcommon wayland alsa-lib systemd-libs
+```
+
+**macOS / Windows:** no extra system dependencies are required for the default build.
+
+---
+
+## Default Controls
+
+The input map is implemented in the shell, though nothing yet consumes it through the SI joybus
+(Phase 6).
+
+| Action | Key |
+| --- | --- |
+| Analog stick | Arrow keys |
+| D-pad | I / J / K / L |
+| A / B | X / Z |
+| Z trigger | Space |
+| Start | Enter |
+| C-buttons | T / F / G / H |
+| L / R | Q / E |
+
+`rustyn64 --help` prints usage and the keymap; `--version` prints the version.
+
+---
+
+## Architecture
+
+Read [`docs/architecture.md`](docs/architecture.md) before any chip doc — it carries the eight
+load-bearing facts that explain why the per-chip specs read the way they do.
+
+Three of those facts, in brief:
+
+1. **One canonical master clock; everything is lockstep.** The master tick is 187.5 MHz — the
+   LCM of the 93.75 MHz CPU and 62.5 MHz RCP clocks — so every emulated domain is an integer
+   divisor (CPU 2, RCP 3, COP0 `Count` 4, SI 12, PIF 96) and drift is unrepresentable rather
+   than merely avoided. `master_ticks` is the only counter ever incremented (ADR 0006).
+2. **The Bus owns everything mutable.** One owner, narrow per-chip traits, split-borrow stepping
+   — which avoids the "CPU holds the coprocessor, but the coprocessor needs the CPU bus" cycle.
+3. **The crate graph is one-directional,** with exactly one permitted chip-to-chip edge:
+   `rustyn64-rdp` → `rustyn64-cart`, solely to borrow the `RdramBus` trait. Everything else
+   depends on `rustyn64-core`, which re-exports the chip types.
+
+### Workspace crates
+
+| Crate | Role |
+| --- | --- |
+| `rustyn64-cpu` | NEC VR4300 (MIPS III, TLB, FPU, SysAD) |
+| `rustyn64-rsp` | RSP — scalar unit + vector unit, DMEM/IMEM, downloadable microcode |
+| `rustyn64-rdp` | RDP rasterizer + VI scan-out |
+| `rustyn64-audio` | AI DAC + sample DMA |
+| `rustyn64-cart` | PI cart + PIF/CIC boot + SI + saves |
+| `rustyn64-core` | The Bus + canonical master-clock scheduler tie crate |
+| `rustyn64-frontend` | The `winit + wgpu + cpal + egui` shell (binary `rustyn64`) |
+| `rustyn64-test-harness` | Golden-log differ, accuracy scorer, frame comparator |
+| `rustyn64-netplay` | Rollback netplay orchestration (placeholder) |
+| `rustyn64-cheevos` | RetroAchievements FFI (placeholder) |
+
+### Project layout
+
+```text
+crates/         Cargo workspace: the crates above
+docs/           Subsystem specs, ADRs, and STATUS.md (single source of truth)
+ref-docs/       Immutable deep-research N64 hardware reference
+ref-proj/       Gitignored study clones of reference emulators (license-classified)
+n64brew_wiki/   Gitignored offline mirror of the N64brew Wiki
+tests/roms/     Committed permissive corpus + gitignored external/ (never committed)
+scripts/        The wiki mirror tool and the commercial-ROM guard
+to-dos/         ROADMAP.md plus per-phase overviews and sprint ticket breakdowns
+```
+
+---
+
+## Compatibility and Accuracy
+
+**The CPU, RSP, and RDP gates report real numbers; the accuracy-breadth work does not yet.** The
+distinction that matters here is that "oracle available" means the ROM is on disk — it says
+nothing about whether the emulator can execute it.
+
+| Gate | Oracle available? | Status |
+| --- | --- | --- |
+| Dillon `basic.z64` (control flow) | **Yes** — external tier | **Passing** — 5/5 |
+| Determinism (ADR 0004) | n/a — self-checking | **Passing** — exercised, not merely specified |
+| n64-systemtest `Failed: 0` (CPU/COP0/TLB/COP1) | **Yes** — ROM committed | **Passing** — Phase 1 exit criterion |
+| n64-systemtest `Failed: 0` (RSP category) | **Yes** — ROM committed | **Passing** — Phase 2 exit criterion |
+| CPU golden-log 0-diff (ares trace) | **Yes** — committed | **Passing** — Phase 1 exit criterion |
+| Real microcode emits an RDP command list | **Yes** — libdragon `rdpq`, committed | **Passing** — Phase 2 exit criterion |
+| RDP conformance vs Angrylion (bit-exactness) | **Yes** — 164 committed `.rvec` vectors | **Passing** — Phase 3 exit criterion |
+| Real ROM renders a golden frame (T-33-006) | **Yes** — license-clean homebrew ROM committed | **Passing** — Phase 3 exit criterion |
+| Accuracy battery | Probes not authored | 0% (battery stubbed) |
+| Visual golden / screenshots (real-game frames) | **Yes** — krom + 240p + commercial staged | Not started (Phase 7) |
+
+Where the hardware documentation is silent, or contradicts itself, the project records that
+rather than guessing quietly: [`docs/accuracy-ledger.md`](docs/accuracy-ledger.md) tracks measured
+constants with their provenance, genuinely undocumented behavior awaiting a hardware pin,
+deliberate deviations, and contradictions **within the vendor manual itself**. A measured constant
+is never tuned to make a ROM pass — the moment one is, every later timing result built on it stops
+being evidence.
+
+> A note on test counts: RustyN64 will be validated by closed-form test ROMs (n64-systemtest,
+> the ParaLLEl-RDP fuzz suite, krom, Dillon's tests) and a commercial-ROM regression corpus — not
+> by a headline unit-test number. When a doc and a passing test ROM disagree, **the ROM wins** —
+> that is this project's definition of "cycle-accurate."
+
+---
+
+## Performance
+
+**No headline performance measurements are published yet**, and any would be premature while
+whole subsystems (AI audio, cart boot) are still stubbed and no full-speed run path exists. The
+strategy is recorded in [`docs/performance.md`](docs/performance.md): correctness first, then
+accelerate validated layers. The software reference RDP — now the working rasterizer — lands
+before any wgpu-compute backend, and stays the oracle that backend is graded against (ADR 0002).
+
+---
+
+## Platform Support
+
+| Platform | Status |
+| --- | --- |
+| **Linux x64** | Built and tested in CI |
+| **macOS ARM64** | Built and tested in CI |
+| **Windows x64** | Built and tested in CI |
+| **`thumbv7em-none-eabihf`** | Chip stack cross-compiles (`no_std` gate) |
+| **WebAssembly** | Browser entry point + 2D-canvas demo (`trunk build`); full in-browser shell is roadmap |
+
+### System requirements
+
+- **Rust 1.96.0** (pinned via `rust-toolchain.toml`; auto-installed by `rustup`).
+- A GPU with a `wgpu`-supported backend (Vulkan / Metal / DX12).
+- Linux additionally needs the alsa/udev/xkbcommon/wayland development headers listed above.
+
+---
+
+## Documentation
+
+| Document | Description |
+| --- | --- |
+| [Project status](docs/STATUS.md) | **Single source of truth** — per-subsystem state, infrastructure, corpora, version policy |
+| [Architecture](docs/architecture.md) | The eight load-bearing facts — read before any chip doc |
+| [Scheduler](docs/scheduler.md) | The canonical 187.5 MHz master-clock model |
+| [Testing strategy](docs/testing-strategy.md) | The oracle, the five test layers, and the corpus tiers |
+| [Roadmap](to-dos/ROADMAP.md) | The phase spine, Phase 0 through Phase 8 |
+| [Version plan](to-dos/VERSION-PLAN.md) | The named release ladder from `v0.1.0` to `v1.0.0` and beyond |
+| [Lockstep checklist](to-dos/LOCKSTEP-CHECKLIST.md) | The process for tracking the two sibling projects when scoping each release |
+| [CHANGELOG.md](CHANGELOG.md) | Version history |
+| [API documentation](https://doublegate.github.io/RustyN64/) | Published rustdoc for every workspace crate |
+
+### Hardware and subsystem specs
+
+| Component | Location |
+| --- | --- |
+| CPU (VR4300) | [docs/cpu.md](docs/cpu.md) |
+| RSP | [docs/rsp.md](docs/rsp.md) |
+| RDP + VI | [docs/rdp.md](docs/rdp.md) |
+| Audio (AI) | [docs/audio.md](docs/audio.md) |
+| Cartridge / PI / saves | [docs/cart.md](docs/cart.md), [docs/cartridge-format.md](docs/cartridge-format.md) |
+| Frontend | [docs/frontend.md](docs/frontend.md) |
+| Compatibility | [docs/compatibility.md](docs/compatibility.md) |
+| Glossary | [docs/glossary.md](docs/glossary.md) |
+
+Architecture Decision Records live in [`docs/adr/`](docs/adr/) in Michael Nygard format.
+Immutable primary research lives in [`ref-docs/`](ref-docs/) — never rewritten in place;
+corrections land as new dated supplemental files.
+
+---
+
+## Current Release
+
+**v0.7.0 "Shell"** is the current release — **the first playable release**. Phase 6 wires the egui
+shell to the real machine: the VI scan-out drives the window, the AI drain feeds the audio ring, and
+SI controller input reaches the game, so a homebrew ROM shows a real rendered frame, plays real PCM,
+and responds to the pad. The frontend also gains save-states, rewind, and run-ahead (all
+frontend-side and off by default, ADR 0004, so output stays byte-identical) and a **wasm browser
+entry point** (a 2D-canvas demo built with `trunk`). "Playable" is honestly scoped: picture, sound,
+and control are demonstrated on the committed **homebrew** ROMs, and save-state restore is
+bit-identical (proven on a booted commercial ROM); a **commercial** title boots and executes but does
+not yet reach a rendered frame — the VI/RI/F3DEX gap tracked as ledger **R-18**, deferred to the
+Phase 3/7 rasterizer + microcode work. The earlier phases remain met: Phase 5 (cart boot + all four
+save backends; HLE and real-PIF boot; n64-systemtest 93 → 90), Phase 4 (audio — the real libdragon
+mixer microcode produces golden PCM; a ROM plays it through the AI), Phase 3 (RDP conformance
+bit-matches Angrylion across 164 vectors; a real ROM renders a golden frame), Phase 2 (RSP-category
+`n64-systemtest Failed: 0`; real `rdpq` microcode emitting an RDP command list), and Phase 1 (CPU
+`Failed: 0`; a 0-diff golden trace against ares). All are oracle results with committed runners, not
+self-assessments: reproduce them with
+
+```bash
+cargo test -p rustyn64-test-harness --release --test systemtest -- --ignored
+cargo test -p rustyn64-test-harness --release --test commercial_boot -- --ignored  # local; gitignored corpus
+cargo test -p rustyn64-test-harness --test savestate
+cargo test -p rustyn64-test-harness --test mixer_microcode
+cargo test -p rustyn64-test-harness --test rdp_conformance
+cargo test -p rustyn64-test-harness --test real_rom_frame
+cargo test -p rustyn64-test-harness --release --test golden_log -- --ignored
+```
+
+The next rung is **v0.8.0 "Breadth"** (Phase 7 — the accuracy battery: the commercial corpus
+triaged and reporting a real pass rate, the custom-microcode families rendering, and the commercial
+title frame that R-18 defers). The release ladder is
+[`to-dos/VERSION-PLAN.md`](to-dos/VERSION-PLAN.md); long-form notes live in
+[`docs/release-notes/`](docs/release-notes/).
+
+- **Authoritative current state:** [`docs/STATUS.md`](docs/STATUS.md).
+- **Full history:** [`CHANGELOG.md`](CHANGELOG.md).
+
+## Roadmap
+
+Nine phases. **Phases 0–6 are complete**; **Phase 7 is next**:
+
+- **Phase 0 — Foundation** *(complete)* — workspace, CI, the Bus and scheduler, and the acquired
+  and license-classified reference corpus.
+- **Phase 1 — CPU golden log** *(complete, v0.2.0)* — the VR4300 to a 0-diff ares trace and
+  n64-systemtest `Failed: 0` on CPU/COP0/TLB/COP1. The integer core, COP0, the TLB, the exception
+  model, and a soft-float COP1 are all in.
+- **Phase 2 — RSP LLE** *(complete, v0.3.0)* — the scalar and vector units running real microcode;
+  n64-systemtest `Failed: 0` on the RSP category, and libdragon's `rdpq` microcode emitting an RDP
+  command list through the DPC seam.
+- **Phase 3 — RDP LLE + VI** *(complete, v0.4.0)* — the software reference rasterizer and scan-out;
+  first picture. 164 conformance vectors bit-match Angrylion and a real ROM renders a golden frame.
+- **Phase 4 — AI audio** *(complete, v0.5.0)* — the AI interface + timing; the real libdragon
+  mixer microcode runs on the LLE RSP and produces verified PCM, resampled to the host by the frontend.
+- **Phase 5 — Cart boot + saves** *(complete, v0.6.0)* — PI, SI/joybus, CIC, and all four save
+  backends; two boot paths (HLE default + a faithful real-PIF boot running the real IPL1/IPL2 and
+  CIC-verifying the IPL2 checksum). A commercial ROM boots and executes to game code in RDRAM.
+- **Phase 6 — Frontend integration** *(complete, v0.7.0)* — the egui shell presents the real
+  machine (VI scan-out, AI audio drain, SI input); save-states / rewind / run-ahead (frontend-side,
+  off by default); a wasm browser entry point. The first playable release (homebrew); the
+  commercial title frame is deferred to Phase 7 (ledger R-18).
+- **Phase 7 — Accuracy breadth** — the battery across the commercial corpus; the accuracy ledger.
+- **Phase 8 — Reach** — netplay, achievements, TAS, scripting, shaders — all off by default.
+
+The full spine, per-phase exit criteria, and the ticket tree live in
+[`to-dos/ROADMAP.md`](to-dos/ROADMAP.md) and the per-phase overviews.
+
+---
+
+## Contributing
+
+Contributions of all kinds are welcome — code, testing, documentation, and design. Please read
+[`CONTRIBUTING.md`](CONTRIBUTING.md) for the quality-gate contract, the conventional-commit
+format, and the chip-behavior-change rule (a chip change touches both the code and its
+`docs/<chip>.md` in the same PR).
+
+### Quick contribution workflow
+
+```bash
+# 1. Fork and clone, then create a feature branch
+git checkout -b feat/my-feature
+
+# 2. Make changes and run the quality gates
+cargo test --workspace
+cargo clippy --workspace --all-targets -- -D warnings
+cargo fmt --all --check
+
+# 3. Commit using conventional commits, then push and open a PR
+git commit -m "feat(cpu): implement <thing>"
+git push origin feat/my-feature
+```
+
+Test ROMs are the spec: pin the failing ROM expectation first, then implement until it passes.
+Never commit commercial ROMs — three independent guards enforce this, and they are tested.
+
+---
+
+## License
+
+RustyN64 is dual-licensed under your choice of:
+
+- **[MIT License](LICENSE-MIT)** — permissive, allows commercial use.
+- **[Apache License 2.0](LICENSE-APACHE)** — permissive with a patent grant.
+
+Unless you state otherwise, any contribution you submit is dual-licensed as above.
+
+**Test ROMs** under `tests/roms/` are individually licensed and tiered: the committed tier is
+permissive only (currently `n64-systemtest`, MIT, shipping its upstream `LICENSE`), and
+everything copyleft, unlicensed, or commercial stays in the gitignored external tier. **No
+commercial Nintendo ROMs are included, and they will never be bundled** — dumps used for
+regression testing are the user's responsibility and must come from cartridges they legally own.
+
+---
+
+## Acknowledgments
+
+RustyN64 stands on the shoulders of giants:
+
+- The **[N64brew Wiki](https://n64brew.dev/wiki/Main_Page)** community for the hardware
+  documentation this project is built against (CC BY-SA 4.0).
+- **[ares](https://github.com/ares-emulator/ares)**, **[CEN64](https://github.com/n64dev/cen64)**,
+  **[Gopher64](https://github.com/gopher64/gopher64)**, and
+  **[ParaLLEl-RDP](https://github.com/Themaister/parallel-rdp)** as the accuracy reference bar.
+- **[lemmy-64's n64-systemtest](https://github.com/lemmy-64/n64-systemtest)**,
+  **[Dillon's n64-tests](https://github.com/Dillonb/n64-tests)**, and
+  **[PeterLemon/N64](https://github.com/PeterLemon/N64)** as the closed-form definition of
+  "cycle-accurate" used by this project.
+- **[libdragon](https://github.com/DragonMinded/libdragon)** and Artemio Urbina's
+  **[240p Test Suite](https://github.com/ArtemioUrbina/240pTestSuite)** for the homebrew toolchain
+  and the video-timing reference.
+- **[RustyNES](https://github.com/doublegate/RustyNES)** and
+  **[RustySNES](https://github.com/doublegate/RustySNES)**, this project's own predecessors, for
+  the Bus-owns-everything architecture, the frontend shell, and the CI/docs infrastructure
+  pattern ported here.
+
+---
+
+## Citation
+
+If you use RustyN64 in academic research, please cite:
+
+```bibtex
+@software{rustyn642026,
+  author  = {RustyN64 Contributors},
+  title   = {RustyN64: A Cycle-Accurate Nintendo 64 Emulator in Rust},
+  year    = {2026},
+  version = {0.7.0},
+  url     = {https://github.com/doublegate/RustyN64},
+  note    = {Cycle-accurate N64 emulator on a canonical 187.5 MHz master-clock scheduler with
+             low-level emulation of the RSP and RDP; a Bus-owns-everything architecture,
+             a one-directional no_std chip-crate graph, and a hard determinism contract;
+             pure-Rust winit/wgpu/cpal/egui frontend. As of v0.7.0 the VR4300 and the LLE
+             RSP are complete and verified against n64-systemtest and an ares golden trace,
+             the LLE RDP rasterizer and VI scan-out bit-match Angrylion across 164
+             conformance vectors with a real ROM rendering a committed golden frame, the RSP
+             audio microcode mixes verified PCM through the AI, a commercial cartridge boots
+             through the real IPL1/IPL2/IPL3 chain (HLE and faithful real-PIF paths) to game
+             code in RDRAM, and the egui/wasm frontend presents the real machine with
+             save-states, rewind, and run-ahead — the first playable release on homebrew, with
+             the commercial title frame deferred to Phase 7 (ledger R-18)}
+}
+```
+
+---
+
+<p align="center">
+  <strong>Built with Rust. Powered by passion for retro gaming.</strong><br>
+  <sub>Preserving video game history, one frame at a time.</sub>
+</p>
+
+<p align="center">
+  <a href="#quick-start">Get Started</a> ·
+  <a href="docs/STATUS.md">Current Status</a> ·
+  <a href="CONTRIBUTING.md">Contribute</a> ·
+  <a href="docs/">Documentation</a>
+</p>

@@ -1,0 +1,3113 @@
+//! The **vector unit** — the RSP's 8-lane SIMD coprocessor (Sprint 2).
+//!
+//! 32 registers of 128 bits, each eight lanes of 16 bits, exposed through COP2.
+//! This module currently implements the **register file and the SU/VU moves**;
+//! the computational instructions, the 48-bit accumulator and the `VRCP`/`VRSQ`
+//! tables are the rest of the sprint.
+//!
+//! # Lanes are a view over bytes, not the storage
+//!
+//! Every move here addresses the register by **byte offset**, not by lane, and
+//! the two disagree in ways that matter: `MTC2` with an odd offset straddles two
+//! lanes, and an offset of 15 wraps. Modeling the register as eight `u16`s and
+//! converting at the edges is what keeps that expressible — the alternative,
+//! treating a lane as the unit, silently rounds every odd offset.
+
+use crate::Rsp;
+use serde::{Deserialize, Serialize};
+
+/// The VU's three control registers (N64brew *RSP CPU Core* §Control registers).
+///
+/// `VCO` and `VCC` are 16 bits, `VCE` is 8. They are flag registers rather than
+/// data: each instruction defines what it reads and writes, so there is no
+/// useful general description of their contents.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct Control {
+    /// Carry / overflow, 16 bits — two flags per lane.
+    pub vco: u16,
+    /// Compare results, 16 bits.
+    pub vcc: u16,
+    /// Clip-equality, 8 bits.
+    pub vce: u8,
+}
+
+/// The reciprocal unit's staging latches.
+///
+/// `VRCP`/`VRSQ` take a 16-bit operand, but the two-instruction `VRCPH`+`VRCPL`
+/// sequence feeds them a **32-bit** one: the `H` instruction latches the high
+/// half into `input` and sets `pending`, and the following `L` sees it and
+/// combines. `pending` is what distinguishes "a high half was just staged" from
+/// "there is a stale value in the latch" — without it, an `L` instruction issued
+/// on its own would silently consume whatever the last `H` left behind.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct Divide {
+    /// The high half staged by a `VRCPH`/`VRSQH`.
+    pub input: u16,
+    /// The high half of the last result, which `VRCPH`/`VRSQH` reads back.
+    pub output: u16,
+    /// Whether `input` was staged by the immediately preceding instruction.
+    pub pending: bool,
+}
+
+/// Which control register a `CFC2`/`CTC2` names.
+///
+/// Only `0`, `1` and `2` are defined. The RSP has no exception mechanism, so a
+/// wider index cannot fault; it is masked, which is what the encoding's two
+/// usable bits already imply.
+const fn control_index(vs: u32) -> u32 {
+    vs & 3
+}
+
+impl Rsp {
+    /// Read a byte of a vector register, big-endian within the 128 bits.
+    ///
+    /// Byte 0 is the most significant half of lane 0, matching the wiki's
+    /// convention that byte indices count *"from the higher part of the register
+    /// (in big-endian order)"*.
+    #[must_use]
+    pub const fn vu_byte(&self, reg: usize, byte: usize) -> u8 {
+        let lane = self.vu_regs[reg & 31][(byte & 15) >> 1];
+        if byte & 1 == 0 {
+            (lane >> 8) as u8
+        } else {
+            lane as u8
+        }
+    }
+
+    /// Write a byte of a vector register.
+    pub const fn set_vu_byte(&mut self, reg: usize, byte: usize, val: u8) {
+        let lane = &mut self.vu_regs[reg & 31][(byte & 15) >> 1];
+        if byte & 1 == 0 {
+            *lane = (*lane & 0x00FF) | ((val as u16) << 8);
+        } else {
+            *lane = (*lane & 0xFF00) | val as u16;
+        }
+    }
+
+    /// `MFC2` — copy two bytes of a vector register into a GPR, sign-extended.
+    ///
+    /// The pair is taken at a **byte** offset, so an odd offset straddles two
+    /// lanes. At offset 15 the second byte **wraps to byte 0** of the same
+    /// register rather than reading past the end — a rule that is invisible
+    /// until something actually addresses the last byte.
+    pub fn mfc2(&mut self, rt: usize, vs: usize, elem: usize) -> u32 {
+        let hi = self.vu_byte(vs, elem);
+        let lo = self.vu_byte(vs, (elem + 1) & 15);
+        let v = (u16::from(hi) << 8) | u16::from(lo);
+        let sext = i32::from(v.cast_signed()).cast_unsigned();
+        self.set_su(rt, sext);
+        sext
+    }
+
+    /// `MTC2` — copy the low 16 bits of a GPR into a vector register at a byte
+    /// offset.
+    ///
+    /// At offset 15 **only one byte is written**, taken from `rt[15..8]`: there
+    /// is no byte 16 to receive the other half, and unlike `MFC2` it does not
+    /// wrap around to byte 0. The asymmetry between the two is deliberate on
+    /// hardware and is exactly what a lane-oriented implementation loses.
+    pub const fn mtc2(&mut self, value: u32, vs: usize, elem: usize) {
+        let hi = (value >> 8) as u8;
+        let lo = value as u8;
+        self.set_vu_byte(vs, elem, hi);
+        if elem != 15 {
+            self.set_vu_byte(vs, elem + 1, lo);
+        }
+    }
+
+    /// `CFC2` — copy a VU control register into a GPR, sign-extended from 16
+    /// bits. The element field is ignored.
+    pub fn cfc2(&mut self, rt: usize, vs: u32) -> u32 {
+        let v = match control_index(vs) {
+            0 => self.vu_ctrl.vco,
+            1 => self.vu_ctrl.vcc,
+            // `VCE` is only 8 bits wide, and the read is still described as a
+            // 16-bit value sign-extended to 32 -- so the byte is zero-extended
+            // into the halfword first, and the halfword's sign bit is therefore
+            // always clear.
+            _ => u16::from(self.vu_ctrl.vce),
+        };
+        let sext = i32::from(v.cast_signed()).cast_unsigned();
+        self.set_su(rt, sext);
+        sext
+    }
+
+    /// `CTC2` — copy the low 16 bits of a GPR into a VU control register.
+    pub const fn ctc2(&mut self, value: u32, vs: u32) {
+        let v = value as u16;
+        match control_index(vs) {
+            0 => self.vu_ctrl.vco = v,
+            1 => self.vu_ctrl.vcc = v,
+            _ => self.vu_ctrl.vce = v as u8,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Bytes are big-endian across the 128 bits: byte 0 is the top half of
+    /// lane 0, byte 1 the bottom half, and so on.
+    #[test]
+    fn bytes_address_the_register_big_endian() {
+        let mut rsp = Rsp::new();
+        rsp.vu_regs[4][0] = 0xAABB;
+        rsp.vu_regs[4][7] = 0x1122;
+        assert_eq!(rsp.vu_byte(4, 0), 0xAA);
+        assert_eq!(rsp.vu_byte(4, 1), 0xBB);
+        assert_eq!(rsp.vu_byte(4, 14), 0x11);
+        assert_eq!(rsp.vu_byte(4, 15), 0x22);
+
+        rsp.set_vu_byte(4, 1, 0xCC);
+        assert_eq!(rsp.vu_regs[4][0], 0xAACC, "only the low byte moved");
+    }
+
+    /// **`MTC2` takes a byte offset, so an odd one straddles two lanes.**
+    ///
+    /// A lane-oriented implementation rounds this to a lane and writes the
+    /// wrong 16 bits — and the two agree for every *even* offset, so a test
+    /// that only uses aligned offsets cannot tell them apart.
+    #[test]
+    fn mtc2_at_an_odd_offset_straddles_two_lanes() {
+        let mut rsp = Rsp::new();
+        rsp.mtc2(0x1234, 2, 1);
+        assert_eq!(
+            rsp.vu_regs[2][0], 0x0012,
+            "high byte into lane 0's low half"
+        );
+        assert_eq!(
+            rsp.vu_regs[2][1], 0x3400,
+            "low byte into lane 1's high half"
+        );
+    }
+
+    /// At byte 15 `MTC2` writes **one** byte and does not wrap.
+    #[test]
+    fn mtc2_at_the_last_byte_writes_only_one() {
+        let mut rsp = Rsp::new();
+        rsp.mtc2(0x1234, 3, 15);
+        assert_eq!(rsp.vu_regs[3][7], 0x0012, "rt[15..8] into the last byte");
+        assert_eq!(rsp.vu_regs[3][0], 0, "and nothing wrapped to the start");
+    }
+
+    /// **`MFC2` at byte 15 wraps its second byte to byte 0** — the asymmetry
+    /// with `MTC2`, which does not.
+    #[test]
+    fn mfc2_at_the_last_byte_wraps_to_the_first() {
+        let mut rsp = Rsp::new();
+        rsp.vu_regs[5][7] = 0x00AB; // byte 15 = 0xAB
+        rsp.vu_regs[5][0] = 0xCD00; // byte 0  = 0xCD
+        let v = rsp.mfc2(1, 5, 15);
+        assert_eq!(v, 0xFFFF_ABCD, "0xABCD, sign-extended");
+        assert_eq!(rsp.su_regs[1], 0xFFFF_ABCD);
+    }
+
+    /// `MFC2` sign-extends, so a value with bit 15 set fills the upper half.
+    #[test]
+    fn mfc2_sign_extends_to_thirty_two_bits() {
+        let mut rsp = Rsp::new();
+        rsp.vu_regs[6][2] = 0x8001;
+        assert_eq!(rsp.mfc2(2, 6, 4), 0xFFFF_8001);
+        rsp.vu_regs[6][2] = 0x7FFF;
+        assert_eq!(rsp.mfc2(2, 6, 4), 0x0000_7FFF);
+    }
+
+    /// The three control registers round-trip, and `VCE` keeps only 8 bits.
+    #[test]
+    fn the_control_registers_round_trip() {
+        let mut rsp = Rsp::new();
+        rsp.ctc2(0xFFFF_1234, 0);
+        rsp.ctc2(0xFFFF_5678, 1);
+        rsp.ctc2(0xFFFF_00AB, 2);
+        assert_eq!(rsp.vu_ctrl.vco, 0x1234);
+        assert_eq!(rsp.vu_ctrl.vcc, 0x5678);
+        assert_eq!(rsp.vu_ctrl.vce, 0xAB, "VCE is 8 bits wide");
+
+        assert_eq!(rsp.cfc2(1, 0), 0x0000_1234);
+        assert_eq!(rsp.cfc2(1, 1), 0x0000_5678);
+        // 0xAB zero-extends into the halfword, so the sign bit is clear and the
+        // 32-bit result has no upper ones.
+        assert_eq!(rsp.cfc2(1, 2), 0x0000_00AB);
+    }
+
+    /// `CFC2` sign-extends from 16 bits, which `VCO` and `VCC` can reach.
+    #[test]
+    fn cfc2_sign_extends_the_sixteen_bit_registers() {
+        let mut rsp = Rsp::new();
+        rsp.ctc2(0x8000, 0);
+        assert_eq!(rsp.cfc2(1, 0), 0xFFFF_8000);
+    }
+}
+
+/// The 48-bit-per-lane accumulator, and the computational instructions.
+///
+/// # The accumulator is one 48-bit register per lane, not three 16-bit ones
+///
+/// `VSAR` slices it into `ACC_HI` (bits 47..32), `ACC_MD` (31..16) and `ACC_LO`
+/// (15..0), which invites modeling it as three separate halfwords. It is not:
+/// the multiply instructions write and accumulate across the full 48 bits, and
+/// the extraction that produces `vd` reads a 32-bit window *spanning* two of
+/// those slices. Splitting the storage makes carries between them disappear.
+impl Rsp {
+    /// Broadcast-modified read of a `vt` lane (N64brew *RSP CPU Core*
+    /// §Broadcast modifier).
+    ///
+    /// `element` 0 and 1 both mean "no broadcast" — the table lists them
+    /// separately and gives them identical lane sets, so this is not a
+    /// simplification.
+    #[must_use]
+    pub const fn vt_lane(&self, vt: usize, element: u32, lane: usize) -> u16 {
+        let src = match element {
+            0 | 1 => lane,
+            // Quarter broadcasts: pairs share the even (2) or odd (3) lane.
+            2 => lane & !1,
+            3 => (lane & !1) | 1,
+            // Half broadcasts: each group of four takes one lane.
+            4..=7 => (lane & !3) | (element as usize - 4),
+            // Single-lane broadcast across all eight.
+            _ => element as usize - 8,
+        };
+        self.vu_regs[vt & 31][src & 7]
+    }
+
+    /// Signed clamp to `[-32768, 32767]`.
+    const fn clamp_signed(v: i64) -> u16 {
+        if v < -32768 {
+            0x8000
+        } else if v > 32767 {
+            0x7FFF
+        } else {
+            (v as i16).cast_unsigned()
+        }
+    }
+
+    /// Unsigned clamp: negatives become 0, and the saturating threshold is
+    /// **15-bit** while the saturated value is 16-bit.
+    ///
+    /// That asymmetry is the documented rule, not a typo — anything above
+    /// `0x7FFF` saturates to `0xFFFF` rather than passing through. A naive
+    /// `> 65535` test lets values in the range `0x8000..=0xFFFF` through
+    /// unchanged and fails the VU tests.
+    const fn clamp_unsigned(v: i64) -> u16 {
+        if v < 0 {
+            0
+        } else if v > 32767 {
+            0xFFFF
+        } else {
+            // In range, so the truncation is exact and the sign is already
+            // known non-negative.
+            v.cast_unsigned() as u16
+        }
+    }
+
+    /// The extraction `VMADL` and `VMADN` use, which is **not** either clamp.
+    ///
+    /// When `acc >> 16` fits in a signed 16-bit value the result is the
+    /// accumulator's *low* slice, untouched. When it does not, the result
+    /// saturates to `0x0000` or `0xFFFF` by the sign. So the low bits are
+    /// returned or discarded wholesale depending on a test applied to a
+    /// different part of the accumulator -- which is why neither
+    /// `clamp_signed` nor `clamp_unsigned` expresses it, and why reusing one of
+    /// them looks right for small values and fails at the boundary.
+    ///
+    /// Derived from n64-systemtest's vectors: `VMADL` lane 4 leaves
+    /// `acc = 0x0000_7FFF_C000` and yields `0xC000` (the low slice), while lane
+    /// 7 leaves `0x0000_8000_C000` -- one step further -- and yields `0xFFFF`.
+    const fn extract_low(acc: i64) -> u16 {
+        let mid = acc >> 16;
+        if mid > 32767 {
+            0xFFFF
+        } else if mid < -32768 {
+            0
+        } else {
+            (acc.cast_unsigned() & 0xFFFF) as u16
+        }
+    }
+
+    /// Sign-extend the 48-bit accumulator lane to a signed 64-bit value.
+    const fn acc_signed(&self, lane: usize) -> i64 {
+        let v = self.vu_acc[lane] & 0xFFFF_FFFF_FFFF;
+        // Bit 47 is the sign; shifting up and back propagates it.
+        (v << 16).cast_signed() >> 16
+    }
+
+    /// Store a signed value back into a 48-bit accumulator lane.
+    const fn set_acc(&mut self, lane: usize, v: i64) {
+        self.vu_acc[lane] = v.cast_unsigned() & 0xFFFF_FFFF_FFFF;
+    }
+
+    /// The computational COP2 instructions.
+    ///
+    /// Returns `false` for an opcode this does not implement yet, so the caller
+    /// can leave the instruction inert rather than writing a wrong result.
+    pub fn vu_compute(&mut self, op: u32, element: u32, vs: usize, vt: usize, vd: usize) -> bool {
+        // The whole-instruction forms (VRND, clip, VZERO, VMACQ) act on the
+        // accumulator or the flag words as a unit and do not fit the per-lane
+        // match below; dispatch them first.
+        if self.vu_whole_instruction(op, element, vs, vt, vd) {
+            return true;
+        }
+        let mut clear_vco = false;
+        let mut set_vco = false;
+        let mut new_vco = 0u16;
+        // The compare group rebuilds VCC's low half from its per-lane results
+        // and clears the high half; `wrote_vcc` distinguishes that from an
+        // instruction that leaves VCC alone entirely (VMRG does).
+        let mut wrote_vcc = false;
+        let mut compare_flags = 0u16;
+        // Snapshot both sources before writing any lane (read-before-write):
+        // the hardware reads the whole broadcast `vt`/`vs` first, so a
+        // destructive `vd == vt`/`vd == vs` broadcast must not read a lane an
+        // earlier iteration overwrote (`VNE V6,V6,V7[Q0]`, the `(e=H1)` cases).
+        let sv: [u16; 8] = core::array::from_fn(|l| self.vu_regs[vs & 31][l]);
+        let tv: [u16; 8] = core::array::from_fn(|l| self.vt_lane(vt, element, l));
+        for lane in 0..8 {
+            let s = sv[lane];
+            let t = tv[lane];
+            let ss = i64::from(s.cast_signed());
+            let ts = i64::from(t.cast_signed());
+            let su = i64::from(s);
+            let tu = i64::from(t);
+
+            let out = match op {
+                0x00..=0x0F => self.multiply_lane(op, lane, ss, ts, su, tu),
+                // VADD/VSUB: signed, **with the carry from VCO's low half**,
+                // and they CLEAR the whole of VCO afterwards. Forgetting the
+                // clear leaves the next VADD adding a stale carry, which shows
+                // up as an off-by-one in one lane of a later frame.
+                0x10 | 0x11 => {
+                    let carry = i64::from((self.vu_ctrl.vco >> lane) & 1);
+                    let r = if op == 0x10 {
+                        ss + ts + carry
+                    } else {
+                        ss - ts - carry
+                    };
+                    self.set_acc_low(lane, r.cast_unsigned() as u16);
+                    clear_vco = true;
+                    Self::clamp_signed(r)
+                }
+                0x13 => self.vabs_lane(lane, ss, ts, t),
+                // VADDC/VSUBC: unsigned, and they *produce* the carry rather
+                // than consuming it. VSUBC also sets VCO's high half from
+                // "result was non-zero", which is what makes the pair usable
+                // for a multi-precision compare.
+                0x14 | 0x15 => {
+                    let r = if op == 0x14 { su + tu } else { su - tu };
+                    let low = r.cast_unsigned() as u16;
+                    self.set_acc_low(lane, low);
+                    let borrow = (r >> 16) & 1 != 0;
+                    if borrow {
+                        new_vco |= 1 << lane;
+                    }
+                    if op == 0x15 && low != 0 {
+                        new_vco |= 1 << (lane + 8);
+                    }
+                    set_vco = true;
+                    low
+                }
+                0x20..=0x23 | 0x27 => {
+                    let (picked, flag) = self.compare_lane(op, lane, s, t, ss, ts);
+                    if let Some(set) = flag {
+                        if set {
+                            compare_flags |= 1 << lane;
+                        }
+                        wrote_vcc = true;
+                    }
+                    clear_vco = true;
+                    self.set_acc_low(lane, picked);
+                    picked
+                }
+                // VSAR: read a 16-bit slice of the accumulator. The slice is
+                // chosen by the *element* field, not by an operand.
+                0x1D => {
+                    let acc = self.vu_acc[lane];
+                    match element {
+                        8 => (acc >> 32) as u16,
+                        9 => (acc >> 16) as u16,
+                        10 => acc as u16,
+                        // Any other element reads zero; the RSP has no
+                        // exception to raise for an undefined selector.
+                        _ => 0,
+                    }
+                }
+                // The bitwise group. Each also writes its result into ACC_LO.
+                0x28 => s & t,
+                0x29 => !(s & t),
+                0x2A => s | t,
+                0x2B => !(s | t),
+                0x2C => s ^ t,
+                0x2D => !(s ^ t),
+                _ => return false,
+            };
+
+            // The logical operations leave ACC_LO holding their result.
+            if (0x28..=0x2D).contains(&op) {
+                self.vu_acc[lane] = (self.vu_acc[lane] & 0xFFFF_FFFF_0000) | u64::from(out);
+            }
+            self.vu_regs[vd & 31][lane] = out;
+        }
+        // VCC is rebuilt once for the whole instruction: the low half from the
+        // predicates, the high half cleared.
+        if wrote_vcc {
+            self.vu_ctrl.vcc = compare_flags;
+        }
+        // VCO is written once for the whole instruction, not per lane.
+        if clear_vco {
+            self.vu_ctrl.vco = 0;
+        } else if set_vco {
+            self.vu_ctrl.vco = new_vco;
+        }
+        true
+    }
+
+    /// The multiply family for one lane: `VMUL*`, `VMUD*` and their
+    /// accumulating `VMAC*`/`VMAD*` partners.
+    ///
+    /// Split out to keep [`Rsp::vu_compute`]'s decode readable; it is one arm of
+    /// that match, not a separable unit.
+    fn multiply_lane(&mut self, op: u32, lane: usize, ss: i64, ts: i64, su: i64, tu: i64) -> u16 {
+        match op {
+            // Multiply, S1.15 * S1.15, doubled and rounded. The +0x8000 is
+            // the rounding constant, and it lands in the accumulator, not
+            // just in the result -- the oracle reads ACC_LO back as 0x8000
+            // for a zero product, which is how the constant is visible.
+            0x00 | 0x01 => {
+                let acc = ss * ts * 2 + 0x8000;
+                self.set_acc(lane, acc);
+                let extracted = self.acc_signed(lane) >> 16;
+                if op == 0x00 {
+                    Self::clamp_signed(extracted)
+                } else {
+                    Self::clamp_unsigned(extracted)
+                }
+            }
+            // VMUDL: U0.16 * U0.16, keeping the high half. The product is
+            // unsigned, so nothing sign-extends into the upper accumulator.
+            0x04 => {
+                let acc = (su * tu) >> 16;
+                self.set_acc(lane, acc);
+                acc.cast_unsigned() as u16
+            }
+            // VMUDM: S0.16 * U0.16.
+            0x05 => {
+                let acc = ss * tu;
+                self.set_acc(lane, acc);
+                (acc >> 16).cast_unsigned() as u16
+            }
+            // VMUDN: U0.16 * S0.16 -- the mirror of VMUDM, and it extracts
+            // the LOW half where VMUDM takes the high one.
+            0x06 => {
+                let acc = su * ts;
+                self.set_acc(lane, acc);
+                acc.cast_unsigned() as u16
+            }
+            // VMUDH: S0.16 * S0.16, shifted into the upper accumulator.
+            0x07 => {
+                let acc = (ss * ts) << 16;
+                self.set_acc(lane, acc);
+                Self::clamp_signed(self.acc_signed(lane) >> 16)
+            }
+            // VMULQ: a 32-bit product placed in the accumulator's MIDDLE 32
+            // bits with the low 16 zeroed, then extracted with a >>1, a signed
+            // clamp, and the low 4 bits masked off. The odd `+ 31` rounds only
+            // negative products.
+            0x03 => {
+                let mut product = ss * ts;
+                if product < 0 {
+                    product += 31;
+                }
+                self.set_acc(lane, product << 16);
+                Self::clamp_signed(product >> 1) & !15
+            }
+            // The accumulating forms. Each adds the same product its
+            // VMUL/VMUD counterpart *sets* -- with one difference that is
+            // easy to miss: VMACF adds `2 * vs * vt` with **no rounding
+            // constant**, where VMULF adds `+ 0x8000`. The oracle shows it
+            // directly: lane 3 moves the accumulator from 0xC000 to
+            // 0x1_0000, a delta of exactly 0x4000 = 2*8192.
+            0x08 | 0x09 => {
+                let acc = self.acc_signed(lane) + ss * ts * 2;
+                self.set_acc(lane, acc);
+                let extracted = self.acc_signed(lane) >> 16;
+                if op == 0x08 {
+                    Self::clamp_signed(extracted)
+                } else {
+                    Self::clamp_unsigned(extracted)
+                }
+            }
+            // VMADL: accumulate VMUDL's product, extract the low slice.
+            0x0C => {
+                let acc = self.acc_signed(lane) + ((su * tu) >> 16);
+                self.set_acc(lane, acc);
+                Self::extract_low(self.acc_signed(lane))
+            }
+            // VMADM: accumulate VMUDM's product. Unlike VMUDM this one
+            // CLAMPS the extracted middle rather than truncating it.
+            0x0D => {
+                let acc = self.acc_signed(lane) + ss * tu;
+                self.set_acc(lane, acc);
+                Self::clamp_signed(self.acc_signed(lane) >> 16)
+            }
+            // VMADN: accumulate VMUDN's product, extract the low slice.
+            0x0E => {
+                let acc = self.acc_signed(lane) + su * ts;
+                self.set_acc(lane, acc);
+                Self::extract_low(self.acc_signed(lane))
+            }
+            // VMADH: accumulate VMUDH's product.
+            0x0F => {
+                let acc = self.acc_signed(lane) + ((ss * ts) << 16);
+                self.set_acc(lane, acc);
+                Self::clamp_signed(self.acc_signed(lane) >> 16)
+            }
+            _ => 0,
+        }
+    }
+
+    /// One lane of the compare/select group.
+    ///
+    /// Returns the selected operand and, for the four true compares, whether the
+    /// predicate held (`VMRG` returns `None` — it consumes `VCC` and produces no
+    /// new flag). Split out to keep [`Rsp::vu_compute`]'s decode under length.
+    fn compare_lane(
+        &self,
+        op: u32,
+        lane: usize,
+        s: u16,
+        t: u16,
+        ss: i64,
+        ts: i64,
+    ) -> (u16, Option<bool>) {
+        // VCO's low half is the carry/borrow; its high half is the "result was
+        // non-zero" flag a preceding VSUBC left.
+        let carry = (self.vu_ctrl.vco >> lane) & 1 != 0;
+        let non_zero = (self.vu_ctrl.vco >> (lane + 8)) & 1 != 0;
+        if op == 0x27 {
+            // VMRG selects on VCC without changing it.
+            let picked = if (self.vu_ctrl.vcc >> lane) & 1 != 0 {
+                s
+            } else {
+                t
+            };
+            return (picked, None);
+        }
+        let cond = match op {
+            0x20 => ss < ts || (ss == ts && carry && non_zero),
+            0x21 => !non_zero && s == t,
+            0x22 => s != t || non_zero,
+            _ => ss > ts || (ss == ts && (!carry || !non_zero)),
+        };
+        (if cond { s } else { t }, Some(cond))
+    }
+
+    /// `VRNDN`/`VRNDP` — accumulator rounding (N64brew *RSP CPU Core*; ares).
+    ///
+    /// These do **not** read a `vs` register. The low bit of the `vs` *field*
+    /// number selects whether the sign-extended `vt` element is shifted left 16
+    /// before use, and the accumulator — not an operand — is what the product
+    /// is conditionally added to. `positive` is `VRNDP`, which adds when the
+    /// 48-bit accumulator is `>= 0`; `VRNDN` adds when it is `< 0`. The result
+    /// is the signed-clamped middle of the accumulator, and the whole 48-bit
+    /// accumulator is written back.
+    fn vrnd(&mut self, positive: bool, element: u32, vs_field: usize, vt: usize, vd: usize) {
+        let shift = vs_field & 1 != 0;
+        // Snapshot `vt` first: `VRNDP/N V6,V6[...]` overwrites its own source,
+        // and a broadcast read of an already-written lane would be corrupt.
+        let tv: [u16; 8] = core::array::from_fn(|l| self.vt_lane(vt, element, l));
+        for (lane, &tl) in tv.iter().enumerate() {
+            let mut product = i64::from(tl.cast_signed());
+            if shift {
+                product <<= 16;
+            }
+            let mut acc = self.acc_signed(lane);
+            if (positive && acc >= 0) || (!positive && acc < 0) {
+                acc = Self::sclip48(acc + product);
+            }
+            self.set_acc(lane, acc);
+            self.vu_regs[vd & 31][lane] = Self::clamp_signed(acc >> 16);
+        }
+    }
+
+    /// The clip compares `VCL` (0x24), `VCH` (0x25), `VCR` (0x26).
+    ///
+    /// The most flag-entangled VU instructions: they read and write `VCO`,
+    /// `VCC` and `VCE` together, per lane. Transcribed from **n64-systemtest's
+    /// reference**, which diverges from ares in `VCH`'s else branch (the suite's
+    /// `VCOH` is just `diff != 0`; ares adds `&& vs != ~vt`).
+    ///
+    /// **Inputs are snapshotted before any write.** With `vd == vt` and a
+    /// broadcast element, a lane can read a `vt` lane a *later*-indexed lane has
+    /// not yet reached — but an *earlier* one may already have overwritten if
+    /// the reads and writes interleave. Hardware reads the whole (broadcast)
+    /// `vt` and `vs` first; so does this. The failing oracle case that forced
+    /// this was `V6,V6,V7[Q0]`.
+    /// The computational opcodes that act on the whole vector at once rather
+    /// than through [`Rsp::vu_compute`]'s per-lane match. Returns whether `op`
+    /// was one of them.
+    ///
+    /// - `VRNDN`/`VRNDP` (`0x02`/`0x0A`) read the **accumulator**, use the low
+    ///   bit of the `vs` *field* as a shift selector rather than reading a `vs`
+    ///   register, and conditionally add on the accumulator's sign.
+    /// - The clip compares `VCL`/`VCH`/`VCR` (`0x24..=0x26`) read and write the
+    ///   whole `VCO`/`VCC`/`VCE` set; this is where ares and the suite diverge.
+    /// - `VMACQ` (`0x0B`) re-rounds the accumulator's magnitude toward a
+    ///   multiple of `0x20_0000` with no operands.
+    /// - The reserved VZERO family (see [`Rsp::vzero`]).
+    fn vu_whole_instruction(
+        &mut self,
+        op: u32,
+        element: u32,
+        vs: usize,
+        vt: usize,
+        vd: usize,
+    ) -> bool {
+        match op {
+            0x02 | 0x0A => self.vrnd(op == 0x02, element, vs, vt, vd),
+            0x0B => self.vmacq(vd),
+            0x24..=0x26 => self.clip(op, element, vs, vt, vd),
+            0x12 | 0x16..=0x1C | 0x1E | 0x1F | 0x2E | 0x2F | 0x38..=0x3E => {
+                self.vzero(element, vs, vt, vd);
+            }
+            _ => return false,
+        }
+        true
+    }
+
+    /// The reserved "VZERO" opcode family (VSUT, VADDB/VSUBB/VACCB/VSUCB/VSAD/
+    /// VSAC/VSUM, V30/V31, V46/V47, VEXT{T,Q,N}/V59/VINS{T,Q,N}).
+    ///
+    /// n64-systemtest pins every one of these undocumented opcodes to a single
+    /// `run_vzero` reference: `ACC_LO = vs + vt` per lane, `vd` zeroed, and no
+    /// flag word touched. Snapshotting the sources is not strictly needed here
+    /// (the write is a constant zero), but it keeps the shape identical to the
+    /// other broadcast consumers.
+    fn vzero(&mut self, element: u32, vs: usize, vt: usize, vd: usize) {
+        let sv: [u16; 8] = core::array::from_fn(|l| self.vu_regs[vs & 31][l]);
+        let tv: [u16; 8] = core::array::from_fn(|l| self.vt_lane(vt, element, l));
+        for lane in 0..8 {
+            self.set_acc_low(lane, sv[lane].wrapping_add(tv[lane]));
+            self.vu_regs[vd & 31][lane] = 0;
+        }
+    }
+
+    fn clip(&mut self, op: u32, element: u32, vs: usize, vt: usize, vd: usize) {
+        let sv: [u16; 8] = core::array::from_fn(|l| self.vu_regs[vs & 31][l]);
+        let tv: [u16; 8] = core::array::from_fn(|l| self.vt_lane(vt, element, l));
+        for lane in 0..8 {
+            let s = sv[lane];
+            let t = tv[lane];
+            let ss = s.cast_signed();
+            let ts = t.cast_signed();
+            let out = match op {
+                0x25 => self.vch_lane(lane, s, t, ss, ts),
+                0x26 => self.vcr_lane(lane, s, t, ss, ts),
+                _ => self.vcl_lane(lane, s, t),
+            };
+            self.set_acc_low(lane, out);
+            self.vu_regs[vd & 31][lane] = out;
+        }
+        if op != 0x25 {
+            self.vu_ctrl.vco = 0;
+            self.vu_ctrl.vce = 0;
+        }
+    }
+
+    const fn vco_l(&self, n: usize) -> bool {
+        (self.vu_ctrl.vco >> n) & 1 != 0
+    }
+    const fn vco_h(&self, n: usize) -> bool {
+        (self.vu_ctrl.vco >> (n + 8)) & 1 != 0
+    }
+    const fn vcc_l(&self, n: usize) -> bool {
+        (self.vu_ctrl.vcc >> n) & 1 != 0
+    }
+    const fn vcc_h(&self, n: usize) -> bool {
+        (self.vu_ctrl.vcc >> (n + 8)) & 1 != 0
+    }
+    const fn vce_bit(&self, n: usize) -> bool {
+        (self.vu_ctrl.vce >> n) & 1 != 0
+    }
+    const fn set_flag(reg: &mut u16, bit: usize, v: bool) -> bool {
+        if v {
+            *reg |= 1 << bit;
+        } else {
+            *reg &= !(1 << bit);
+        }
+        v
+    }
+    const fn set_vce(reg: &mut u8, bit: usize, v: bool) {
+        if v {
+            *reg |= 1 << bit;
+        } else {
+            *reg &= !(1 << bit);
+        }
+    }
+
+    fn vch_lane(&mut self, n: usize, s: u16, t: u16, ss: i16, ts: i16) -> u16 {
+        if (ss ^ ts) < 0 {
+            let r = ss.wrapping_add(ts);
+            Self::set_flag(&mut self.vu_ctrl.vcc, n, r <= 0);
+            Self::set_flag(&mut self.vu_ctrl.vcc, n + 8, ts < 0);
+            Self::set_flag(&mut self.vu_ctrl.vco, n, true);
+            Self::set_flag(&mut self.vu_ctrl.vco, n + 8, r != 0 && s != (t ^ 0xFFFF));
+            Self::set_vce(&mut self.vu_ctrl.vce, n, r == -1);
+            if r <= 0 { t.wrapping_neg() } else { s }
+        } else {
+            let r = ss.wrapping_sub(ts);
+            Self::set_flag(&mut self.vu_ctrl.vcc, n, ts < 0);
+            Self::set_flag(&mut self.vu_ctrl.vcc, n + 8, r >= 0);
+            Self::set_flag(&mut self.vu_ctrl.vco, n, false);
+            // Suite: else-branch VCOH is `diff != 0` alone (ares adds a term).
+            Self::set_flag(&mut self.vu_ctrl.vco, n + 8, r != 0);
+            Self::set_vce(&mut self.vu_ctrl.vce, n, false);
+            if r >= 0 { t } else { s }
+        }
+    }
+
+    fn vcl_lane(&mut self, n: usize, s: u16, t: u16) -> u16 {
+        if self.vco_l(n) {
+            if self.vco_h(n) {
+                if self.vcc_l(n) { t.wrapping_neg() } else { s }
+            } else {
+                let sum = s.wrapping_add(t);
+                let carry = u32::from(s) + u32::from(t) != u32::from(sum);
+                let v = if self.vce_bit(n) {
+                    sum == 0 || !carry
+                } else {
+                    sum == 0 && !carry
+                };
+                Self::set_flag(&mut self.vu_ctrl.vcc, n, v);
+                if v { t.wrapping_neg() } else { s }
+            }
+        } else if self.vco_h(n) {
+            if self.vcc_h(n) { t } else { s }
+        } else {
+            let v = i32::from(s) - i32::from(t) >= 0;
+            Self::set_flag(&mut self.vu_ctrl.vcc, n + 8, v);
+            if v { t } else { s }
+        }
+    }
+
+    fn vcr_lane(&mut self, n: usize, s: u16, t: u16, ss: i16, ts: i16) -> u16 {
+        if (ss ^ ts) < 0 {
+            Self::set_flag(&mut self.vu_ctrl.vcc, n + 8, ts < 0);
+            let v = i32::from(ss) + i32::from(ts) < 0;
+            Self::set_flag(&mut self.vu_ctrl.vcc, n, v);
+            if v { !t } else { s }
+        } else {
+            Self::set_flag(&mut self.vu_ctrl.vcc, n, ts < 0);
+            let v = i32::from(ss) - i32::from(ts) >= 0;
+            Self::set_flag(&mut self.vu_ctrl.vcc, n + 8, v);
+            if v { t } else { s }
+        }
+    }
+
+    /// `VMACQ` — nudge the accumulator toward a multiple of `0x20_0000`, in
+    /// place, no operands.
+    ///
+    /// Transcribed from n64-systemtest's `simulate`: when bit 21 is clear the
+    /// 48-bit accumulator is moved by `±0x20_0000` toward zero-mod-that (only
+    /// away from the `[0x20_0000, 0x3F_FFFF]` band, which bit 21 being set
+    /// excludes), and the result is `acc >> 17`, saturated past 32 bits and
+    /// masked to clear its low 4 bits. `ACC_LO` survives because the delta sits
+    /// at bit 21, above it.
+    fn vmacq(&mut self, vd: usize) {
+        for lane in 0..8 {
+            let acc = self.acc_signed(lane);
+            let out = if acc & 0x20_0000 == 0 {
+                match (acc >> 22).cmp(&0) {
+                    core::cmp::Ordering::Less => acc + 0x20_0000,
+                    core::cmp::Ordering::Greater => acc - 0x20_0000,
+                    core::cmp::Ordering::Equal => acc,
+                }
+            } else {
+                acc
+            };
+            self.set_acc(lane, out);
+            let clamped: u16 = if out < 0 {
+                if (!out) >> 32 != 0 {
+                    0x8000
+                } else {
+                    (out >> 17).cast_unsigned() as u16
+                }
+            } else if out >> 32 != 0 {
+                0x7FFF
+            } else {
+                (out >> 17).cast_unsigned() as u16
+            };
+            self.vu_regs[vd & 31][lane] = clamped & 0xFFF0;
+        }
+    }
+
+    /// Sign-clip to 48 bits, as the accumulator is.
+    const fn sclip48(v: i64) -> i64 {
+        (v << 16) >> 16
+    }
+
+    /// `VABS` for one lane: the **sign of `vs` applied to `vt`**, which is not
+    /// the absolute value of either operand despite the mnemonic.
+    ///
+    /// The most negative input is the interesting case: its negation is not
+    /// representable, so `vd` saturates to `0x7FFF` while the accumulator keeps
+    /// `0x8000`. The two deliberately disagree, and a test reading only `vd`
+    /// cannot see it.
+    fn vabs_lane(&mut self, lane: usize, ss: i64, ts: i64, t: u16) -> u16 {
+        match ss.cmp(&0) {
+            core::cmp::Ordering::Less => {
+                if ts == -32768 {
+                    self.set_acc_low(lane, 0x8000);
+                    0x7FFF
+                } else {
+                    let neg = (-ts).cast_unsigned() as u16;
+                    self.set_acc_low(lane, neg);
+                    neg
+                }
+            }
+            core::cmp::Ordering::Greater => {
+                self.set_acc_low(lane, t);
+                t
+            }
+            core::cmp::Ordering::Equal => {
+                self.set_acc_low(lane, 0);
+                0
+            }
+        }
+    }
+
+    /// Write one lane's accumulator low slice, leaving the upper 32 bits alone.
+    const fn set_acc_low(&mut self, lane: usize, value: u16) {
+        self.vu_acc[lane] = (self.vu_acc[lane] & 0xFFFF_FFFF_0000) | value as u64;
+    }
+}
+
+#[cfg(test)]
+mod compute_tests {
+    use super::*;
+
+    /// The oracle's own input pair, named as **it** names them.
+    ///
+    /// n64-systemtest loads these into `$v0` and `$v1` and then assembles e.g.
+    /// `write_vmulf(V2, V0, V1)` — whose signature is **`(vd, vt, vs)`**, not
+    /// the `(vd, vs, vt)` it reads like. So `$v1` is the instruction's `vs` and
+    /// `$v0` is its `vt`.
+    ///
+    /// Getting that backwards is invisible for every *symmetric* multiply —
+    /// `VMULF`, `VMACF`, `VMUDH`, `VMUDL` all commute — and shows up only on
+    /// `VMUDM`/`VMADM` and `VMUDN`/`VMADN`, where one operand is read signed
+    /// and the other unsigned. Naming the constants after the registers rather
+    /// than after the operand roles is what keeps the distinction visible here.
+    const V0: [u16; 8] = [
+        0x0000, 0x0000, 0x0000, 0xE000, 0x8001, 0x8000, 0x7FFF, 0x8000,
+    ];
+    const V1: [u16; 8] = [
+        0x0000, 0x0001, 0xFFFF, 0xFFFF, 0x8000, 0x7FFF, 0x7FFF, 0x8000,
+    ];
+    /// `vs` is `$v1` and `vt` is `$v0`; see [`V0`].
+    const VS_REG: usize = 1;
+    const VT_REG: usize = 0;
+
+    fn seeded() -> Rsp {
+        let mut rsp = Rsp::new();
+        rsp.vu_regs[0] = V0;
+        rsp.vu_regs[1] = V1;
+        rsp
+    }
+
+    fn acc_slice(rsp: &Rsp, shift: u32) -> [u16; 8] {
+        core::array::from_fn(|i| (rsp.vu_acc[i] >> shift) as u16)
+    }
+
+    /// **`VMULF` against n64-systemtest's own expected vectors.**
+    ///
+    /// Result *and* all three accumulator slices, because the result alone
+    /// cannot distinguish the rounding constant landing in the accumulator from
+    /// it being applied only to the extracted value — `ACC_LO` reading back
+    /// `0x8000` for a zero product is the only place that shows.
+    #[test]
+    fn vmulf_matches_the_oracle_vectors() {
+        let mut rsp = seeded();
+        assert!(rsp.vu_compute(0x00, 0, VS_REG, VT_REG, 2));
+        assert_eq!(
+            rsp.vu_regs[2],
+            [0, 0, 0, 0, 0x7fff, 0x8001, 0x7ffe, 0x7fff],
+            "VMULF result"
+        );
+        assert_eq!(acc_slice(&rsp, 32), [0, 0, 0, 0, 0, 0xffff, 0, 0], "ACC_HI");
+        assert_eq!(
+            acc_slice(&rsp, 16),
+            [0, 0, 0, 0, 0x7fff, 0x8001, 0x7ffe, 0x8000],
+            "ACC_MD"
+        );
+        assert_eq!(
+            acc_slice(&rsp, 0),
+            [
+                0x8000, 0x8000, 0x8000, 0xc000, 0x8000, 0x8000, 0x8002, 0x8000
+            ],
+            "ACC_LO"
+        );
+    }
+
+    /// The last lane is the one that pins the **clamp**: the 48-bit accumulator
+    /// is positive there, so `acc >> 16` is `0x8000` = 32768, one past the
+    /// signed maximum, and the result saturates to `0x7FFF`.
+    #[test]
+    fn vmulf_saturates_where_the_accumulator_overflows_the_result() {
+        let mut rsp = seeded();
+        rsp.vu_compute(0x00, 0, VS_REG, VT_REG, 2);
+        assert_eq!(rsp.vu_acc[7] >> 16, 0x8000, "the accumulator holds 32768");
+        assert_eq!(rsp.vu_regs[2][7], 0x7FFF, "and the result saturates");
+    }
+
+    /// **`VMULU` against the oracle's vectors** — the same accumulator as
+    /// `VMULF`, differing *only* in the clamp.
+    ///
+    /// That shared path is exactly why this needs its own instruction-level
+    /// case: `clamp_unsigned` being right as a helper says nothing about the
+    /// `op == 0x01` arm selecting it, and a mis-selection would hide behind the
+    /// `VMULF` coverage. Lane 5 is the discriminator — `VMULF` gives `0x8001`
+    /// there and `VMULU` gives `0`, because the accumulator is negative and
+    /// unsigned clamping floors it. Lane 7 is the other half: positive and over
+    /// the 15-bit threshold, so it saturates to `0xFFFF` where `VMULF` gives
+    /// `0x7FFF`.
+    ///
+    /// Note this test's `vs` differs from `VMULF`'s in lane 2 (`0x0010`), which
+    /// is the oracle's own input — kept rather than normalized, so the expected
+    /// vectors can be compared against the suite verbatim.
+    #[test]
+    fn vmulu_matches_the_oracle_vectors() {
+        let mut rsp = Rsp::new();
+        rsp.vu_regs[0] = [
+            0x0000, 0x0000, 0x0010, 0xE000, 0x8001, 0x8000, 0x7FFF, 0x8000,
+        ];
+        rsp.vu_regs[1] = V1;
+        assert!(rsp.vu_compute(0x01, 0, VS_REG, VT_REG, 2));
+        assert_eq!(
+            rsp.vu_regs[2],
+            [0, 0, 0, 0, 0x7fff, 0, 0x7ffe, 0xffff],
+            "VMULU result"
+        );
+        assert_eq!(acc_slice(&rsp, 32), [0, 0, 0, 0, 0, 0xffff, 0, 0], "ACC_HI");
+        assert_eq!(
+            acc_slice(&rsp, 16),
+            [0, 0, 0, 0, 0x7fff, 0x8001, 0x7ffe, 0x8000],
+            "ACC_MD"
+        );
+        assert_eq!(
+            acc_slice(&rsp, 0),
+            [
+                0x8000, 0x8000, 0x7fe0, 0xc000, 0x8000, 0x8000, 0x8002, 0x8000
+            ],
+            "ACC_LO -- identical to VMULF's, since only the clamp differs"
+        );
+    }
+
+    /// **`VMUDL` against the oracle's vectors** — an unsigned product keeping
+    /// the high half, so nothing sign-extends into the upper accumulator.
+    #[test]
+    fn vmudl_matches_the_oracle_vectors() {
+        let mut rsp = seeded();
+        assert!(rsp.vu_compute(0x04, 0, VS_REG, VT_REG, 2));
+        assert_eq!(
+            rsp.vu_regs[2],
+            [0, 0, 0, 0xdfff, 0x4000, 0x3fff, 0x3fff, 0x4000],
+            "VMUDL result"
+        );
+        assert_eq!(acc_slice(&rsp, 32), [0; 8], "ACC_HI stays clear");
+        assert_eq!(acc_slice(&rsp, 16), [0; 8], "ACC_MD too");
+    }
+
+    /// **The six accumulating forms, against n64-systemtest's vectors.**
+    ///
+    /// The suite primes the accumulator with a `VMULF` and *then* runs the
+    /// accumulating instruction, so these reproduce that exactly — the whole
+    /// point of the family is what it adds to an existing accumulator, and a
+    /// test starting from zero would pass for an implementation that ignored
+    /// the previous contents entirely.
+    #[test]
+    fn the_accumulating_forms_match_the_oracle_vectors() {
+        /// `VMADN`'s test uses a **different** `$v0` from the other five —
+        /// checked against each file rather than assumed, after taking the
+        /// shared vector on faith produced a mismatch that looked like a bug in
+        /// the instruction.
+        const VMADN_V0: [u16; 8] = [
+            0x0000, 0x8000, 0xFFFF, 0x8000, 0x8001, 0x8000, 0x7FFF, 0x8000,
+        ];
+
+        /// One accumulating case, transcribed from the matching `op_*.rs`.
+        struct Case {
+            op: u32,
+            name: &'static str,
+            v0: [u16; 8],
+            result: [u16; 8],
+            hi: [u16; 8],
+            md: [u16; 8],
+            lo: [u16; 8],
+        }
+
+        let cases = [
+            Case {
+                op: 0x08,
+                name: "VMACF",
+                v0: V0,
+                result: [0, 0, 0, 0x1, 0x7fff, 0x8000, 0x7fff, 0x7fff],
+                hi: [0, 0, 0, 0, 0, 0xffff, 0, 1],
+                md: [0, 0, 0, 1, 0xfffe, 2, 0xfffc, 0],
+                lo: [0x8000, 0x8000, 0x8000, 0, 0x8000, 0x8000, 0x8004, 0x8000],
+            },
+            Case {
+                op: 0x09,
+                name: "VMACU",
+                v0: V0,
+                result: [0, 0, 0, 1, 0xffff, 0, 0xffff, 0xffff],
+                hi: [0, 0, 0, 0, 0, 0xffff, 0, 1],
+                md: [0, 0, 0, 1, 0xfffe, 2, 0xfffc, 0],
+                lo: [0x8000, 0x8000, 0x8000, 0, 0x8000, 0x8000, 0x8004, 0x8000],
+            },
+            Case {
+                op: 0x0C,
+                name: "VMADL",
+                v0: V0,
+                result: [
+                    0x8000, 0x8000, 0x8000, 0x9fff, 0xc000, 0xbfff, 0xc001, 0xffff,
+                ],
+                hi: [0, 0, 0, 0, 0, 0xffff, 0, 0],
+                md: [0, 0, 0, 1, 0x7fff, 0x8001, 0x7ffe, 0x8000],
+                lo: [
+                    0x8000, 0x8000, 0x8000, 0x9fff, 0xc000, 0xbfff, 0xc001, 0xc000,
+                ],
+            },
+            Case {
+                op: 0x0D,
+                name: "VMADM",
+                v0: V0,
+                result: [0, 0, 0, 0xffff, 0x3fff, 0xc001, 0x7fff, 0x4000],
+                hi: [0, 0, 0, 0xffff, 0, 0xffff, 0, 0],
+                md: [0, 0, 0, 0xffff, 0x3fff, 0xc001, 0xbffd, 0x4000],
+                lo: [0x8000, 0x8000, 0x8000, 0xe000, 0, 0, 0x8003, 0x8000],
+            },
+            Case {
+                op: 0x0E,
+                name: "VMADN",
+                v0: VMADN_V0,
+                result: [0x8000, 0, 0x8003, 0, 0, 0, 0xffff, 0x8000],
+                hi: [0, 0xffff, 0xffff, 0xffff, 0, 0xffff, 0, 0],
+                md: [0, 0xffff, 0xffff, 0x8002, 0x4000, 0x4002, 0xbffd, 0x4000],
+                lo: [0x8000, 0, 0x8003, 0, 0, 0, 0x8003, 0x8000],
+            },
+            Case {
+                op: 0x0F,
+                name: "VMADH",
+                v0: V0,
+                result: [0, 0, 0, 0x2000, 0x7fff, 0x8000, 0x7fff, 0x7fff],
+                hi: [0, 0, 0, 0, 0x3fff, 0xc000, 0x3fff, 0x4000],
+                md: [0, 0, 0, 0x2000, 0xffff, 1, 0x7fff, 0x8000],
+                lo: [
+                    0x8000, 0x8000, 0x8000, 0xc000, 0x8000, 0x8000, 0x8002, 0x8000,
+                ],
+            },
+        ];
+
+        for Case {
+            op,
+            name,
+            v0,
+            result,
+            hi,
+            md,
+            lo,
+        } in cases
+        {
+            let mut rsp = seeded();
+            rsp.vu_regs[0] = v0;
+            // Prime the accumulator exactly as the suite does.
+            assert!(
+                rsp.vu_compute(0x00, 0, VS_REG, VT_REG, 2),
+                "{name}: priming VMULF"
+            );
+            assert!(
+                rsp.vu_compute(op, 0, VS_REG, VT_REG, 2),
+                "{name} is implemented"
+            );
+            assert_eq!(rsp.vu_regs[2], result, "{name} result");
+            assert_eq!(acc_slice(&rsp, 32), hi, "{name} ACC_HI");
+            assert_eq!(acc_slice(&rsp, 16), md, "{name} ACC_MD");
+            assert_eq!(acc_slice(&rsp, 0), lo, "{name} ACC_LO");
+        }
+    }
+
+    /// **`VMACF` adds no rounding constant, where `VMULF` adds `0x8000`.**
+    ///
+    /// The single most confusable difference in the family, and the accumulator
+    /// is the only place it shows: lane 3 moves from `0xC000` to `0x1_0000`, a
+    /// delta of exactly `0x4000` = 2 x 8192. An implementation that reused
+    /// `VMULF`'s expression would land on `0x1_8000`.
+    #[test]
+    fn vmacf_adds_no_rounding_constant() {
+        let mut rsp = seeded();
+        rsp.vu_compute(0x00, 0, VS_REG, VT_REG, 2);
+        assert_eq!(rsp.vu_acc[3], 0xC000, "after the priming VMULF");
+        rsp.vu_compute(0x08, 0, VS_REG, VT_REG, 2);
+        assert_eq!(
+            rsp.vu_acc[3], 0x1_0000,
+            "delta is 2*vs*vt exactly, with no 0x8000 added"
+        );
+    }
+
+    /// The broadcast modifier selects which `vt` lane each lane reads.
+    #[test]
+    fn the_broadcast_modifier_selects_lanes() {
+        let rsp = seeded();
+        // 0 and 1 are both "no broadcast".
+        for e in [0, 1] {
+            assert_eq!(
+                core::array::from_fn::<u16, 8, _>(|i| rsp.vt_lane(1, e, i)),
+                V1
+            );
+        }
+        // e(0q): pairs take the even lane.
+        assert_eq!(
+            core::array::from_fn::<u16, 8, _>(|i| rsp.vt_lane(1, 2, i)),
+            [V1[0], V1[0], V1[2], V1[2], V1[4], V1[4], V1[6], V1[6]]
+        );
+        // e(2h): each group of four takes lane 2 or 6.
+        assert_eq!(
+            core::array::from_fn::<u16, 8, _>(|i| rsp.vt_lane(1, 6, i)),
+            [V1[2], V1[2], V1[2], V1[2], V1[6], V1[6], V1[6], V1[6]]
+        );
+        // e(5): lane 5 everywhere.
+        assert_eq!(
+            core::array::from_fn::<u16, 8, _>(|i| rsp.vt_lane(1, 13, i)),
+            [V1[5]; 8]
+        );
+    }
+
+    /// `VSAR` reads back the slice the element field names.
+    #[test]
+    fn vsar_reads_the_accumulator_slices() {
+        let mut rsp = seeded();
+        rsp.vu_compute(0x00, 0, VS_REG, VT_REG, 2);
+        let hi = acc_slice(&rsp, 32);
+        let md = acc_slice(&rsp, 16);
+        let lo = acc_slice(&rsp, 0);
+
+        rsp.vu_compute(0x1D, 8, 0, 0, 3);
+        assert_eq!(rsp.vu_regs[3], hi, "element 8 = ACC_HI");
+        rsp.vu_compute(0x1D, 9, 0, 0, 4);
+        assert_eq!(rsp.vu_regs[4], md, "element 9 = ACC_MD");
+        rsp.vu_compute(0x1D, 10, 0, 0, 5);
+        assert_eq!(rsp.vu_regs[5], lo, "element 10 = ACC_LO");
+    }
+
+    /// **Unsigned clamping saturates at a 15-bit threshold to a 16-bit value.**
+    ///
+    /// A naive `> 65535` test lets `0x8000..=0xFFFF` through unchanged; the rule
+    /// is that anything above `0x7FFF` becomes `0xFFFF`.
+    #[test]
+    fn unsigned_clamping_uses_a_fifteen_bit_threshold() {
+        assert_eq!(Rsp::clamp_unsigned(-1), 0);
+        assert_eq!(Rsp::clamp_unsigned(0x7FFF), 0x7FFF);
+        assert_eq!(Rsp::clamp_unsigned(0x8000), 0xFFFF, "not 0x8000");
+        assert_eq!(Rsp::clamp_unsigned(0xFFFF), 0xFFFF);
+    }
+
+    /// The bitwise group computes and leaves its result in `ACC_LO`.
+    #[test]
+    fn the_bitwise_group_writes_the_accumulator_low_slice() {
+        let mut rsp = seeded();
+        assert!(rsp.vu_compute(0x28, 0, VS_REG, VT_REG, 2)); // VAND
+        assert_eq!(rsp.vu_regs[2][3], V1[3] & V0[3]);
+        assert_eq!(acc_slice(&rsp, 0)[3], V1[3] & V0[3], "ACC_LO follows");
+
+        assert!(rsp.vu_compute(0x29, 0, VS_REG, VT_REG, 3)); // VNAND
+        assert_eq!(rsp.vu_regs[3][3], !(V1[3] & V0[3]));
+    }
+
+    /// An unimplemented opcode reports so, rather than writing a wrong result.
+    ///
+    /// `0x3F` is chosen because it is genuinely unassigned — an opcode from the
+    /// not-yet-implemented list would silently turn this test into a no-op the
+    /// day it lands, which is what happened when it named `VMACF`.
+    #[test]
+    fn an_unimplemented_opcode_is_reported_not_guessed() {
+        let mut rsp = seeded();
+        assert!(
+            !rsp.vu_compute(0x3F, 0, VS_REG, VT_REG, 2),
+            "an opcode with no implementation reports rather than guessing"
+        );
+        assert_eq!(rsp.vu_regs[2], [0; 8], "and it wrote nothing");
+    }
+}
+
+/// The vector load/store family (Sprint 3, brought forward).
+///
+/// Encoding: `LWC2`/`SWC2` | `base` (25..21) | `vt` (20..16) | `opcode`
+/// (15..11) | `element` (10..7) | `offset` (6..0, **signed 7-bit**).
+///
+/// The offset is scaled by the access size, and `element` is a **byte** index
+/// into the vector register naming the first byte the operation touches — so a
+/// non-zero element means *fewer* bytes move, not a shifted window.
+impl Rsp {
+    /// Sign-extend the 7-bit offset field.
+    const fn sext7(offset: u32) -> i32 {
+        (offset & 0x7F).cast_signed() << 25 >> 25
+    }
+
+    /// Execute a vector load or store. Returns `false` for an opcode not
+    /// implemented yet, leaving the instruction inert.
+    pub fn vector_mem(
+        &mut self,
+        store: bool,
+        op: u32,
+        base: usize,
+        vt: usize,
+        element: usize,
+        offset: u32,
+    ) -> bool {
+        let rs = self.r(base);
+        match op {
+            // Scalar group: 1, 2, 4 or 8 bytes, the size doubling with the
+            // opcode. The offset scales by that same size.
+            0x00..=0x03 => {
+                let size = 1usize << op;
+                let addr = rs.wrapping_add_signed(Self::sext7(offset) * size.cast_signed() as i32);
+                // **Loads and stores treat the register end differently** --
+                // n64-systemtest says so outright (op_vector_stores.rs:17):
+                // "the element specifier specifies the starting element. If
+                // there isn't enough room after e, there is wrap-around inside
+                // of the register (this is *different from loads*)".
+                //
+                // LOAD: no wrap; a short tail past byte 15 simply reduces the
+                // count ("only LSV/LLV/LDV can overflow"). STORE: the register
+                // index wraps (`& 15`) and the full width always moves -- the
+                // element rotates the source, it does not shorten the transfer.
+                if store {
+                    for i in 0..size {
+                        let byte = (element + i) & 15;
+                        let at = addr.wrapping_add(i as u32);
+                        let v = self.vu_byte(vt, byte);
+                        self.dmem_write_pub(at, v);
+                    }
+                } else {
+                    let size = core::cmp::min(size, 16 - element);
+                    for i in 0..size {
+                        let byte = element + i;
+                        let at = addr.wrapping_add(i as u32);
+                        let v = self.dmem_read_pub(at);
+                        self.set_vu_byte(vt, byte, v);
+                    }
+                }
+                true
+            }
+            // `LQV`/`SQV`: up to 16 bytes, **left-aligned** — the transfer runs
+            // from the address up to (and including) the last byte before the
+            // next 16-byte boundary, so a misaligned address moves fewer bytes
+            // rather than crossing the boundary.
+            0x04 => {
+                let addr = rs.wrapping_add_signed(Self::sext7(offset) * 16);
+                let end = addr | 15;
+                // The transfer runs to the 16-byte boundary. On a STORE that
+                // count is `16 - (addr & 15)` regardless of the element (the
+                // element only rotates the wrapped source); on a LOAD the
+                // element shortens it, since loads do not wrap (see the scalar
+                // group above and op_vector_stores.rs:17).
+                let size = if store {
+                    end - addr
+                } else {
+                    core::cmp::min(end - addr, 15 - element as u32)
+                };
+                for i in 0..=size {
+                    let byte = (element + i as usize) & 15;
+                    let at = addr.wrapping_add(i);
+                    if store {
+                        let v = self.vu_byte(vt, byte);
+                        self.dmem_write_pub(at, v);
+                    } else {
+                        let v = self.dmem_read_pub(at);
+                        self.set_vu_byte(vt, byte, v);
+                    }
+                }
+                true
+            }
+            // `LRV`/`SRV`: the **right-aligned** partner of `LQV`, and the
+            // reason a misaligned 128-bit access needs two instructions.
+            //
+            // The transfer runs from the *previous* 16-byte boundary up to (and
+            // excluding) the address, and it lands at the *far end* of the
+            // register: with 8 bytes to move they go to `VPR[8..15]`, not
+            // `VPR[0..7]`. The element field then shortens it from the front on
+            // the DMEM side while moving the destination up — the wiki's own
+            // worked example has `e(2)` read bytes `0x10..0x13` into
+            // `VPR[12..15]`, which pins both halves of that at once.
+            0x05 => {
+                let end = rs.wrapping_add_signed(Self::sext7(offset) * 16);
+                let addr = end & !15;
+                let n = (end & 15) as usize;
+                if store {
+                    // SRV: the `n` bytes from the boundary up to `end`, pulled
+                    // from the register starting at `16 - n` and wrapping (`&
+                    // 15`). The element rotates the source; unlike the load it
+                    // does not shorten the transfer (op_vector_stores.rs:191).
+                    for i in 0..n {
+                        let byte = (element + 16 - n + i) & 15;
+                        let at = addr.wrapping_add(i as u32);
+                        let v = self.vu_byte(vt, byte);
+                        self.dmem_write_pub(at, v);
+                    }
+                } else if element < n {
+                    // LRV: loads do not wrap, so the element shortens the count
+                    // and shifts the destination toward the register's far end.
+                    let count = n - element;
+                    let dest_base = 16 - n + element;
+                    for i in 0..count {
+                        let byte = dest_base + i;
+                        let at = addr.wrapping_add(i as u32);
+                        let v = self.dmem_read_pub(at);
+                        self.set_vu_byte(vt, byte, v);
+                    }
+                }
+                true
+            }
+            0x06..=0x08 => self.vector_mem_packed(store, op, rs, vt, element, offset),
+            // LTV/STV: the **transpose**. These touch a whole *group* of eight
+            // registers (`vt & ~7`), moving one lane into or out of each with
+            // rotating byte offsets and wraparound inside a 16-byte window. They
+            // do not fit the single-register loop above, so they have their own
+            // handler. LFV/SFV (0x09) and SWV (0x0A) are handled below.
+            0x0B => {
+                let addr = Self::base_16(rs, offset);
+                if store {
+                    self.stv(addr, vt, element);
+                } else {
+                    self.ltv(addr, vt, element);
+                }
+                true
+            }
+            // LFV load. Derived from n64-systemtest's OWN reference, which
+            // conflicts with ares for e != 0 (ares uses `mis - e` for lane 0
+            // where the suite uses `mis + e`). The oracle wins.
+            0x09 if !store => {
+                self.lfv(Self::base_16(rs, offset), vt, element);
+                true
+            }
+            // SFV store. Also from the suite reference: it writes FOUR bytes,
+            // whose source lanes are chosen by an `e`-dependent table, and for
+            // any `e` not in that table it writes **zero** -- not a wrap, an
+            // actual zero, which a table-less implementation gets wrong.
+            0x09 => {
+                self.sfv(Self::base_16(rs, offset), vt, element);
+                true
+            }
+            // SWV store. All 16 bytes leave the register, but the DMEM target
+            // rotates within a 16-byte window anchored to the *8-byte*-aligned
+            // base -- `misalignment` is `& 7`, not `& 15`. The source index
+            // wraps with the element (op_vector_stores.rs:353).
+            0x0A if store => {
+                let ea = rs.wrapping_add_signed(Self::sext7(offset) * 16);
+                let base = ea & !7;
+                let mis = ea & 7;
+                for i in 0..16u32 {
+                    let at = base.wrapping_add((mis + i) & 15);
+                    let byte = (element + i as usize) & 15;
+                    let v = self.vu_byte(vt, byte);
+                    self.dmem_write_pub(at, v);
+                }
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// The packed (`LPV`/`LUV`/`SPV`/`SUV`) and strided (`LHV`/`SHV`) memory
+    /// ops, split out of [`Rsp::vector_mem`] to keep its decode under length.
+    fn vector_mem_packed(
+        &mut self,
+        store: bool,
+        op: u32,
+        rs: u32,
+        vt: usize,
+        element: usize,
+        offset: u32,
+    ) -> bool {
+        match op {
+            // LPV/LUV (loads) and SPV/SUV (stores): the **packed** family.
+            // Eight bytes move, one per lane, each byte occupying a lane's high
+            // portion. LPV/SPV place it at bit 15 (`<< 8` / `.byte()`), LUV/SUV
+            // one bit lower at bit 14 (`<< 7`). The offset scales by 8.
+            0x06 | 0x07 => {
+                let base = rs.wrapping_add_signed(Self::sext7(offset) * 8);
+                // `index` folds the element field into the DMEM byte the first
+                // lane reads; it can go negative, so it wraps mod 16.
+                let index = (base & 7).wrapping_sub(element as u32);
+                let low = op == 0x07; // LUV/SUV shift one bit lower
+                if store {
+                    // The store side does NOT align the address (ares SPV/SUV),
+                    // unlike the load, which is why `base` is passed unmasked.
+                    self.packed_store(vt, base, element, low);
+                } else {
+                    let addr = base & !7;
+                    for lane in 0..8u32 {
+                        let byte = index.wrapping_add(lane) & 15;
+                        let v = u16::from(self.dmem_read_pub(addr.wrapping_add(byte)));
+                        self.vu_regs[vt & 31][lane as usize] = v << if low { 7 } else { 8 };
+                    }
+                }
+                true
+            }
+            // LHV/SHV: the **strided** pair, accessing every *other* DMEM byte.
+            // Like the packed family but the DMEM index steps by 2 per lane, and
+            // the value lands one bit lower (bit 14). The offset scales by 16.
+            // LFV/SFV (0x09) and the transposing LTV/STV (0x0B) are not here yet
+            // -- LFV/SFV have element-dependent lane subsets the suite itself
+            // calls "complicated", and are left to derive fresh rather than
+            // guessed.
+            0x08 => {
+                let base = rs.wrapping_add_signed(Self::sext7(offset) * 16);
+                let addr = base & !7;
+                if store {
+                    // The store reads the register at stride 2 and combines each
+                    // adjacent byte pair into one DMEM byte; index is the raw low
+                    // 3 bits, NOT folded with the element field (which the load
+                    // does). See ares SHV vs LHV.
+                    let index = base & 7;
+                    for lane in 0..8u32 {
+                        let byte = element + (lane as usize) * 2;
+                        let hi = u16::from(self.vu_byte(vt, byte & 15));
+                        let lo = u16::from(self.vu_byte(vt, (byte + 1) & 15));
+                        let value = ((hi << 1) | (lo >> 7)) as u8;
+                        let at = index.wrapping_add(lane * 2) & 15;
+                        self.dmem_write_pub(addr.wrapping_add(at), value);
+                    }
+                } else {
+                    let index = (base & 7).wrapping_sub(element as u32);
+                    for lane in 0..8u32 {
+                        let at = index.wrapping_add(lane * 2) & 15;
+                        let v = u16::from(self.dmem_read_pub(addr.wrapping_add(at)));
+                        self.vu_regs[vt & 31][lane as usize] = v << 7;
+                    }
+                }
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Base address for a 16-scaled offset, used by the whole-vector ops.
+    fn base_16(rs: u32, offset: u32) -> u32 {
+        rs.wrapping_add_signed(Self::sext7(offset) * 16)
+    }
+
+    /// `LFV` — the "complicated" fractional load, transcribed from
+    /// n64-systemtest's reference (not ares, which differs for `e != 0`).
+    ///
+    /// Eight lanes are computed from a fixed offset pattern around the aligned
+    /// address, each byte placed at bit 14. Then only the register **bytes**
+    /// `[e, e + min(8, 16 - e))` are written from that temporary — the rest of
+    /// the register is left as it was, which is the partial-write behavior the
+    /// name hides.
+    fn lfv(&mut self, address: u32, vt: usize, element: usize) {
+        let aligned = address & !7;
+        let mis = (address & 7).cast_signed();
+        let e = i32::try_from(element).unwrap_or(0);
+        let at = |k: i32| -> u16 {
+            let idx = aligned.wrapping_add(((mis + k).rem_euclid(16)) as u32);
+            u16::from(self.dmem_read_pub(idx)) << 7
+        };
+        // The offset pattern, per n64-systemtest's LFV reference.
+        let temp: [u16; 8] = [
+            at(e),
+            at(4 - e),
+            at(8 - e),
+            at(12 - e),
+            at(8 - e),
+            at(12 - e),
+            at(-e),
+            at(4 - e),
+        ];
+        // temp as 16 big-endian bytes.
+        let mut bytes = [0u8; 16];
+        for (lane, v) in temp.iter().enumerate() {
+            bytes[lane * 2] = (v >> 8) as u8;
+            bytes[lane * 2 + 1] = *v as u8;
+        }
+        let length = core::cmp::min(8, 16 - element);
+        for (i, &b) in bytes.iter().enumerate().skip(element).take(length) {
+            self.set_vu_byte(vt, i, b);
+        }
+    }
+
+    /// `SFV` — the fractional store, transcribed from n64-systemtest's
+    /// reference.
+    ///
+    /// Four bytes are written at DMEM stride 4 within the aligned window. Which
+    /// four source lanes supply them depends on `e` through a fixed table; for
+    /// any `e` **not** in the table the bytes are **zero** — a real zero, not a
+    /// wrap, which is the "even 0 for some E" behavior the suite warns about.
+    fn sfv(&mut self, address: u32, vt: usize, element: usize) {
+        // The source-lane table (N64brew / n64-systemtest). `None` -> write 0.
+        let lanes: Option<[usize; 4]> = match element {
+            0 | 15 => Some([0, 1, 2, 3]),
+            1 => Some([6, 7, 4, 5]),
+            4 => Some([1, 2, 3, 0]),
+            5 => Some([7, 4, 5, 6]),
+            8 => Some([4, 5, 6, 7]),
+            11 => Some([3, 0, 1, 2]),
+            12 => Some([5, 6, 7, 4]),
+            _ => None,
+        };
+        let a = address & 7;
+        let b = address & !7;
+        for i in 0..4u32 {
+            let value = lanes.map_or(0, |l| (self.vu_regs[vt & 31][l[i as usize]] >> 7) as u8);
+            let at = b + ((a + (i << 2)) & 15);
+            self.dmem_write_pub(at, value);
+        }
+    }
+
+    /// `LTV` — load a transposed diagonal into a register group.
+    ///
+    /// Transcribed from ares. The window is the 16 bytes at `rs & ~7`; the read
+    /// pointer starts at an element-and-address-dependent offset and wraps at
+    /// the window's end; each iteration fills one lane of the next register in
+    /// the group, the register index rotating mod 8. Modeled and cross-checked
+    /// in a scratch script before implementation, per the note in
+    /// `docs/rsp.md`.
+    fn ltv(&mut self, address: u32, vt: usize, element: usize) {
+        let begin = address & !7;
+        let mut ptr = begin + ((element as u32 + (address & 8)) & 15);
+        let vtbase = vt & !7;
+        let mut vtoff = element >> 1;
+        for i in 0..8usize {
+            for half in 0..2 {
+                let v = self.dmem_read_pub(ptr);
+                self.set_vu_byte(vtbase + vtoff, i * 2 + half, v);
+                ptr += 1;
+                if ptr == begin + 16 {
+                    ptr = begin;
+                }
+            }
+            vtoff = (vtoff + 1) & 7;
+        }
+    }
+
+    /// `STV` — store a register group as a transposed diagonal. The mirror of
+    /// [`Rsp::ltv`], with its own distinct offset arithmetic (also from ares).
+    fn stv(&mut self, address: u32, vt: usize, element: usize) {
+        let start = vt & !7;
+        let mut elem = 16 - (element & !1);
+        let mut base = (address & 7).wrapping_sub((element & !1) as u32);
+        let addr = address & !7;
+        for offset in start..start + 8 {
+            let b0 = self.vu_byte(offset, elem & 15);
+            self.dmem_write_pub(addr.wrapping_add(base & 15), b0);
+            base = base.wrapping_add(1);
+            elem += 1;
+            let b1 = self.vu_byte(offset, elem & 15);
+            self.dmem_write_pub(addr.wrapping_add(base & 15), b1);
+            base = base.wrapping_add(1);
+            elem += 1;
+        }
+    }
+
+    /// The `SPV`/`SUV` store half of the packed family.
+    ///
+    /// Each of eight consecutive DMEM bytes comes from either a lane's **high**
+    /// byte or its value shifted down 7, and *which* is chosen alternates on a
+    /// `(offset & 15) < 8` test — with `SPV` and `SUV` taking opposite branches.
+    /// That split is why the store is not a mirror of the load.
+    fn packed_store(&mut self, vt: usize, addr: u32, element: usize, suv: bool) {
+        for i in 0..8u32 {
+            let offset = element as u32 + i;
+            let lane = (offset & 7) as usize;
+            let first_half = offset & 15 < 8;
+            // SPV: high-byte in the first half, shifted-down in the second.
+            // SUV swaps the two.
+            let high_byte = first_half != suv;
+            let byte = if high_byte {
+                self.vu_byte(vt, lane << 1)
+            } else {
+                (self.vu_regs[vt & 31][lane] >> 7) as u8
+            };
+            self.dmem_write_pub(addr.wrapping_add(i), byte);
+        }
+    }
+
+    /// DMEM byte read, for the vector memory paths.
+    pub(crate) const fn dmem_read_pub(&self, addr: u32) -> u8 {
+        self.dmem[(addr & 0xFFF) as usize]
+    }
+
+    /// DMEM byte write, for the vector memory paths.
+    pub(crate) const fn dmem_write_pub(&mut self, addr: u32, val: u8) {
+        self.dmem[(addr & 0xFFF) as usize] = val;
+    }
+}
+
+#[cfg(test)]
+mod mem_tests {
+    use super::*;
+
+    fn with_dmem(pattern: &[u8]) -> Rsp {
+        let mut rsp = Rsp::new();
+        for (i, b) in pattern.iter().enumerate() {
+            rsp.dmem[i] = *b;
+        }
+        rsp
+    }
+
+    /// **An aligned `LQV` fills the whole register.**
+    #[test]
+    fn an_aligned_lqv_loads_sixteen_bytes() {
+        let bytes: [u8; 16] = core::array::from_fn(|i| i as u8 + 0x10);
+        let mut rsp = with_dmem(&bytes);
+        assert!(rsp.vector_mem(false, 0x04, 0, 1, 0, 0));
+        for (i, want) in bytes.iter().enumerate() {
+            assert_eq!(rsp.vu_byte(1, i), *want, "byte {i}");
+        }
+    }
+
+    /// **A misaligned `LQV` stops at the 16-byte boundary rather than crossing
+    /// it.** This is the whole reason `LRV` exists, and an implementation that
+    /// simply reads 16 bytes from the address passes an aligned test and fails
+    /// here.
+    #[test]
+    fn a_misaligned_lqv_stops_at_the_boundary() {
+        let bytes: [u8; 32] = core::array::from_fn(|i| i as u8 + 0x10);
+        let mut rsp = with_dmem(&bytes);
+        // Address 0x08: eight bytes to the boundary at 0x10.
+        rsp.set_su(2, 8);
+        assert!(rsp.vector_mem(false, 0x04, 2, 1, 0, 0));
+        for i in 0..8 {
+            assert_eq!(rsp.vu_byte(1, i), bytes[8 + i], "loaded byte {i}");
+        }
+        for i in 8..16 {
+            assert_eq!(rsp.vu_byte(1, i), 0, "byte {i} must be untouched");
+        }
+    }
+
+    /// A non-zero `element` moves **fewer** bytes: the window is
+    /// `VPR[element..15]`, not a shifted 16.
+    #[test]
+    fn a_non_zero_element_shortens_the_transfer() {
+        let bytes: [u8; 16] = core::array::from_fn(|i| i as u8 + 0x10);
+        let mut rsp = with_dmem(&bytes);
+        assert!(rsp.vector_mem(false, 0x04, 0, 1, 12, 0));
+        for i in 0..12 {
+            assert_eq!(rsp.vu_byte(1, i), 0, "below the element, untouched");
+        }
+        for i in 12..16 {
+            assert_eq!(rsp.vu_byte(1, i), bytes[i - 12], "from the start of DMEM");
+        }
+    }
+
+    /// `SQV` is the mirror: the register's bytes land in DMEM.
+    #[test]
+    fn sqv_round_trips_with_lqv() {
+        let bytes: [u8; 16] = core::array::from_fn(|i| i as u8 + 0xA0);
+        let mut rsp = with_dmem(&bytes);
+        rsp.vector_mem(false, 0x04, 0, 1, 0, 0);
+        rsp.set_su(2, 0x100);
+        assert!(rsp.vector_mem(true, 0x04, 2, 1, 0, 0));
+        for (i, want) in bytes.iter().enumerate() {
+            assert_eq!(rsp.dmem[0x100 + i], *want, "stored byte {i}");
+        }
+    }
+
+    /// The scalar group's offset scales by the access size, which is what makes
+    /// `LDV`'s reach eight times `LBV`'s for the same encoded offset.
+    #[test]
+    fn the_scalar_offset_scales_with_the_access_size() {
+        let bytes: [u8; 64] = core::array::from_fn(|i| i as u8);
+        let mut rsp = with_dmem(&bytes);
+        // LBV, offset 2 -> address 2.
+        assert!(rsp.vector_mem(false, 0x00, 0, 1, 0, 2));
+        assert_eq!(rsp.vu_byte(1, 0), 2);
+        // LDV, offset 2 -> address 16.
+        assert!(rsp.vector_mem(false, 0x03, 0, 2, 0, 2));
+        assert_eq!(rsp.vu_byte(2, 0), 16);
+    }
+
+    /// **`LRV` lands at the far end of the register, not the near one.**
+    ///
+    /// The wiki's worked example, reproduced exactly: with `a0` 16-byte aligned,
+    /// `lrv $v0, 0x18(a0)` reads bytes `0x10..0x17` into `VPR[8..15]`. An
+    /// implementation that writes from byte 0 — the natural mirror of `LQV` —
+    /// puts the right-hand half of the vector in the left-hand slots, and the
+    /// pair no longer reconstructs a misaligned 128-bit load.
+    #[test]
+    fn lrv_loads_into_the_far_end_of_the_register() {
+        let bytes: [u8; 48] = core::array::from_fn(|i| i as u8 + 0x10);
+        let mut rsp = with_dmem(&bytes);
+        rsp.set_su(2, 0x18);
+        assert!(rsp.vector_mem(false, 0x05, 2, 1, 0, 0));
+        for i in 0..8 {
+            assert_eq!(rsp.vu_byte(1, i), 0, "the left half stays untouched");
+        }
+        for i in 8..16 {
+            assert_eq!(
+                rsp.vu_byte(1, i),
+                bytes[0x10 + (i - 8)],
+                "byte {i} comes from the previous 16-byte boundary"
+            );
+        }
+    }
+
+    /// The element field shortens `LRV` from the front on the DMEM side while
+    /// moving the destination **up** — the wiki's `e(2)` example reads
+    /// `0x10..0x13` into `VPR[12..15]`.
+    #[test]
+    fn lrv_with_an_element_shortens_from_the_front() {
+        let bytes: [u8; 48] = core::array::from_fn(|i| i as u8 + 0x10);
+        let mut rsp = with_dmem(&bytes);
+        rsp.set_su(2, 0x18);
+        assert!(rsp.vector_mem(false, 0x05, 2, 1, 4, 0));
+        for i in 0..12 {
+            assert_eq!(rsp.vu_byte(1, i), 0, "byte {i} untouched");
+        }
+        for i in 12..16 {
+            assert_eq!(
+                rsp.vu_byte(1, i),
+                bytes[0x10 + (i - 12)],
+                "byte {i} still starts from the boundary, not from +4"
+            );
+        }
+    }
+
+    /// **`LQV` and `LRV` together reconstruct a misaligned 128-bit load**, which
+    /// is the entire point of the pair. Neither alone can.
+    #[test]
+    fn lqv_and_lrv_together_load_a_misaligned_vector() {
+        let bytes: [u8; 48] = core::array::from_fn(|i| i as u8 + 0x10);
+        let mut rsp = with_dmem(&bytes);
+        rsp.set_su(2, 0x08);
+        rsp.vector_mem(false, 0x04, 2, 1, 0, 0); // lqv 0x08
+        rsp.set_su(3, 0x18);
+        rsp.vector_mem(false, 0x05, 3, 1, 0, 0); // lrv 0x18
+        for i in 0..16 {
+            assert_eq!(
+                rsp.vu_byte(1, i),
+                bytes[8 + i],
+                "the pair must yield the 16 bytes at 0x08"
+            );
+        }
+    }
+
+    /// **A scalar load near the end of the register loads fewer bytes rather
+    /// than wrapping.**
+    ///
+    /// The regression test for the bug this branch fixed: the register side
+    /// masked its byte index with 15, so an `LDV` at element 12 wrapped its
+    /// last four bytes back to `VPR[0..3]` instead of stopping. Nothing here
+    /// caught it before — the existing scalar test uses `element = 0`, where
+    /// wrapping and truncating agree.
+    #[test]
+    fn a_scalar_load_near_the_end_of_the_register_truncates() {
+        let bytes: [u8; 16] = core::array::from_fn(|i| i as u8 + 0x10);
+        let mut rsp = with_dmem(&bytes);
+        // LDV wants 8 bytes; at element 12 only 4 fit.
+        assert!(rsp.vector_mem(false, 0x03, 0, 1, 12, 0));
+        for i in 12..16 {
+            assert_eq!(rsp.vu_byte(1, i), bytes[i - 12], "byte {i} loaded");
+        }
+        for i in 0..12 {
+            assert_eq!(
+                rsp.vu_byte(1, i),
+                0,
+                "byte {i} must be untouched -- the tail must NOT wrap to the start"
+            );
+        }
+    }
+
+    /// An unimplemented opcode reports so rather than moving wrong bytes.
+    #[test]
+    fn an_unimplemented_vector_memory_op_is_reported() {
+        let mut rsp = Rsp::new();
+        assert!(
+            !rsp.vector_mem(false, 0x0A, 0, 1, 0, 0),
+            "an unassigned opcode"
+        );
+    }
+}
+
+/// The `VRCP` / `VRSQ` reciprocal ROMs.
+///
+/// 512 entries each, **generated by exact integer arithmetic** rather than
+/// stored as literals — a deliberate departure from `docs/rsp.md`'s "data, not
+/// a formula" rule, argued and bounded in accuracy ledger **C-31**. The short
+/// version: the rule guards against *approximation*, and these constructions
+/// have no rounding freedom, so they reproduce the ROM rather than estimating
+/// it. The construction is ares's (ISC).
+pub mod rom {
+    /// The reciprocal ROM, built at **compile time**.
+    ///
+    /// A `static` rather than a function, which is what makes it a table in the
+    /// binary: the generator runs during const evaluation and nothing computes
+    /// a reciprocal at run time. An earlier revision computed each entry on
+    /// demand, which made every `VRSQ` pay for a search — see the note on
+    /// [`INVERSE_SQUARE_ROOT`].
+    pub static RECIPROCAL: [u16; 512] = build_reciprocal();
+
+    /// The inverse-square-root ROM, likewise built at compile time.
+    pub static INVERSE_SQUARE_ROOT: [u16; 512] = build_inverse_square_root();
+
+    /// `(1 << 34) / (index + 512)`, rounded.
+    ///
+    /// Entry 0 is `0xFFFF` and does **not** follow the formula — hardware pins
+    /// it, and a generator that applies the formula uniformly gets the
+    /// most-used entry wrong.
+    const fn build_reciprocal() -> [u16; 512] {
+        let mut table = [0u16; 512];
+        table[0] = u16::MAX;
+        let mut index = 1usize;
+        while index < 512 {
+            let a = (index as u64) + 512;
+            let b = (1u64 << 34) / a;
+            table[index] = ((b + 1) >> 8) as u16;
+            index += 1;
+        }
+        table
+    }
+
+    /// The **smallest** `b ≥ 2¹⁷` with `a·(b+1)² ≥ 2⁴⁴`, where `a` is halved on
+    /// odd indices.
+    ///
+    /// Note the predicate, which is *not* what ares's comment above the same
+    /// loop says. That comment reads "find the largest b where b < 1.0 /
+    /// sqrt(a)", but the loop is `while cond { b += 1 }` — it walks *through*
+    /// the last satisfying value and stops one past it. The value the table
+    /// actually holds is therefore one greater than the comment describes.
+    ///
+    /// This was found by pinning the bisection against twelve values captured
+    /// from the original upward scan: implementing the comment's predicate gave
+    /// `26964` where the scan gives `26965`. Without that test the off-by-one
+    /// would have shipped, since every property the other tests check
+    /// (monotonicity, the odd/even interleave, the 16-bit range) holds just as
+    /// well one step to the left.
+    ///
+    /// **Binary search, not a linear scan.** The naive upward walk runs
+    /// ~131,000 iterations of two 64-bit multiplications for the smallest `a`,
+    /// per entry — tolerable once at build time, disastrous when an earlier
+    /// revision called it per instruction, and emulated in software on
+    /// `thumbv7em`, which this crate must build for.
+    const fn build_inverse_square_root() -> [u16; 512] {
+        let mut table = [0u16; 512];
+        let mut index = 0usize;
+        while index < 512 {
+            let a = ((index as u64) + 512) >> ((index % 2 == 1) as u32);
+            // `b + 1` stays under 2^19 for the smallest `a`, so `a*(b+1)^2`
+            // fits in `u64`.
+            let mut lo = 1u64 << 17;
+            let mut hi = 1u64 << 19;
+            while lo < hi {
+                let mid = u64::midpoint(lo, hi);
+                if a * (mid + 1) * (mid + 1) >= (1u64 << 44) {
+                    hi = mid;
+                } else {
+                    lo = mid + 1;
+                }
+            }
+            table[index] = (lo >> 1) as u16;
+            index += 1;
+        }
+        table
+    }
+
+    /// The reciprocal ROM entry for `index`.
+    #[must_use]
+    pub fn reciprocal(index: usize) -> u16 {
+        RECIPROCAL[index & 511]
+    }
+
+    /// The inverse-square-root ROM entry for `index`.
+    #[must_use]
+    pub fn inverse_square_root(index: usize) -> u16 {
+        INVERSE_SQUARE_ROOT[index & 511]
+    }
+}
+
+#[cfg(test)]
+mod rom_tests {
+    use super::rom;
+
+    /// **Entry 0 is a special case in both tables' construction.**
+    ///
+    /// The reciprocal formula does not produce `0xFFFF` at index 0; hardware
+    /// pins it, and a generator that applies the formula uniformly gets the
+    /// most-used entry wrong.
+    #[test]
+    fn the_reciprocal_rom_pins_its_first_entry() {
+        assert_eq!(rom::reciprocal(0), 0xFFFF);
+        // And the formula does take over immediately afterwards.
+        assert_eq!(rom::reciprocal(1), ((((1u64 << 34) / 513) + 1) >> 8) as u16);
+    }
+
+    /// The reciprocal ROM is **monotonically decreasing**: it approximates
+    /// `1/x` over an increasing divisor, so any entry that rises above its
+    /// predecessor is a construction error rather than a rounding artifact.
+    ///
+    /// This is a property test rather than a transcription check — it cannot
+    /// prove the values are the hardware's, but it fails loudly for the class
+    /// of error a generator actually makes (a wrong shift, a wrong width),
+    /// which a handful of spot-checked entries would not.
+    #[test]
+    fn the_reciprocal_rom_decreases_monotonically() {
+        for i in 2..512 {
+            assert!(
+                rom::reciprocal(i) <= rom::reciprocal(i - 1),
+                "entry {i} rose above its predecessor"
+            );
+        }
+    }
+
+    /// **The binary search reproduces the linear scan exactly.**
+    ///
+    /// The build switched from an upward scan to a bisection for speed, and the
+    /// two agreeing is the whole basis for calling that a refactor rather than
+    /// a change. These twelve values were captured from the scan *before* the
+    /// switch; if the bisection has an off-by-one at the boundary it lands
+    /// here rather than in a wrong vertex months later.
+    #[test]
+    fn the_inverse_square_root_rom_matches_the_linear_scan() {
+        assert_eq!(
+            core::array::from_fn::<u16, 12, _>(rom::inverse_square_root),
+            [
+                27145, 65535, 26965, 65280, 26785, 65026, 26607, 64774, 26430, 64523, 26253, 64274
+            ]
+        );
+    }
+
+    /// Every entry fits the 16 bits the ROM is, at both ends of the range.
+    #[test]
+    fn both_roms_stay_within_sixteen_bits() {
+        // Exercised for its panic-freedom and range; `u16` makes the bound
+        // structural, so what this really pins is that the generators do not
+        // overflow their intermediate `u64` arithmetic on the way.
+        for i in 0..512 {
+            let _ = rom::reciprocal(i);
+            let _ = rom::inverse_square_root(i);
+        }
+    }
+
+    /// **The inverse-square-root ROM is two interleaved decreasing sequences**,
+    /// not one.
+    ///
+    /// Odd indices *halve* `a`, so they cover the neighboring binade and come
+    /// out **larger** than their even predecessors — the table alternates
+    /// between roughly 92,000 and 131,000 rather than descending. Asserting a
+    /// single monotonic run fails, and my first version of this test asserted
+    /// the pairing backwards; the structure was checked against the generator's
+    /// output rather than the assertion being flipped until it passed.
+    ///
+    /// That interleaving is what lets `VRSQ` cover a 2:1 input range with one
+    /// table.
+    #[test]
+    fn the_inverse_square_root_rom_is_two_interleaved_sequences() {
+        for i in (2..510).step_by(2) {
+            assert!(
+                rom::inverse_square_root(i) <= rom::inverse_square_root(i - 2),
+                "the even subsequence rose at {i}"
+            );
+            assert!(
+                rom::inverse_square_root(i + 1) <= rom::inverse_square_root(i - 1),
+                "the odd subsequence rose at {i}"
+            );
+            assert!(
+                rom::inverse_square_root(i + 1) > rom::inverse_square_root(i),
+                "the odd entry at {i} must exceed its even neighbor"
+            );
+        }
+    }
+}
+
+/// The single-lane reciprocal group: `VRCP`, `VRSQ`, their `L`/`H` partners,
+/// `VMOV` and `VNOP`.
+///
+/// These do not operate lane-wise. They read **one** lane of `vt` (selected by
+/// the element field), write **one** lane of `vd` (selected by the `de` field,
+/// which occupies the `vs` position), and set the whole accumulator low slice to
+/// the broadcast `vt`.
+impl Rsp {
+    /// The shared core of `VRCP`/`VRCPL` and `VRSQ`/`VRSQL`.
+    ///
+    /// `long` selects whether a staged high half is consumed; `sqrt` selects the
+    /// inverse-square-root table and its halved shift.
+    fn reciprocal_core(&mut self, element: u32, vt: usize, de: usize, long: bool, sqrt: bool) {
+        let lane = self.vt_lane(vt, element, (element & 7) as usize);
+        // A 32-bit operand only when an `H` instruction staged one immediately
+        // before; otherwise the 16-bit lane, sign-extended.
+        let input: i32 = if long && self.div.pending {
+            ((i32::from(self.div.input)) << 16) | i32::from(lane)
+        } else {
+            i32::from(lane.cast_signed())
+        };
+
+        let mask = input >> 31;
+        let mut data = input ^ mask;
+        if input > -32768 {
+            data -= mask;
+        }
+
+        let result: i32 = if data == 0 {
+            // Division by zero saturates rather than faulting -- the RSP has no
+            // exception mechanism to report it with.
+            0x7FFF_FFFF
+        } else if input == -32768 {
+            // The one input whose negation is not representable.
+            0xFFFF_0000u32.cast_signed()
+        } else {
+            let shift = data.cast_unsigned().leading_zeros();
+            let index = ((u64::from(data.cast_unsigned()) << shift) & 0x7FC0_0000) >> 22;
+            let entry = if sqrt {
+                // The odd/even interleave: the low bit of the shift picks which
+                // of the two sequences the entry comes from.
+                rom::inverse_square_root(((index as usize) & 0x1FE) | (shift as usize & 1))
+            } else {
+                rom::reciprocal(index as usize)
+            };
+            let r = (0x10000 | i32::from(entry)) << 14;
+            // The square root halves the renormalizing shift, because it is
+            // undoing a squaring.
+            let back = if sqrt { (31 - shift) >> 1 } else { 31 - shift };
+            (r >> back) ^ mask
+        };
+
+        self.div.pending = false;
+        self.div.output = (result.cast_unsigned() >> 16) as u16;
+        self.acc_low_from_broadcast(element, vt);
+        self.set_vd_lane(de, result.cast_unsigned() as u16);
+    }
+
+    /// Set every accumulator low slice to the broadcast `vt`, which each of
+    /// these instructions does regardless of what it computes.
+    fn acc_low_from_broadcast(&mut self, element: u32, vt: usize) {
+        for lane in 0..8 {
+            let v = self.vt_lane(vt, element, lane);
+            self.vu_acc[lane] = (self.vu_acc[lane] & 0xFFFF_FFFF_0000) | u64::from(v);
+        }
+    }
+
+    /// Write the destination lane. Stored separately so `vd` can be resolved
+    /// once by the caller.
+    fn set_vd_lane(&mut self, de: usize, value: u16) {
+        self.pending_vd_lane = Some((de, value));
+    }
+
+    /// The single-lane group's dispatch. Returns `false` for an opcode outside
+    /// it, so the caller can fall through.
+    pub fn vu_single_lane(
+        &mut self,
+        op: u32,
+        element: u32,
+        vt: usize,
+        de: usize,
+        vd: usize,
+    ) -> bool {
+        let de = de & 7;
+        match op {
+            0x30 | 0x31 | 0x34 | 0x35 => {
+                let long = op == 0x31 || op == 0x35;
+                let sqrt = op >= 0x34;
+                self.reciprocal_core(element, vt, de, long, sqrt);
+            }
+            // The `H` partners stage the high half and hand back the high half
+            // of the previous result. They compute nothing themselves.
+            0x32 | 0x36 => {
+                self.acc_low_from_broadcast(element, vt);
+                self.div.input = self.vt_lane(vt, element, (element & 7) as usize);
+                self.div.pending = true;
+                self.pending_vd_lane = Some((de, self.div.output));
+            }
+            // VMOV copies one lane of the broadcast source.
+            0x33 => {
+                self.acc_low_from_broadcast(element, vt);
+                let v = self.vt_lane(vt, element, de);
+                self.pending_vd_lane = Some((de, v));
+            }
+            // VNOP and VNULL retire without effect.
+            0x37 | 0x3F => return true,
+            _ => return false,
+        }
+        if let Some((lane, value)) = self.pending_vd_lane.take() {
+            self.vu_regs[vd & 31][lane] = value;
+        }
+        true
+    }
+}
+
+#[cfg(test)]
+mod reciprocal_tests {
+    use super::*;
+
+    /// **`VRCPH` stages a high half and hands back the previous result's.**
+    ///
+    /// Both halves of that matter: the write-back is the *old* `DIVOUT`, not
+    /// anything derived from this instruction's operand, so an implementation
+    /// that returns the staged value instead looks plausible and produces
+    /// garbage on the second use.
+    #[test]
+    fn vrcph_stages_the_input_and_returns_the_previous_output() {
+        let mut rsp = Rsp::new();
+        rsp.vu_regs[1] = [0x1234; 8];
+        rsp.div.output = 0xBEEF;
+
+        assert!(rsp.vu_single_lane(0x32, 0, 1, 0, 2));
+        assert_eq!(rsp.vu_regs[2][0], 0xBEEF, "the PREVIOUS output comes back");
+        assert_eq!(rsp.div.input, 0x1234, "and this operand is staged");
+        assert!(rsp.div.pending);
+    }
+
+    /// **`VRCPL` consumes a staged half only when one was just staged.**
+    ///
+    /// `pending` is what separates "a high half was staged by the preceding
+    /// instruction" from "there is a stale value in the latch". Without it an
+    /// `L` issued on its own silently consumes whatever the last `H` left, and
+    /// the result depends on unrelated code that ran earlier.
+    #[test]
+    fn vrcpl_consumes_a_staged_half_only_once() {
+        let mut rsp = Rsp::new();
+        rsp.vu_regs[1] = [0x0002; 8];
+
+        // Stage, then consume: `pending` must be cleared by the consumer.
+        rsp.vu_single_lane(0x32, 0, 1, 0, 2);
+        assert!(rsp.div.pending);
+        rsp.vu_single_lane(0x31, 0, 1, 0, 3);
+        assert!(!rsp.div.pending, "the L instruction clears the staging");
+
+        // A second L with nothing staged must take the 16-bit path. Compare it
+        // against a plain VRCP of the same operand, which is the same path.
+        let mut plain = Rsp::new();
+        plain.vu_regs[1] = [0x0002; 8];
+        plain.vu_single_lane(0x30, 0, 1, 0, 4);
+
+        rsp.vu_single_lane(0x31, 0, 1, 0, 5);
+        assert_eq!(
+            rsp.vu_regs[5][0], plain.vu_regs[4][0],
+            "an unstaged L is a plain 16-bit reciprocal"
+        );
+    }
+
+    /// Division by zero **saturates** rather than faulting — the RSP has no
+    /// exception mechanism, so there is nothing for it to raise.
+    #[test]
+    fn reciprocal_of_zero_saturates() {
+        let mut rsp = Rsp::new();
+        rsp.vu_regs[1] = [0; 8];
+        rsp.vu_single_lane(0x30, 0, 1, 0, 2);
+        assert_eq!(rsp.div.output, 0x7FFF, "the high half of 0x7FFF_FFFF");
+        assert_eq!(rsp.vu_regs[2][0], 0xFFFF, "and the low half");
+    }
+
+    /// Every one of these writes the accumulator's low slice from the broadcast
+    /// source, whatever else it does — including `VRCPH`, which computes
+    /// nothing.
+    #[test]
+    fn the_single_lane_group_always_writes_the_accumulator_low_slice() {
+        for op in [0x30u32, 0x31, 0x32, 0x33, 0x34, 0x35, 0x36] {
+            let mut rsp = Rsp::new();
+            rsp.vu_regs[1] = [0xABCD; 8];
+            rsp.vu_single_lane(op, 0, 1, 0, 2);
+            assert_eq!(
+                (rsp.vu_acc[5] & 0xFFFF) as u16,
+                0xABCD,
+                "opcode {op:#04x} did not write ACC_LO"
+            );
+        }
+    }
+
+    /// `VNOP` retires without touching anything — including the accumulator,
+    /// which separates it from the rest of the group.
+    #[test]
+    fn vnop_does_nothing_at_all() {
+        let mut rsp = Rsp::new();
+        rsp.vu_regs[1] = [0xABCD; 8];
+        assert!(rsp.vu_single_lane(0x37, 0, 1, 0, 2));
+        assert_eq!(rsp.vu_regs[2], [0; 8]);
+        assert_eq!(rsp.vu_acc, [0; 8], "not even the accumulator");
+    }
+}
+
+#[cfg(test)]
+mod arithmetic_tests {
+    use super::*;
+
+    fn pair(a: [u16; 8], b: [u16; 8]) -> Rsp {
+        let mut rsp = Rsp::new();
+        rsp.vu_regs[1] = a; // vs
+        rsp.vu_regs[0] = b; // vt
+        rsp
+    }
+
+    /// **`VADD` consumes `VCO`'s carry and then clears the whole register.**
+    ///
+    /// Both halves matter. Not consuming it makes multi-precision addition
+    /// silently lose the carry; not clearing it makes the *next* `VADD` add a
+    /// stale one, which surfaces as an off-by-one in a single lane much later.
+    #[test]
+    fn vadd_consumes_the_carry_and_clears_vco() {
+        let mut rsp = pair([1; 8], [1; 8]);
+        rsp.vu_ctrl.vco = 0b0000_0101; // carry into lanes 0 and 2
+        assert!(rsp.vu_compute(0x10, 0, 1, 0, 2));
+
+        assert_eq!(rsp.vu_regs[2][0], 3, "1 + 1 + carry");
+        assert_eq!(rsp.vu_regs[2][1], 2, "1 + 1, no carry");
+        assert_eq!(rsp.vu_regs[2][2], 3, "carry again");
+        assert_eq!(rsp.vu_ctrl.vco, 0, "VCO is cleared wholesale");
+    }
+
+    /// `VADD` **clamps** its result while the accumulator keeps the unclamped
+    /// low bits — the two disagree on overflow, and a test reading only `vd`
+    /// cannot tell.
+    #[test]
+    fn vadd_clamps_the_result_but_not_the_accumulator() {
+        let mut rsp = pair([0x7FFF; 8], [0x7FFF; 8]);
+        rsp.vu_compute(0x10, 0, 1, 0, 2);
+        assert_eq!(rsp.vu_regs[2][0], 0x7FFF, "saturated");
+        assert_eq!(
+            (rsp.vu_acc[0] & 0xFFFF) as u16,
+            0xFFFE,
+            "the accumulator keeps 0x7FFF + 0x7FFF unclamped"
+        );
+    }
+
+    /// **`VADDC` produces a carry where `VADD` consumes one**, and writes no
+    /// clamped result — it is the low half of a multi-precision add.
+    #[test]
+    fn vaddc_produces_the_carry() {
+        let mut rsp = pair([0xFFFF; 8], [0x0001; 8]);
+        assert!(rsp.vu_compute(0x14, 0, 1, 0, 2));
+        assert_eq!(rsp.vu_regs[2][0], 0, "the wrapped low half, not clamped");
+        assert_eq!(rsp.vu_ctrl.vco, 0xFF, "a carry out of every lane");
+    }
+
+    /// `VSUBC` sets `VCO`'s **high** half from "the result was non-zero", which
+    /// is what makes the pair usable as a comparison.
+    #[test]
+    fn vsubc_records_borrow_and_non_zero_separately() {
+        let mut rsp = pair([5, 5, 0, 0, 0, 0, 0, 0], [3, 7, 0, 0, 0, 0, 0, 0]);
+        assert!(rsp.vu_compute(0x15, 0, 1, 0, 2));
+        assert_eq!(rsp.vu_regs[2][0], 2, "5 - 3");
+        assert_eq!(rsp.vu_regs[2][1], 0xFFFE, "5 - 7 wraps");
+        assert_eq!(rsp.vu_ctrl.vco & 1, 0, "no borrow out of lane 0");
+        assert_ne!(rsp.vu_ctrl.vco & 2, 0, "lane 1 borrowed");
+        assert_ne!(rsp.vu_ctrl.vco & (1 << 8), 0, "lane 0 was non-zero");
+        assert_ne!(rsp.vu_ctrl.vco & (1 << 9), 0, "lane 1 was non-zero");
+        assert_eq!(rsp.vu_ctrl.vco & (1 << 10), 0, "lane 2 was zero");
+    }
+
+    /// **`VABS` applies the sign of `vs` to `vt`** — it is not the absolute
+    /// value of either operand, which is what the name suggests.
+    #[test]
+    fn vabs_applies_the_sign_of_vs_to_vt() {
+        let mut rsp = pair(
+            [0xFFFF, 0x0001, 0x0000, 0, 0, 0, 0, 0], // vs: negative, positive, zero
+            [0x0005, 0x0005, 0x0005, 0, 0, 0, 0, 0], // vt: 5 throughout
+        );
+        assert!(rsp.vu_compute(0x13, 0, 1, 0, 2));
+        assert_eq!(rsp.vu_regs[2][0], 0xFFFB, "negative vs negates vt");
+        assert_eq!(rsp.vu_regs[2][1], 5, "positive vs passes it through");
+        assert_eq!(rsp.vu_regs[2][2], 0, "zero vs yields zero, not 5");
+    }
+
+    /// The one input whose negation is not representable: `vd` saturates while
+    /// the **accumulator keeps the unsaturated value**, so the two disagree.
+    #[test]
+    fn vabs_of_the_most_negative_value_disagrees_with_its_accumulator() {
+        let mut rsp = pair([0xFFFF; 8], [0x8000; 8]);
+        rsp.vu_compute(0x13, 0, 1, 0, 2);
+        assert_eq!(rsp.vu_regs[2][0], 0x7FFF, "the result saturates");
+        assert_eq!(
+            (rsp.vu_acc[0] & 0xFFFF) as u16,
+            0x8000,
+            "the accumulator does not"
+        );
+    }
+}
+
+#[cfg(test)]
+mod compare_tests {
+    use super::*;
+
+    fn pair(a: [u16; 8], b: [u16; 8]) -> Rsp {
+        let mut rsp = Rsp::new();
+        rsp.vu_regs[1] = a; // vs
+        rsp.vu_regs[0] = b; // vt
+        rsp
+    }
+
+    /// **A compare writes a *selection*, not a boolean.** `vd` receives `vs` or
+    /// `vt` per lane; the predicate goes to `VCC`. An implementation that wrote
+    /// 0/1 into `vd` would satisfy any test that only inspected `VCC`.
+    #[test]
+    fn a_compare_selects_an_operand_and_records_the_predicate() {
+        let mut rsp = pair([1, 9, 5, 0, 0, 0, 0, 0], [5, 5, 5, 0, 0, 0, 0, 0]);
+        assert!(rsp.vu_compute(0x20, 0, 1, 0, 2)); // VLT
+
+        assert_eq!(rsp.vu_regs[2][0], 1, "1 < 5, so vs is selected");
+        assert_eq!(rsp.vu_regs[2][1], 5, "9 !< 5, so vt is");
+        assert_eq!(rsp.vu_ctrl.vcc & 0b011, 0b001, "only lane 0 compared true");
+        assert_eq!(rsp.vu_ctrl.vcc >> 8, 0, "VCC's high half is cleared");
+    }
+
+    /// **`VLT`'s equality case consults `VCO`**, which is what chains it onto a
+    /// preceding `VSUBC`. Dropping the `VCO` terms leaves a compare that looks
+    /// right on unequal operands and wrong on equal ones — the exact case a
+    /// casual test omits.
+    #[test]
+    fn vlt_on_equal_operands_depends_on_vco() {
+        // Equal operands, with both VCO halves set for lane 0 only.
+        let mut rsp = pair([5; 8], [5; 8]);
+        rsp.vu_ctrl.vco = (1 << 0) | (1 << 8);
+        rsp.vu_compute(0x20, 0, 1, 0, 2);
+        assert_ne!(rsp.vu_ctrl.vcc & 1, 0, "equal + carry + ne compares true");
+        assert_eq!(rsp.vu_ctrl.vcc & 2, 0, "lane 1 has neither, so false");
+
+        // Same operands, no VCO: now false everywhere.
+        let mut rsp = pair([5; 8], [5; 8]);
+        rsp.vu_compute(0x20, 0, 1, 0, 2);
+        assert_eq!(rsp.vu_ctrl.vcc, 0, "without VCO, equal is not less-than");
+    }
+
+    /// `VGE`'s equality case uses the **opposite** VCO condition to `VLT`'s, so
+    /// the two are not complements of each other on equal operands.
+    #[test]
+    fn vge_and_vlt_are_not_complements_on_equal_operands() {
+        let mut lt = pair([5; 8], [5; 8]);
+        lt.vu_ctrl.vco = (1 << 0) | (1 << 8);
+        lt.vu_compute(0x20, 0, 1, 0, 2);
+
+        let mut ge = pair([5; 8], [5; 8]);
+        ge.vu_ctrl.vco = (1 << 0) | (1 << 8);
+        ge.vu_compute(0x23, 0, 1, 0, 2);
+
+        assert_ne!(lt.vu_ctrl.vcc & 1, 0, "VLT true for lane 0");
+        assert_eq!(
+            ge.vu_ctrl.vcc & 1,
+            0,
+            "and VGE ALSO false -- not a negation"
+        );
+    }
+
+    /// `VEQ` and `VNE` consult `VCO`'s **high** half (the non-zero flag) rather
+    /// than its carry.
+    #[test]
+    fn veq_and_vne_consult_the_non_zero_flag() {
+        let mut rsp = pair([5; 8], [5; 8]);
+        rsp.vu_ctrl.vco = 1 << 8; // lane 0's "non-zero" flag
+        rsp.vu_compute(0x21, 0, 1, 0, 2); // VEQ
+        assert_eq!(rsp.vu_ctrl.vcc & 1, 0, "equal, but the ne flag suppresses");
+        assert_ne!(rsp.vu_ctrl.vcc & 2, 0, "lane 1 has no flag, so equal holds");
+
+        let mut rsp = pair([5; 8], [5; 8]);
+        rsp.vu_ctrl.vco = 1 << 8;
+        rsp.vu_compute(0x22, 0, 1, 0, 2); // VNE
+        assert_ne!(rsp.vu_ctrl.vcc & 1, 0, "the flag forces not-equal");
+        assert_eq!(rsp.vu_ctrl.vcc & 2, 0, "lane 1 is genuinely equal");
+    }
+
+    /// **`VMRG` consumes `VCC` without changing it** — it is the consumer of a
+    /// compare, not another producer. It still clears `VCO`.
+    #[test]
+    fn vmrg_selects_on_vcc_and_leaves_it_alone() {
+        let mut rsp = pair([0xAAAA; 8], [0xBBBB; 8]);
+        rsp.vu_ctrl.vcc = 0b1010_0101;
+        rsp.vu_ctrl.vco = 0xFFFF;
+        assert!(rsp.vu_compute(0x27, 0, 1, 0, 2));
+
+        assert_eq!(rsp.vu_regs[2][0], 0xAAAA, "VCC bit set selects vs");
+        assert_eq!(rsp.vu_regs[2][1], 0xBBBB, "clear selects vt");
+        assert_eq!(rsp.vu_ctrl.vcc, 0b1010_0101, "VCC survives untouched");
+        assert_eq!(rsp.vu_ctrl.vco, 0, "but VCO is cleared");
+    }
+
+    /// Every compare clears `VCO` wholesale, so a second compare does not
+    /// inherit the first's flags.
+    #[test]
+    fn a_compare_clears_vco() {
+        let mut rsp = pair([5; 8], [5; 8]);
+        rsp.vu_ctrl.vco = 0xFFFF;
+        rsp.vu_compute(0x21, 0, 1, 0, 2);
+        assert_eq!(rsp.vu_ctrl.vco, 0);
+    }
+}
+
+/// `VCH` and its `VCL`/`VCR` siblings write `VCC`/`VCO`/`VCE` together per lane.
+/// The expected flags below are computed by hand from **n64-systemtest's**
+/// reference algorithm (`op_vector_arithmetic.rs`), NOT from this code, so they
+/// stay valid under a mutation of the implementation.
+#[cfg(test)]
+mod clip_tests {
+    use super::*;
+
+    fn pair(vs: [u16; 8], vt: [u16; 8]) -> Rsp {
+        let mut rsp = Rsp::new();
+        rsp.vu_regs[1] = vs; // vs
+        rsp.vu_regs[0] = vt; // vt
+        rsp
+    }
+
+    /// **`VCH` exercises both branches, the `s == ~t` term, and `VCE`.** With
+    /// the suite's operand mapping (source1 -> vt, source2 -> vs) the reference
+    /// is `i1 = vt`, `i2 = vs`:
+    ///
+    /// - Lane 0 (`vs=5`, `vt=3`, same sign -> *else*): `diff = vs - vt = 2`, so
+    ///   `VCC.hi = (diff>=0) = 1`, `VCO.hi = (diff!=0) = 1`, everything else 0,
+    ///   output `= vt = 3`.
+    /// - Lane 1 (`vs=0xFFFB=-5`, `vt=4`, opposite sign -> *if*): `sum = -1`, so
+    ///   `VCC.lo = (sum<=0) = 1`, `VCO.lo = 1`, `VCE = (sum==-1) = 1`, and
+    ///   critically `VCO.hi = (sum!=0 && vs!=~vt) = (1 && 0) = 0` because
+    ///   `0xFFFB == ~4`; output `= -vt = 0xFFFC`.
+    ///
+    /// Dropping the `s != !t` term flips lane 1's `VCO.hi` on (VCO -> 0x0302);
+    /// collapsing the else-branch `VCO.hi` clears lane 0's (VCO -> 0x0002).
+    #[test]
+    fn vch_writes_the_three_flag_words_per_lane() {
+        let mut rsp = pair([5, 0xFFFB, 0, 0, 0, 0, 0, 0], [3, 0x0004, 0, 0, 0, 0, 0, 0]);
+        assert!(rsp.vu_compute(0x25, 0, 1, 0, 2));
+
+        assert_eq!(
+            rsp.vu_regs[2],
+            [3, 0xFFFC, 0, 0, 0, 0, 0, 0],
+            "selected output"
+        );
+        assert_eq!(rsp.vu_ctrl.vcc, 0xFD02, "VCC: hi=lanes!=1, lo=lane1");
+        assert_eq!(rsp.vu_ctrl.vco, 0x0102, "VCO: hi=lane0, lo=lane1");
+        assert_eq!(rsp.vu_ctrl.vce, 0x02, "VCE: lane1 only (sum == -1)");
+    }
+
+    /// **`VCL` and `VCR` clear `VCO` and `VCE` after they run; `VCH` does not.**
+    /// The whole point of the pair is to *consume* the flags a preceding compare
+    /// left, so a stale `VCO` would corrupt the next multi-precision step.
+    #[test]
+    fn vcl_and_vcr_clear_vco_and_vce_but_vch_does_not() {
+        for op in [0x24u32, 0x26] {
+            let mut rsp = pair([1; 8], [2; 8]);
+            rsp.vu_ctrl.vco = 0xFFFF;
+            rsp.vu_ctrl.vce = 0xFF;
+            assert!(rsp.vu_compute(op, 0, 1, 0, 2));
+            assert_eq!(rsp.vu_ctrl.vco, 0, "op {op:#x} clears VCO");
+            assert_eq!(rsp.vu_ctrl.vce, 0, "op {op:#x} clears VCE");
+        }
+
+        // VCH keeps them: it is the producer, not the consumer.
+        let mut rsp = pair([1; 8], [2; 8]);
+        rsp.vu_compute(0x25, 0, 1, 0, 2);
+        assert_ne!(rsp.vu_ctrl.vco, 0, "VCH leaves VCO set");
+    }
+}
+
+/// The reserved "VZERO" opcode family. n64-systemtest pins all of them to one
+/// `run_vzero` reference: `ACC_LO = vs + vt`, `vd = 0`, flags untouched.
+#[cfg(test)]
+mod vzero_tests {
+    use super::*;
+
+    /// **Every reserved op writes the sum to `ACC_LO` and zeroes `vd`.** The
+    /// `vd` sentinel (`0xDEAD`) is what makes a *decoded* no-op visible: an
+    /// instruction that fell through the decode would leave it in place. The
+    /// expected `ACC_LO` is `vs + vt` computed from the seeds, not the code, and
+    /// the flag words are checked to prove the family touches none of them.
+    #[test]
+    fn reserved_ops_sum_into_acc_low_and_zero_vd() {
+        let vs = [10u16, 20, 0xFFFF, 0x8000, 1, 2, 3, 0x7FFF];
+        let vt = [5u16, 0x7FFF, 2, 0x8000, 0, 0, 0, 1];
+        // One representative from each disjoint funct band.
+        for op in [0x12u32, 0x16, 0x1C, 0x1E, 0x2E, 0x38, 0x3E] {
+            let mut rsp = Rsp::new();
+            rsp.vu_regs[1] = vs;
+            rsp.vu_regs[0] = vt;
+            rsp.vu_regs[2] = [0xDEAD; 8];
+            rsp.vu_ctrl.vco = 0xABCD;
+            rsp.vu_ctrl.vcc = 0x1234;
+            rsp.vu_ctrl.vce = 0x56;
+            assert!(rsp.vu_compute(op, 0, 1, 0, 2), "op {op:#x} is decoded");
+            for lane in 0..8 {
+                assert_eq!(rsp.vu_regs[2][lane], 0, "op {op:#x} zeroes vd lane {lane}");
+                assert_eq!(
+                    (rsp.vu_acc[lane] & 0xFFFF) as u16,
+                    vs[lane].wrapping_add(vt[lane]),
+                    "op {op:#x} ACC_LO lane {lane} = vs + vt"
+                );
+            }
+            assert_eq!(rsp.vu_ctrl.vco, 0xABCD, "op {op:#x} leaves VCO");
+            assert_eq!(rsp.vu_ctrl.vcc, 0x1234, "op {op:#x} leaves VCC");
+            assert_eq!(rsp.vu_ctrl.vce, 0x56, "op {op:#x} leaves VCE");
+        }
+    }
+}
+
+#[cfg(test)]
+mod vrnd_tests {
+    use super::*;
+
+    /// The suite primes the accumulator with `VMUDH` then `VMADL`, using these
+    /// two vectors, before running `VRND`.
+    const V0: [u16; 8] = [
+        0x0000, 0x0001, 0x0001, 0x7FFF, 0xFFFF, 0x7FFF, 0x3FFF, 0x8000,
+    ];
+    const V1: [u16; 8] = [
+        0x0000, 0x0001, 0xFFFF, 0xFFFF, 0xFFFF, 0x7FFF, 0x7FFF, 0x7FFF,
+    ];
+    /// The `vt` input to VRND (`0x20`); its odd lanes are ignored by the suite.
+    const VT: [u16; 8] = [
+        0x0000, 0x0001, 0x0002, 0x7FFF, 0xFFFF, 0x8000, 0x8001, 0x8002,
+    ];
+
+    /// Prime the accumulator the way the oracle does: `V0=$v0`, `V1=$v1`,
+    /// `vmudh $v2,$v0,$v1` then `vmadl $v2,$v0,$v1`.
+    fn primed() -> Rsp {
+        let mut rsp = Rsp::new();
+        rsp.vu_regs[0] = V0;
+        rsp.vu_regs[1] = V1;
+        rsp.vu_compute(0x07, 0, 0, 1, 2); // VMUDH: vs=$v0, vt=$v1
+        rsp.vu_compute(0x0C, 0, 0, 1, 2); // VMADL
+        rsp
+    }
+
+    fn acc_slice(rsp: &Rsp, shift: u32) -> [u16; 8] {
+        core::array::from_fn(|i| (rsp.vu_acc[i] >> shift) as u16)
+    }
+
+    /// **`VRNDN` against n64-systemtest's vectors**, with an **even** `vs` field
+    /// (no shift). Result and all three accumulator slices, because VRND writes
+    /// the whole 48-bit accumulator and the result alone hides the low bits.
+    #[test]
+    fn vrndn_matches_the_oracle_with_an_even_vs() {
+        let mut rsp = primed();
+        // vt is $v0 in the oracle's i==0 case; vs field is register 0 (even).
+        rsp.vu_regs[0] = VT;
+        assert!(rsp.vu_compute(0x0A, 0, 0, 0, 2));
+
+        assert_eq!(
+            rsp.vu_regs[2],
+            [0, 1, 0xFFFF, 0x8001, 1, 0x7FFF, 0x7FFF, 0x8000],
+            "VRNDN result"
+        );
+        assert_eq!(
+            acc_slice(&rsp, 32),
+            [0, 0, 0xFFFF, 0xFFFF, 0, 0x3FFF, 0x1FFF, 0xC000],
+            "ACC_HI"
+        );
+        assert_eq!(
+            acc_slice(&rsp, 16),
+            [0, 1, 0xFFFF, 0x8001, 1, 1, 0x4001, 0x7FFF],
+            "ACC_MD"
+        );
+        assert_eq!(
+            acc_slice(&rsp, 0),
+            [0, 0, 2, 0xFFFD, 0xFFFE, 0x3FFF, 0x1FFF, 0xC001],
+            "ACC_LO"
+        );
+    }
+
+    /// **The low bit of the `vs` field shifts the product left 16.** An even
+    /// and an odd `vs` over the same operand must differ, which is the only
+    /// thing that distinguishes the field-as-immediate reading from treating
+    /// `vs` as a register.
+    #[test]
+    fn the_vs_field_low_bit_selects_the_shift() {
+        let mut even = primed();
+        even.vu_regs[0] = VT;
+        even.vu_compute(0x0A, 0, 0, 0, 2); // vs field 0
+
+        let mut odd = primed();
+        odd.vu_regs[0] = VT;
+        odd.vu_compute(0x0A, 0, 1, 0, 2); // vs field 1 -> shift
+
+        assert_ne!(
+            even.vu_regs[2], odd.vu_regs[2],
+            "an odd vs field shifts the product and must change the result"
+        );
+    }
+
+    /// **`VRNDP` against n64-systemtest's vectors.** It shares everything with
+    /// `VRNDN` except the sign condition — `VRNDP` adds on a non-negative
+    /// accumulator — so its `ACC_HI` slice is identical to `VRNDN`'s while `ACC_MD`,
+    /// `ACC_LO` and the result diverge wherever a lane's accumulator sign differs.
+    /// Asserting the full published vector pins that divergence exactly, without
+    /// having to reason about which lanes are negative.
+    #[test]
+    fn vrndp_matches_the_oracle_with_an_even_vs() {
+        let mut rsp = primed();
+        rsp.vu_regs[0] = VT;
+        assert!(rsp.vu_compute(0x02, 0, 0, 0, 2));
+
+        assert_eq!(
+            rsp.vu_regs[2],
+            [0, 1, 0xFFFF, 0x8001, 1, 0x7FFF, 0x7FFF, 0x8000],
+            "VRNDP result"
+        );
+        assert_eq!(
+            acc_slice(&rsp, 32),
+            [0, 0, 0xFFFF, 0xFFFF, 0, 0x3FFF, 0x1FFF, 0xC000],
+            "ACC_HI -- identical to VRNDN's"
+        );
+        assert_eq!(
+            acc_slice(&rsp, 16),
+            [0, 1, 0xFFFF, 0x8001, 1, 0, 0x4000, 0x8000],
+            "ACC_MD"
+        );
+        assert_eq!(
+            acc_slice(&rsp, 0),
+            [0, 1, 0, 0x7FFE, 0xFFFD, 0xBFFF, 0xA000, 0x3FFF],
+            "ACC_LO"
+        );
+    }
+}
+
+#[cfg(test)]
+mod vmulq_tests {
+    use super::*;
+
+    const VS: [u16; 8] = [
+        0x0000, 0x0001, 0x7FFF, 0x7FFF, 0x8000, 0x8000, 0xFFFE, 0xFFFF,
+    ];
+    const VT: [u16; 8] = [
+        0x0000, 0x0001, 0x7FFF, 0xFFFF, 0x7FFF, 0x7FFF, 0x0001, 0x0001,
+    ];
+
+    fn seeded() -> Rsp {
+        let mut rsp = Rsp::new();
+        rsp.vu_regs[0] = VS; // used as vs
+        rsp.vu_regs[1] = VT;
+        rsp
+    }
+
+    fn acc_slice(rsp: &Rsp, shift: u32) -> [u16; 8] {
+        core::array::from_fn(|i| (rsp.vu_acc[i] >> shift) as u16)
+    }
+
+    /// **`VMULQ` against n64-systemtest's vectors.** The result's low 4 bits are
+    /// masked off and `ACC_LO` is always zero — two properties a naive multiply
+    /// gets wrong and the accumulator slices expose.
+    #[test]
+    fn vmulq_matches_the_oracle_vectors() {
+        let mut rsp = seeded();
+        assert!(rsp.vu_compute(0x03, 0, 0, 1, 2));
+        assert_eq!(
+            rsp.vu_regs[2],
+            [0, 0, 0x7FF0, 0xC010, 0x8000, 0x8000, 0, 0],
+            "VMULQ result -- note the low nibble is always clear"
+        );
+        assert_eq!(
+            acc_slice(&rsp, 32),
+            [0, 0, 0x3FFF, 0xFFFF, 0xC000, 0xC000, 0, 0],
+            "ACC_HI"
+        );
+        assert_eq!(
+            acc_slice(&rsp, 16),
+            [0, 1, 1, 0x8020, 0x801F, 0x801F, 0x1D, 0x1E],
+            "ACC_MD"
+        );
+        assert_eq!(acc_slice(&rsp, 0), [0; 8], "ACC_LO is zeroed");
+    }
+
+    /// **The result always has its low 4 bits clear**, independent of the
+    /// operands — the `& ~15` is not incidental.
+    #[test]
+    fn vmulq_masks_the_low_nibble() {
+        let mut rsp = Rsp::new();
+        rsp.vu_regs[0] = [0x00FF; 8];
+        rsp.vu_regs[1] = [0x00FF; 8];
+        rsp.vu_compute(0x03, 0, 0, 1, 2);
+        for lane in 0..8 {
+            assert_eq!(rsp.vu_regs[2][lane] & 15, 0, "lane {lane} low nibble");
+        }
+    }
+}
+
+#[cfg(test)]
+mod packed_tests {
+    use super::*;
+
+    fn with_dmem(pattern: &[u8]) -> Rsp {
+        let mut rsp = Rsp::new();
+        for (i, b) in pattern.iter().enumerate() {
+            rsp.dmem[i] = *b;
+        }
+        rsp
+    }
+
+    /// **`LPV` loads one byte per lane into the lane's high byte.**
+    ///
+    /// Each of the eight lanes takes a consecutive DMEM byte and places it at
+    /// bit 15, so the low byte of every lane is zero — a property a 16-bit load
+    /// would not have.
+    #[test]
+    fn lpv_loads_one_byte_per_lane_high() {
+        let bytes: [u8; 8] = core::array::from_fn(|i| i as u8 + 0x10);
+        let mut rsp = with_dmem(&bytes);
+        assert!(rsp.vector_mem(false, 0x06, 0, 1, 0, 0));
+        for (lane, &b) in bytes.iter().enumerate() {
+            assert_eq!(
+                rsp.vu_regs[1][lane],
+                u16::from(b) << 8,
+                "lane {lane} in the high byte"
+            );
+        }
+    }
+
+    /// **`LUV` is `LPV` shifted one bit lower** — bit 14 rather than 15.
+    #[test]
+    fn luv_shifts_one_bit_below_lpv() {
+        let bytes: [u8; 8] = core::array::from_fn(|i| i as u8 + 0x10);
+        let mut rsp = with_dmem(&bytes);
+        assert!(rsp.vector_mem(false, 0x07, 0, 1, 0, 0));
+        for (lane, &b) in bytes.iter().enumerate() {
+            assert_eq!(rsp.vu_regs[1][lane], u16::from(b) << 7);
+        }
+    }
+
+    /// The element field rotates which DMEM byte each lane reads, wrapping
+    /// within the 16-byte window — the packed loads' equivalent of an offset.
+    #[test]
+    fn lpv_element_rotates_the_source_bytes() {
+        let bytes: [u8; 16] = core::array::from_fn(|i| i as u8 + 0x10);
+        let mut base = with_dmem(&bytes);
+        base.vector_mem(false, 0x06, 0, 1, 0, 0);
+        let mut rot = with_dmem(&bytes);
+        rot.vector_mem(false, 0x06, 0, 1, 1, 0); // element 1
+        assert_ne!(
+            base.vu_regs[1], rot.vu_regs[1],
+            "a non-zero element must rotate the mapping"
+        );
+    }
+
+    /// **The `SPV`/`SUV` branch split only appears when the element field
+    /// pushes an offset past 8**, and `SPV`/`SUV` take opposite branches.
+    ///
+    /// With `e = 4` the eight offsets are `4..=11`: the first four (`< 8`) take
+    /// one branch and the last four the other. This test computes the reference
+    /// exactly as the hardware model does, per byte, rather than asserting a
+    /// summary — my earlier attempts at a summary were wrong three times because
+    /// the split is genuinely position-dependent.
+    #[test]
+    fn spv_and_suv_take_opposite_branches() {
+        let regs: [u16; 8] =
+            core::array::from_fn(|lane| ((0x10 + lane as u16) << 8) | (0x80 + lane as u16));
+        // The reference: for offset in e..e+8, byte comes from the high byte
+        // when (offset & 15 < 8) for SPV, or the opposite for SUV.
+        let expect = |suv: bool, e: usize| -> [u8; 8] {
+            core::array::from_fn(|i| {
+                let offset = e + i;
+                let lane = offset & 7;
+                let high = (offset & 15 < 8) != suv;
+                if high {
+                    (regs[lane] >> 8) as u8
+                } else {
+                    (regs[lane] >> 7) as u8
+                }
+            })
+        };
+
+        for (op, suv) in [(0x06u32, false), (0x07u32, true)] {
+            let mut rsp = Rsp::new();
+            rsp.vu_regs[1] = regs;
+            rsp.set_su(2, 0x100);
+            assert!(rsp.vector_mem(true, op, 2, 1, 4, 0)); // e = 4
+            let got: [u8; 8] = core::array::from_fn(|i| rsp.dmem[0x100 + i]);
+            assert_eq!(
+                got,
+                expect(suv, 4),
+                "{} with e=4",
+                if suv { "SUV" } else { "SPV" }
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod strided_tests {
+    use super::*;
+
+    /// **`LHV` reads every *other* DMEM byte, one per lane**, placing it at
+    /// bit 14. With `rs = 0`, `e = 0` the eight lanes take bytes 0, 2, 4 … 14.
+    /// Expected values were computed independently before being pinned here.
+    #[test]
+    fn lhv_reads_every_other_byte() {
+        let bytes: [u8; 16] = core::array::from_fn(|i| i as u8 + 0x10);
+        let mut rsp = Rsp::new();
+        for (i, b) in bytes.iter().enumerate() {
+            rsp.dmem[i] = *b;
+        }
+        assert!(rsp.vector_mem(false, 0x08, 0, 1, 0, 0));
+        assert_eq!(
+            rsp.vu_regs[1],
+            [
+                0x0800, 0x0900, 0x0A00, 0x0B00, 0x0C00, 0x0D00, 0x0E00, 0x0F00
+            ],
+            "each lane holds byte (2*lane) at bit 14"
+        );
+    }
+
+    /// **`SHV` combines each adjacent byte pair of the register into one strided
+    /// DMEM byte** (`hi << 1 | lo >> 7`). The eight results land at DMEM 0, 2,
+    /// 4 … 14. Independently computed.
+    #[test]
+    fn shv_combines_adjacent_bytes() {
+        let mut rsp = Rsp::new();
+        rsp.vu_regs[1] = core::array::from_fn(|l| ((0x10 + l as u16) << 8) | (0x80 + l as u16));
+        rsp.set_su(2, 0);
+        assert!(rsp.vector_mem(true, 0x08, 2, 1, 0, 0));
+
+        let expected: [(usize, u8); 8] = [
+            (0x0, 0x21),
+            (0x2, 0x23),
+            (0x4, 0x25),
+            (0x6, 0x27),
+            (0x8, 0x29),
+            (0xA, 0x2B),
+            (0xC, 0x2D),
+            (0xE, 0x2F),
+        ];
+        for (at, want) in expected {
+            assert_eq!(rsp.dmem[at], want, "DMEM byte {at:#x}");
+        }
+        // The odd bytes between them are untouched.
+        assert_eq!(rsp.dmem[0x1], 0, "byte 1 is not written");
+    }
+}
+
+#[cfg(test)]
+mod transpose_tests {
+    use super::*;
+
+    /// **`LTV` loads a transposed *diagonal*** — each of the eight registers in
+    /// the group gets one lane filled, at a rotating position. With `rs = 0`,
+    /// `e = 0` and DMEM `0x10..0x1F`, register `v_r` receives its `r`-th lane.
+    /// The expected diagonal was computed in a scratch script first.
+    #[test]
+    fn ltv_loads_a_transposed_diagonal() {
+        let mut rsp = Rsp::new();
+        for i in 0..16 {
+            rsp.dmem[i] = 0x10 + i as u8;
+        }
+        assert!(rsp.vector_mem(false, 0x0B, 0, 0, 0, 0)); // vt=0 -> group 0..7
+        let diag: [u16; 8] = [
+            0x1011, 0x1213, 0x1415, 0x1617, 0x1819, 0x1A1B, 0x1C1D, 0x1E1F,
+        ];
+        for (r, &want) in diag.iter().enumerate() {
+            assert_eq!(rsp.vu_regs[r][r], want, "register {r}, diagonal lane");
+            // Every other lane in that register stays zero.
+            for l in 0..8 {
+                if l != r {
+                    assert_eq!(rsp.vu_regs[r][l], 0, "reg {r} lane {l} untouched");
+                }
+            }
+        }
+    }
+
+    /// **`STV` stores the transposed diagonal back out.** Register `v_r`, byte
+    /// `b` is seeded to `0x10*r + b` so every byte in the group is distinct;
+    /// the expected DMEM pattern was computed independently.
+    #[test]
+    fn stv_stores_a_transposed_diagonal() {
+        let mut rsp = Rsp::new();
+        for r in 0..8usize {
+            for b in 0..16usize {
+                let byte = (0x10 * r + b) as u8;
+                rsp.set_vu_byte(r, b, byte);
+            }
+        }
+        rsp.set_su(2, 0);
+        assert!(rsp.vector_mem(true, 0x0B, 2, 0, 0, 0)); // vt=0 -> group 0..7
+        let expected: [u8; 16] = [
+            0x00, 0x01, 0x12, 0x13, 0x24, 0x25, 0x36, 0x37, 0x48, 0x49, 0x5A, 0x5B, 0x6C, 0x6D,
+            0x7E, 0x7F,
+        ];
+        for (i, want) in expected.iter().enumerate() {
+            assert_eq!(rsp.dmem[i], *want, "DMEM byte {i}");
+        }
+    }
+}
+
+/// Store-side register wrap. Loads shorten on a non-zero element; **stores wrap
+/// the register index and move the full width** (`op_vector_stores.rs:17`). The
+/// expected DMEM below is computed by hand from that rule, not from the code, so
+/// it fails if the store silently adopts the load's shortening behavior.
+#[cfg(test)]
+mod store_wrap_tests {
+    use super::*;
+
+    fn seeded() -> Rsp {
+        let mut rsp = Rsp::new();
+        // Register 1, byte b = 0xA0 + b: every byte distinct so a wrap shows.
+        for b in 0..16usize {
+            rsp.set_vu_byte(1, b, 0xA0 + b as u8);
+        }
+        rsp
+    }
+
+    /// **`SQV [e=1]` on an aligned address writes 16 bytes, the last wrapped.**
+    /// Bytes 1..15 land at DMEM 0..14; byte 0 wraps to DMEM 15. The load rule
+    /// (`16 - e = 15` bytes) would leave DMEM 15 untouched.
+    #[test]
+    fn sqv_wraps_the_register_tail() {
+        let mut rsp = seeded();
+        rsp.set_su(0, 0);
+        assert!(rsp.vector_mem(true, 0x04, 0, 1, 1, 0));
+        let expected: [u8; 16] = [
+            0xA1, 0xA2, 0xA3, 0xA4, 0xA5, 0xA6, 0xA7, 0xA8, 0xA9, 0xAA, 0xAB, 0xAC, 0xAD, 0xAE,
+            0xAF, 0xA0,
+        ];
+        for (i, want) in expected.iter().enumerate() {
+            assert_eq!(rsp.dmem[i], *want, "DMEM byte {i}");
+        }
+    }
+
+    /// **`SWV` rotates all 16 bytes within the window anchored to the 8-byte
+    /// base.** With `ea = 3`, base is `0` and `misalignment` is `3`, so byte `i`
+    /// lands at DMEM `(3 + i) & 15`; the last three wrap to DMEM 0..2.
+    #[test]
+    fn swv_rotates_within_the_eight_byte_window() {
+        let mut rsp = seeded();
+        rsp.set_su(2, 3);
+        assert!(rsp.vector_mem(true, 0x0A, 2, 1, 0, 0));
+        let expected: [u8; 16] = [
+            0xAD, 0xAE, 0xAF, 0xA0, 0xA1, 0xA2, 0xA3, 0xA4, 0xA5, 0xA6, 0xA7, 0xA8, 0xA9, 0xAA,
+            0xAB, 0xAC,
+        ];
+        for (i, want) in expected.iter().enumerate() {
+            assert_eq!(rsp.dmem[i], *want, "DMEM byte {i}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod lfv_tests {
+    use super::*;
+
+    fn with_dmem() -> Rsp {
+        let mut rsp = Rsp::new();
+        for i in 0..16 {
+            rsp.dmem[i] = 0x10 + i as u8;
+        }
+        rsp
+    }
+
+    /// **`LFV` at `e = 0` writes only the first four lanes** — its length is
+    /// `min(8, 16 - e)` *bytes*, so a zero element fills bytes 0..8 = lanes 0..3
+    /// and leaves the upper half untouched. Computed from n64-systemtest's own
+    /// reference.
+    #[test]
+    fn lfv_at_element_zero_fills_the_low_half() {
+        let mut rsp = with_dmem();
+        assert!(rsp.vector_mem(false, 0x09, 0, 1, 0, 0));
+        assert_eq!(rsp.vu_regs[1], [0x0800, 0x0A00, 0x0C00, 0x0E00, 0, 0, 0, 0]);
+    }
+
+    /// **`LFV` at `e = 4` follows a different offset pattern** — this is the
+    /// case where ares and the suite reference diverge, and the value here is
+    /// the suite's. The partial write now touches bytes 4..12 = lanes 2..5,
+    /// leaving lanes 0, 1, 6, 7 as they were.
+    #[test]
+    fn lfv_at_element_four_matches_the_suite_not_ares() {
+        let mut rsp = with_dmem();
+        assert!(rsp.vector_mem(false, 0x09, 0, 1, 4, 0));
+        assert_eq!(rsp.vu_regs[1], [0, 0, 0x0A00, 0x0C00, 0x0A00, 0x0C00, 0, 0]);
+    }
+}
+
+#[cfg(test)]
+mod sfv_tests {
+    use super::*;
+
+    fn seeded() -> Rsp {
+        let mut rsp = Rsp::new();
+        // Lane l = (l+1) << 8, so lane>>7 = (l+1)<<1 -- distinct per lane.
+        rsp.vu_regs[1] = core::array::from_fn(|l| (l as u16 + 1) << 8);
+        rsp.set_su(2, 0);
+        rsp
+    }
+
+    /// **`SFV` writes four bytes, source lanes chosen by an `e`-table.** `e=0`
+    /// takes lanes 0..3; `e=4` rotates to 1,2,3,0. Values computed from the
+    /// suite reference.
+    #[test]
+    fn sfv_selects_source_lanes_by_element() {
+        let mut rsp = seeded();
+        assert!(rsp.vector_mem(true, 0x09, 2, 1, 0, 0)); // e=0
+        assert_eq!(
+            [rsp.dmem[0], rsp.dmem[4], rsp.dmem[8], rsp.dmem[12]],
+            [2, 4, 6, 8]
+        );
+
+        let mut rsp = seeded();
+        assert!(rsp.vector_mem(true, 0x09, 2, 1, 4, 0)); // e=4 -> lanes 1,2,3,0
+        assert_eq!(
+            [rsp.dmem[0], rsp.dmem[4], rsp.dmem[8], rsp.dmem[12]],
+            [4, 6, 8, 2]
+        );
+    }
+
+    /// **An `e` outside the table writes zero, not a wrapped lane.** This is the
+    /// "even 0 for some E" case; a table-less implementation would store some
+    /// plausible lane instead.
+    #[test]
+    fn sfv_writes_zero_for_an_undefined_element() {
+        let mut rsp = seeded();
+        // Seed the DMEM non-zero so a zero write is visible.
+        for i in 0..16 {
+            rsp.dmem[i] = 0xEE;
+        }
+        assert!(rsp.vector_mem(true, 0x09, 2, 1, 2, 0)); // e=2 not in table
+        assert_eq!(
+            [rsp.dmem[0], rsp.dmem[4], rsp.dmem[8], rsp.dmem[12]],
+            [0, 0, 0, 0],
+            "undefined e writes real zeros"
+        );
+        assert_eq!(rsp.dmem[1], 0xEE, "untouched bytes stay");
+    }
+}
+
+#[cfg(test)]
+mod vmacq_tests {
+    use super::*;
+
+    /// Seed one lane's accumulator from its three 16-bit slices.
+    fn set_acc_slices(rsp: &mut Rsp, lane: usize, top: u16, mid: u16, low: u16) {
+        rsp.vu_acc[lane] = (u64::from(top) << 32) | (u64::from(mid) << 16) | u64::from(low);
+    }
+
+    /// **`VMACQ` against n64-systemtest's `simulate`.** Each case is
+    /// `(top, mid, low) -> (vd, ACC_HI, ACC_MD, ACC_LO)`, computed by running
+    /// the suite's reference in a scratch script.
+    #[test]
+    fn vmacq_matches_the_suite_simulate() {
+        // (top, mid, low, vd, ACC_HI, ACC_MD, ACC_LO)
+        let cases: [[u16; 7]; 5] = [
+            [0, 0, 0, 0, 0, 0, 0],
+            [0, 0x40, 0, 0x10, 0, 0x20, 0],
+            [0, 0x10, 0, 0, 0, 0x10, 0],
+            [0xFFFF, 0xFF00, 0, 0xFF90, 0xFFFF, 0xFF20, 0],
+            [0, 0x80, 0x1234, 0x30, 0, 0x60, 0x1234],
+        ];
+        for [top, mid, low, vd, ah, am, al] in cases {
+            let mut rsp = Rsp::new();
+            set_acc_slices(&mut rsp, 0, top, mid, low);
+            assert!(rsp.vu_compute(0x0B, 0, 0, 0, 2));
+            assert_eq!(rsp.vu_regs[2][0], vd, "vd for ({top:#x},{mid:#x},{low:#x})");
+            assert_eq!((rsp.vu_acc[0] >> 32) as u16, ah, "ACC_HI");
+            assert_eq!((rsp.vu_acc[0] >> 16) as u16, am, "ACC_MD");
+            assert_eq!(rsp.vu_acc[0] as u16, al, "ACC_LO preserved");
+        }
+    }
+
+    /// **`ACC_LO` is preserved** — the nudge is at bit 21, above it. A whole-
+    /// accumulator rewrite that recomputed the low slice would corrupt it.
+    #[test]
+    fn vmacq_preserves_the_low_slice() {
+        let mut rsp = Rsp::new();
+        set_acc_slices(&mut rsp, 0, 0, 0x40, 0xBEEF);
+        rsp.vu_compute(0x0B, 0, 0, 0, 2);
+        assert_eq!(rsp.vu_acc[0] as u16, 0xBEEF, "the low slice is untouched");
+    }
+
+    /// **The result's low nibble is always clear** (`& 0xFFF0`).
+    #[test]
+    fn vmacq_masks_the_low_nibble() {
+        let mut rsp = Rsp::new();
+        set_acc_slices(&mut rsp, 0, 0, 0x7F, 0xFFFF);
+        rsp.vu_compute(0x0B, 0, 0, 0, 2);
+        assert_eq!(rsp.vu_regs[2][0] & 0xF, 0);
+    }
+}

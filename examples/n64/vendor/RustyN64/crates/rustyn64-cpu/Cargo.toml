@@ -1,0 +1,30 @@
+[package]
+name = "rustyn64-cpu"
+version = "0.8.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[features]
+default = ["std"]
+std = []
+# ADR 0013: the instruction-granular execution path. Default-OFF and additive —
+# with it disabled this crate contains no behavior change at all, because the fast
+# path is a separate entry point (`Cpu::step_instruction_at`) in a module that does
+# not exist without the feature, rather than a branch inside `tick_at`. It adds no
+# field to `Pipeline`, so the save-state layout is identical either way and ADR
+# 0011 §4's mode marker is not owed yet.
+fast-exec = []
+# Instruction-classification census (ADR 0006: counters only, nothing schedules
+# against them). Used to size a fast commit path before writing one.
+work-counters = []
+
+[dependencies]
+bitflags = { version = "2", features = ["serde"] }
+serde = { version = "1", default-features = false, features = ["derive", "alloc"] }
+serde-big-array = "0.5"
+rustyn64-snapshot = { path = "../rustyn64-snapshot" }
+
+[lints]
+workspace = true

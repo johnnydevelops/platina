@@ -1,0 +1,15 @@
+{
+  "name": "n64",
+  "tree": {
+    "$className": "DataModel",
+    "ReplicatedStorage": {
+      "N64": { "$path": "out/n64.luau" },
+      "Rom": { "$path": "place/rom" }
+    },
+    "StarterPlayer": {
+      "StarterPlayerScripts": {
+        "RunN64": { "$path": "place/RunN64.client.luau" }
+      }
+    }
+  }
+}

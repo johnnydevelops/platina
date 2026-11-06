@@ -1,0 +1,1480 @@
+//! FPU arithmetic (T-13-002).
+//!
+//! Pure functions over IEEE-754 values, with the VR4300's `FCSR` semantics
+//! layered on top. Kept separate from [`crate::fpr`] (the register file) and
+//! [`crate::cop1`] (the control registers) so each can be tested without the
+//! others.
+//!
+//! # Rounding
+//!
+//! `FCSR.RM` selects the mode (UM §7.2.4): 0 nearest-even, 1 toward zero,
+//! 2 toward +∞, 3 toward −∞.
+//!
+//! **Every operation here honors it**, arithmetic included. The four
+//! arithmetic operations are adapters over [`crate::softfloat`], which takes
+//! the mode as a parameter and rounds exactly once; the conversions take a
+//! [`Rounding`] directly.
+//!
+//! This paragraph has been wrong in both directions and is worth reading
+//! carefully before it is edited again. It first claimed the modes applied
+//! throughout while the arithmetic ignored them; it was then corrected to say
+//! the arithmetic could not honor them, which became false when the soft-float
+//! path landed. See `docs/engineering-lessons.md` §3.3c — the rule is that a
+//! comment asserting *what the code does* goes stale silently, because no test
+//! fails when it is wrong.
+//!
+//! # What is deliberately absent
+//!
+//! The **FP multiplication erratum** is not here. It is a property of specific
+//! early console revisions (`n64brew_wiki/markdown/VR4300.md`) and belongs with
+//! the revision model, not with the arithmetic; implementing it inline would
+//! make every multiply on every console wrong.
+
+// Two lints are allowed for this module, both because the thing they warn about
+// is the thing being modeled:
+//
+//   * `cast_precision_loss` -- an FPU's conversion instructions exist precisely
+//     to lose precision in a defined way. The loss is the behavior, and it is
+//     reported through the Inexact flag rather than avoided.
+//   * `float_cmp` -- `C.EQ` is IEEE equality and the exactness checks are exact
+//     by definition. An epsilon here would make the emulator report relations
+//     and flags the hardware does not.
+#![allow(clippy::cast_precision_loss, clippy::float_cmp)]
+
+use serde::{Deserialize, Serialize};
+
+/// Which VR4300 stepping a console carries.
+///
+/// The only behavior that currently depends on it is the **FP multiplication
+/// erratum**, and that dependency is why this is modeled as console state
+/// rather than folded into `mul`: an unconditional erratum would make every
+/// multiply on *every* console wrong, and most consoles do not have it.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub enum Stepping {
+    /// A later stepping, with the multiplication erratum **fixed**.
+    ///
+    /// The default, because it is the majority of hardware and because the
+    /// erratum's output is undocumented — see [`Stepping::has_mul_erratum`].
+    #[default]
+    Fixed,
+    /// An early stepping carrying the erratum: NUS-01 and NUS-02 (Japan only)
+    /// and NUS-03 (the first US revision).
+    Early,
+}
+
+impl Stepping {
+    /// Does this stepping carry the FP multiplication erratum?
+    ///
+    /// # Why the erratum is not implemented
+    ///
+    /// The trigger is documented (`n64brew_wiki/markdown/VR4300.md`): a
+    /// multiply whose *preceding* multiply had a NaN, zero or infinity operand
+    /// *"may produce unexpected results"*. GCC's `-mfix4300` works around it by
+    /// inserting two `nop`s after every `MUL.S`/`MUL.D`/`MULT`.
+    ///
+    /// **What the corrupted output actually is has never been characterized** —
+    /// our own `ref-docs/2026-07-20-vr4300-timing-supplement.md` lists it under
+    /// undocumented constants, with only trigger conditions known. So the
+    /// erratum can be *detected* here but not *reproduced*, and inventing a
+    /// plausible wrong value would be exactly the fitted-constant failure
+    /// `docs/accuracy-ledger.md` forbids: every later result built on it would
+    /// stop being evidence.
+    ///
+    /// Accuracy-ledger **U-7**. Selecting [`Stepping::Early`] therefore changes
+    /// nothing yet — it exists so that when the output *is* characterized, the
+    /// switch is already in the right place rather than threaded through
+    /// afterwards.
+    #[must_use]
+    pub const fn has_mul_erratum(self) -> bool {
+        matches!(self, Self::Early)
+    }
+}
+
+/// Would the erratum's trigger condition fire for this multiply?
+///
+/// True when an operand of the **previous** multiply was a NaN, zero or
+/// infinity. Exposed so a future characterization has a tested trigger to hang
+/// the corrupted output on, and so a trace can flag affected instructions today.
+#[must_use]
+pub fn mul_erratum_triggers(prev_a: f64, prev_b: f64) -> bool {
+    let suspicious = |v: f64| v.is_nan() || v == 0.0 || v.is_infinite();
+    suspicious(prev_a) || suspicious(prev_b)
+}
+
+/// The `FCSR` cause/flag bits an operation can raise (UM §7.2.2).
+///
+/// # Completeness
+///
+/// All five are modeled for the four arithmetic operations, which compute
+/// through [`crate::softfloat`] and so have the exact pre-rounding result
+/// available. `inexact` and `underflow` were the two that previously never set
+/// for ordinary rounding — accuracy-ledger C-11 — and detecting them is
+/// precisely why that module exists.
+///
+/// Still **not** produced anywhere: the unmaskable *unimplemented-operation*
+/// cause (bit 17), which the VR4300 raises for subnormal operands and results.
+/// It is not an IEEE exception and is not part of this struct; see
+/// [`CAUSE_UNIMPLEMENTED`].
+///
+/// Returned rather than written, because `FCSR` belongs to
+/// [`crate::cop1::Cop1Control`] and an arithmetic helper that reached into it
+/// would need to own it.
+// Five bools, one per IEEE exception. Clippy suggests a bitflags type; the
+// architectural field IS five independent conditions that can co-occur (an
+// overflow is also inexact), and naming them costs nothing at this size.
+#[allow(clippy::struct_excessive_bools)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct Flags {
+    /// Invalid operation — a signaling NaN, or an undefined form like `0 × ∞`.
+    pub invalid: bool,
+    /// Division by zero, with a finite non-zero numerator.
+    pub div_by_zero: bool,
+    /// The result overflowed the format's range.
+    pub overflow: bool,
+    /// The result underflowed to a subnormal or zero.
+    pub underflow: bool,
+    /// The result was not exactly representable.
+    pub inexact: bool,
+}
+
+impl Flags {
+    /// No exceptions raised.
+    pub const NONE: Self = Self {
+        invalid: false,
+        div_by_zero: false,
+        overflow: false,
+        underflow: false,
+        inexact: false,
+    };
+
+    /// Just the invalid-operation flag.
+    pub const INVALID: Self = Self {
+        invalid: true,
+        ..Self::NONE
+    };
+
+    /// Pack into the `FCSR` **Cause** bits 16..=12 and **Flags** bits 6..=2.
+    ///
+    /// Both at once because hardware sets them together: `Cause` is what the
+    /// current operation raised, `Flags` is the sticky accumulation.
+    ///
+    /// **Bit 17 (`Unimplemented Operation`) is not produced here** — it is not
+    /// an IEEE exception, and it is raised on its own by the conversions via
+    /// [`CAUSE_UNIMPLEMENTED`]. Documenting the range as 17..=12 implied this
+    /// helper could set it, which it cannot.
+    #[must_use]
+    pub const fn to_fcsr_bits(self) -> u32 {
+        let mut cause = 0u32;
+        let mut flags = 0u32;
+        if self.invalid {
+            cause |= 1 << 16;
+            flags |= 1 << 6;
+        }
+        if self.div_by_zero {
+            cause |= 1 << 15;
+            flags |= 1 << 5;
+        }
+        if self.overflow {
+            cause |= 1 << 14;
+            flags |= 1 << 4;
+        }
+        if self.underflow {
+            cause |= 1 << 13;
+            flags |= 1 << 3;
+        }
+        if self.inexact {
+            cause |= 1 << 12;
+            flags |= 1 << 2;
+        }
+        cause | flags
+    }
+}
+
+/// The rounding mode from `FCSR.RM` (UM §7.2.4).
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum Rounding {
+    /// Round to nearest, ties to even. The IEEE default and `FCSR.RM = 0`.
+    Nearest,
+    /// Toward zero (truncate).
+    TowardZero,
+    /// Toward +∞.
+    TowardPlusInf,
+    /// Toward −∞.
+    TowardMinusInf,
+}
+
+impl Rounding {
+    /// Decode `FCSR.RM` (bits 1..=0).
+    #[must_use]
+    pub const fn from_rm(rm: u8) -> Self {
+        match rm & 0b11 {
+            1 => Self::TowardZero,
+            2 => Self::TowardPlusInf,
+            3 => Self::TowardMinusInf,
+            _ => Self::Nearest,
+        }
+    }
+}
+
+/// A result plus the flags producing it raised.
+///
+/// Deliberately **not** `Eq`: `T` is a float, and `NaN != NaN`. Deriving `Eq`
+/// would assert a reflexivity that FP values do not have.
+#[allow(
+    clippy::derived_hash_with_manual_eq,
+    clippy::derive_partial_eq_without_eq
+)]
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Outcome<T> {
+    /// The computed value.
+    pub value: T,
+    /// What the operation raised.
+    pub flags: Flags,
+}
+
+impl<T> Outcome<T> {
+    /// Did the operation underflow?
+    #[must_use]
+    pub const fn underflowed(&self) -> bool {
+        self.flags.underflow
+    }
+}
+
+/// Is this `f32` a **signaling** NaN *as the VR4300 classifies one*?
+///
+/// # The convention is inverted from IEEE-754:2008
+///
+/// IEEE-754:2008 says the significand's MSB **set** means *quiet*. The VR4300
+/// predates that edition and uses the **legacy MIPS convention**, where the
+/// significand MSB **set** means *signaling*. So `0x7FC0_0000` — the pattern
+/// every modern language calls a quiet NaN, and what Rust's `f32::NAN` is — is
+/// a **signaling** NaN to this processor, and raises Invalid.
+///
+/// # How this was established
+///
+/// Not from a manual: from n64-systemtest's own expectations, which name their
+/// constants by the IEEE convention and then assert the opposite behavior.
+/// For a non-signaling compare (`C.EQ`, `C.F`, …) it expects
+/// `QUIET_NAN_START_32` (`0x7FC0_0000`, MSB set) to raise Invalid and
+/// `SIGNALING_NAN_END_32` (`0x7FBF_FFFF`, MSB clear) to raise nothing. The
+/// signaling compare forms (`C.SF`, `C.SEQ`, …) raise Invalid for both, which
+/// is the ordinary IEEE rule for those forms and so does not distinguish them.
+///
+/// The corroboration that makes this more than a curve fit: the VR4300's own
+/// default NaN result is `0x7FBF_FFFF`, MSB **clear**. Under IEEE that would be
+/// a processor whose invalid-operation result is a *signaling* NaN — absurd,
+/// since it would re-trap on first use. Under this convention it is exactly
+/// what it should be, a quiet one.
+///
+/// Accuracy ledger **C-12**.
+#[must_use]
+pub const fn is_snan_f32(v: f32) -> bool {
+    let b = v.to_bits();
+    // Exponent all ones, significand MSB SET. No payload check is needed: the
+    // MSB being set already makes the significand non-zero, so this cannot
+    // catch an infinity.
+    b & 0x7F80_0000 == 0x7F80_0000 && b & 0x0040_0000 != 0
+}
+
+/// Is this `f64` a **signaling** NaN as the VR4300 classifies one?
+///
+/// See [`is_snan_f32`] — the convention is inverted from IEEE-754:2008.
+#[must_use]
+pub const fn is_snan_f64(v: f64) -> bool {
+    let b = v.to_bits();
+    b & 0x7FF0_0000_0000_0000 == 0x7FF0_0000_0000_0000 && b & 0x0008_0000_0000_0000 != 0
+}
+
+/// Is this a **subnormal** — a non-zero value with a zero exponent field?
+///
+/// Load-bearing on the VR4300 in a way it is not on most FPUs: this processor
+/// **cannot compute with subnormals at all**. A subnormal operand, or a
+/// subnormal result with `FCSR.FS` clear, raises the unmaskable
+/// *unimplemented operation* cause rather than producing a number. See
+/// [`arith_unimplemented_s`].
+#[must_use]
+pub const fn is_subnormal_f32(v: f32) -> bool {
+    let b = v.to_bits();
+    b & 0x7F80_0000 == 0 && b & 0x007F_FFFF != 0
+}
+
+/// Is this `f64` a subnormal? See [`is_subnormal_f32`].
+#[must_use]
+pub const fn is_subnormal_f64(v: f64) -> bool {
+    let b = v.to_bits();
+    b & 0x7FF0_0000_0000_0000 == 0 && b & 0x000F_FFFF_FFFF_FFFF != 0
+}
+
+/// Is this a NaN the VR4300's arithmetic cannot handle?
+///
+/// A NaN with the significand MSB **clear** — quiet by this processor's own
+/// inverted convention (ledger C-12). It cannot propagate one in hardware, so
+/// arithmetic on it raises *unimplemented operation*.
+///
+/// The complementary case is the opposite of what IEEE would lead you to
+/// expect: an MSB-**set** NaN is *signaling* here and raises the ordinary
+/// Invalid, which [`is_snan_f32`] covers. Both NaN classes trap — they trap
+/// **differently**, and swapping them is invisible until `FCSR` is read back.
+#[must_use]
+pub const fn is_unimplemented_nan_f32(v: f32) -> bool {
+    let b = v.to_bits();
+    b & 0x7F80_0000 == 0x7F80_0000 && b & 0x007F_FFFF != 0 && b & 0x0040_0000 == 0
+}
+
+/// See [`is_unimplemented_nan_f32`].
+#[must_use]
+pub const fn is_unimplemented_nan_f64(v: f64) -> bool {
+    let b = v.to_bits();
+    b & 0x7FF0_0000_0000_0000 == 0x7FF0_0000_0000_0000
+        && b & 0x000F_FFFF_FFFF_FFFF != 0
+        && b & 0x0008_0000_0000_0000 == 0
+}
+
+/// Do these arithmetic operands force *unimplemented operation* before the
+/// operation is even attempted?
+///
+/// **Operand subnormality wins over everything**, including a NaN that would
+/// otherwise raise Invalid: n64-systemtest pairs a quiet NaN with a subnormal
+/// and expects unimplemented, not invalid.
+///
+/// Applies to `ADD`/`SUB`/`MUL`/`DIV` only. **Compares are exempt** — the
+/// suite's compare tests expect a subnormal operand to compare as an ordinary
+/// number with no flags at all. Worth stating, because "this FPU cannot do
+/// subnormals" sounds like it should be universal and is not.
+#[must_use]
+pub const fn arith_unimplemented_s(a: f32, b: f32) -> bool {
+    is_subnormal_f32(a)
+        || is_subnormal_f32(b)
+        || is_unimplemented_nan_f32(a)
+        || is_unimplemented_nan_f32(b)
+}
+
+/// See [`arith_unimplemented_s`].
+#[must_use]
+pub const fn arith_unimplemented_d(a: f64, b: f64) -> bool {
+    is_subnormal_f64(a)
+        || is_subnormal_f64(b)
+        || is_unimplemented_nan_f64(a)
+        || is_unimplemented_nan_f64(b)
+}
+
+/// Flush a subnormal result to zero or to the smallest normal, per `FCSR.FS`.
+///
+/// **Which one depends on the rounding mode**, and that is the part most easily
+/// got wrong: "flush to zero" is the whole story only for round-to-nearest and
+/// toward-zero. A directed mode that rounds *away* from zero must deliver the
+/// smallest **normal** of that sign instead, because zero is on the wrong side
+/// of the true result.
+///
+/// n64-systemtest pins all four: a tiny negative result gives `-0` under
+/// nearest, toward-zero and toward-`+inf`, and `-f32::MIN_POSITIVE` under
+/// toward-`-inf`.
+#[must_use]
+pub fn flush_subnormal_f32(v: f32, mode: Rounding) -> f32 {
+    let negative = v.is_sign_negative();
+    if flushes_away_from_zero(negative, mode) {
+        if negative {
+            -f32::MIN_POSITIVE
+        } else {
+            f32::MIN_POSITIVE
+        }
+    } else if negative {
+        -0.0
+    } else {
+        0.0
+    }
+}
+
+/// See [`flush_subnormal_f32`].
+#[must_use]
+pub fn flush_subnormal_f64(v: f64, mode: Rounding) -> f64 {
+    let negative = v.is_sign_negative();
+    if flushes_away_from_zero(negative, mode) {
+        if negative {
+            -f64::MIN_POSITIVE
+        } else {
+            f64::MIN_POSITIVE
+        }
+    } else if negative {
+        -0.0
+    } else {
+        0.0
+    }
+}
+
+/// Does the rounding mode push this sign away from zero?
+const fn flushes_away_from_zero(negative: bool, mode: Rounding) -> bool {
+    match mode {
+        Rounding::Nearest | Rounding::TowardZero => false,
+        Rounding::TowardPlusInf => !negative,
+        Rounding::TowardMinusInf => negative,
+    }
+}
+
+/// `ADD.S`, `SUB.S`, `MUL.S`, `DIV.S` and their `.D` counterparts.
+///
+/// Each is a thin adapter over [`crate::softfloat`], which computes the
+/// correctly-rounded result **and** the exact IEEE exception flags in one pass.
+///
+/// # Why these are not `a + b`
+///
+/// The native operators produce the right value and discard everything else:
+/// there is no way to ask them whether the operation was inexact, whether it
+/// underflowed, or what a directed rounding mode would have given. The VR4300
+/// reports all three through `FCSR`, so an FPU built on `+`/`-`/`*`/`/` is
+/// bit-exact on values and silently wrong on flags — which is where accuracy
+/// ledger **C-11** found it, with `inexact` set only as a side effect of
+/// overflow and `underflow` never set at all.
+///
+/// The soft-float path is checked against those same native operators as an
+/// independent oracle: in round-to-nearest its results must be bit-identical
+/// across a large pseudo-random corpus in both formats. See
+/// `softfloat::tests`.
+fn arith_s(a: f32, b: f32, op: u8, mode: Rounding) -> Outcome<f32> {
+    use crate::softfloat::{self, F32};
+    let (a_bits, b_bits) = (u64::from(a.to_bits()), u64::from(b.to_bits()));
+    let out = match op {
+        0 => softfloat::add(a_bits, b_bits, F32, mode),
+        1 => softfloat::sub(a_bits, b_bits, F32, mode),
+        2 => softfloat::mul(a_bits, b_bits, F32, mode),
+        _ => softfloat::div(a_bits, b_bits, F32, mode),
+    };
+    Outcome {
+        value: f32::from_bits(out.bits as u32),
+        flags: out.flags,
+    }
+}
+
+fn arith_d(a: f64, b: f64, op: u8, mode: Rounding) -> Outcome<f64> {
+    use crate::softfloat::{self, F64};
+    let (a_bits, b_bits) = (a.to_bits(), b.to_bits());
+    let out = match op {
+        0 => softfloat::add(a_bits, b_bits, F64, mode),
+        1 => softfloat::sub(a_bits, b_bits, F64, mode),
+        2 => softfloat::mul(a_bits, b_bits, F64, mode),
+        _ => softfloat::div(a_bits, b_bits, F64, mode),
+    };
+    Outcome {
+        value: f64::from_bits(out.bits),
+        flags: out.flags,
+    }
+}
+
+/// `ADD.S`.
+#[must_use]
+pub fn add_s(a: f32, b: f32, mode: Rounding) -> Outcome<f32> {
+    arith_s(a, b, 0, mode)
+}
+
+/// `SUB.S`.
+#[must_use]
+pub fn sub_s(a: f32, b: f32, mode: Rounding) -> Outcome<f32> {
+    arith_s(a, b, 1, mode)
+}
+
+/// `MUL.S`.
+///
+/// **Does not model the VR4300 multiplication erratum** — see the module docs.
+#[must_use]
+pub fn mul_s(a: f32, b: f32, mode: Rounding) -> Outcome<f32> {
+    arith_s(a, b, 2, mode)
+}
+
+/// `DIV.S`.
+#[must_use]
+pub fn div_s(a: f32, b: f32, mode: Rounding) -> Outcome<f32> {
+    arith_s(a, b, 3, mode)
+}
+
+/// `ADD.D`.
+#[must_use]
+pub fn add_d(a: f64, b: f64, mode: Rounding) -> Outcome<f64> {
+    arith_d(a, b, 0, mode)
+}
+
+/// `SUB.D`.
+#[must_use]
+pub fn sub_d(a: f64, b: f64, mode: Rounding) -> Outcome<f64> {
+    arith_d(a, b, 1, mode)
+}
+
+/// `MUL.D`.
+#[must_use]
+pub fn mul_d(a: f64, b: f64, mode: Rounding) -> Outcome<f64> {
+    arith_d(a, b, 2, mode)
+}
+
+/// `DIV.D`.
+#[must_use]
+pub fn div_d(a: f64, b: f64, mode: Rounding) -> Outcome<f64> {
+    arith_d(a, b, 3, mode)
+}
+
+/// `ABS.S` — clears the sign bit.
+///
+/// Written as an explicit bit clear rather than `f32::abs`. The two are
+/// **equivalent**, including for NaN payloads — mutation testing confirmed
+/// swapping them changes nothing — so this is a readability choice, not a
+/// correctness one: the hardware operation *is* a bit clear, and saying so makes
+/// the NaN-payload behavior obvious instead of something to look up.
+#[must_use]
+pub const fn abs_s(a: f32) -> f32 {
+    f32::from_bits(a.to_bits() & 0x7FFF_FFFF)
+}
+
+/// `NEG.S` — flips the sign bit.
+#[must_use]
+pub const fn neg_s(a: f32) -> f32 {
+    f32::from_bits(a.to_bits() ^ 0x8000_0000)
+}
+
+/// `ABS.D`.
+#[must_use]
+pub const fn abs_d(a: f64) -> f64 {
+    f64::from_bits(a.to_bits() & 0x7FFF_FFFF_FFFF_FFFF)
+}
+
+/// `NEG.D`.
+#[must_use]
+pub const fn neg_d(a: f64) -> f64 {
+    f64::from_bits(a.to_bits() ^ 0x8000_0000_0000_0000)
+}
+
+/// The outcome of an ordered comparison: which of the three mutually exclusive
+/// relations holds.
+///
+/// Named rather than three bools, because exactly one is true and a bool triple
+/// makes the impossible states representable.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum Relation {
+    /// `fs < ft`.
+    Less,
+    /// `fs == ft`.
+    Equal,
+    /// `fs > ft`.
+    Greater,
+    /// At least one operand is a NaN, so no ordering exists.
+    Unordered,
+}
+
+/// `C.cond.fmt` — compare two single-precision values.
+///
+/// # The condition encoding
+///
+/// The 4-bit `cond` field is **systematic**, not sixteen unrelated mnemonics
+/// (UM Table 7-11):
+///
+/// | Bit | Meaning |
+/// | --- | --- |
+/// | 3 | raise Invalid when the operands are **unordered** (the signaling forms) |
+/// | 2 | true when `fs < ft` |
+/// | 1 | true when `fs == ft` |
+/// | 0 | true when the operands are **unordered** |
+///
+/// So `C.EQ` is `cond = 2`, `C.OLT` is `4`, `C.OLE` is `6`, `C.UN` is `1`, and
+/// each signaling variant is its ordinary form plus 8. Writing the sixteen
+/// mnemonics as sixteen cases invites getting one wrong; deriving them from the
+/// bits makes all sixteen correct or none.
+///
+/// Note **`Greater` appears in no bit**: `fs > ft` is simply "none of less,
+/// equal or unordered", which is why three condition bits suffice. Software
+/// tests it by branching on the complement of `C.OLE`.
+#[must_use]
+pub fn compare_s(a: f32, b: f32, cond: u8) -> Outcome<bool> {
+    let rel = relation_f32(a, b);
+    compare_result(rel, cond, is_snan_f32(a) || is_snan_f32(b))
+}
+
+/// `C.cond.fmt` — compare two double-precision values.
+#[must_use]
+pub fn compare_d(a: f64, b: f64, cond: u8) -> Outcome<bool> {
+    let rel = relation_f64(a, b);
+    compare_result(rel, cond, is_snan_f64(a) || is_snan_f64(b))
+}
+
+/// Which relation holds between two `f32`s.
+///
+/// Exact equality is **correct here and epsilon comparison would be wrong**:
+/// `C.EQ` is defined as IEEE equality, not approximate equality, so a tolerance
+/// would make the instruction report a relation the hardware does not.
+fn relation_f32(a: f32, b: f32) -> Relation {
+    if a.is_nan() || b.is_nan() {
+        Relation::Unordered
+    } else if a < b {
+        Relation::Less
+    } else if a == b {
+        Relation::Equal
+    } else {
+        Relation::Greater
+    }
+}
+
+/// Which relation holds between two `f64`s.
+///
+/// Exact equality is **correct here and epsilon comparison would be wrong**:
+/// `C.EQ` is defined as IEEE equality, not approximate equality, so a tolerance
+/// would make the instruction report a relation the hardware does not.
+fn relation_f64(a: f64, b: f64) -> Relation {
+    if a.is_nan() || b.is_nan() {
+        Relation::Unordered
+    } else if a < b {
+        Relation::Less
+    } else if a == b {
+        Relation::Equal
+    } else {
+        Relation::Greater
+    }
+}
+
+/// Apply the condition bits to a computed relation.
+fn compare_result(rel: Relation, cond: u8, snan: bool) -> Outcome<bool> {
+    let unordered = matches!(rel, Relation::Unordered);
+    let value = (matches!(rel, Relation::Less) && cond & 0b100 != 0)
+        || (matches!(rel, Relation::Equal) && cond & 0b010 != 0)
+        || (unordered && cond & 0b001 != 0);
+
+    let mut flags = Flags::NONE;
+    // Bit 3 selects the SIGNALING forms, which raise Invalid on *any*
+    // unordered comparison -- including one caused by a merely quiet NaN. That
+    // is the whole difference between `C.EQ` and `C.SEQ`, and it is why the
+    // quiet/signaling test used elsewhere is not sufficient on its own here.
+    if unordered && cond & 0b1000 != 0 {
+        flags.invalid = true;
+    }
+    // A signaling NaN operand raises Invalid whatever the condition.
+    if snan {
+        flags.invalid = true;
+    }
+    Outcome { value, flags }
+}
+
+/// `FCSR.Cause` — bits **17:12**, the field an operation replaces wholesale.
+///
+/// **UM §7.2.4, Figure 7-2** ("Control/Status Register Bit Assignments") gives
+/// `FCR31`'s layout with `Cause` spanning 17:12, six bits wide. **Figure 7-3**
+/// then names the bits, and the asymmetry below is visible in it directly:
+/// `Cause` carries `E V Z O U I` while `Enables` and `Flags` carry only
+/// `V Z O U I`.
+///
+/// **17:12, not 16:12.** That extra bit is `Cause.E`, Unimplemented Operation —
+/// part of `Cause` despite having no `Enable` bit and no sticky `Flags` twin,
+/// which makes this mask the *only* thing that ever clears it. A narrower 16:12
+/// mask left bit 17 permanently set once raised: a shipped bug in this project's
+/// history, and the reason the constant lives here rather than being written out
+/// at each site. It had reached four copies.
+///
+/// Only the five *maskable* conditions live in 16:12; that narrower range is what
+/// an enable comparison uses, and it is a different statement from this one.
+pub const CAUSE_MASK: u32 = 0x3F << 12;
+
+/// The `Unimplemented Operation` cause bit (`FCSR` bit 17).
+///
+/// Distinct from Invalid: it means *"this processor cannot do this in
+/// hardware — trap to software"*, not *"the operation is mathematically
+/// undefined"*. The VR4300 uses it for the long-integer conversion restriction
+/// below, which is a **hardware limitation**, not a numerical error.
+pub const CAUSE_UNIMPLEMENTED: u32 = 1 << 17;
+
+/// Does a 64-bit integer satisfy `CVT.[S,D].L`'s range restriction?
+///
+/// > *"When converting a long integer to a single- or double-precision
+/// > floating-point number (`CVT.[S,D].L`), bits 63:55 of the 64-bit integer
+/// > must be all zeroes or ones, otherwise the VR4300 processor raises a
+/// > floating-point instruction exception."* — UM §7.5.2
+///
+/// This is a **VR4300-specific hardware limitation**, not IEEE behavior: the
+/// value is perfectly representable, the processor simply declines. An emulator
+/// that converts it anyway produces a *correct* number where hardware traps, so
+/// software's fixup path never runs and the difference surfaces far downstream.
+#[must_use]
+pub const fn long_convertible(v: i64) -> bool {
+    let top = (v >> 55) & 0x1FF;
+    top == 0 || top == 0x1FF
+}
+
+/// `CVT.D.S` — single to double. Always exact: every `f32` is an `f64`.
+#[must_use]
+pub fn cvt_d_s(v: f32) -> Outcome<f64> {
+    Outcome {
+        value: f64::from(v),
+        flags: if is_snan_f32(v) {
+            Flags::INVALID
+        } else {
+            Flags::NONE
+        },
+    }
+}
+
+/// `CVT.S.D` — double to single. Can overflow, underflow or lose precision.
+#[must_use]
+pub fn cvt_s_d(v: f64) -> Outcome<f32> {
+    let value = v as f32;
+    let mut flags = Flags::NONE;
+    if is_snan_f64(v) {
+        flags.invalid = true;
+    }
+    if v.is_finite() {
+        if value.is_infinite() {
+            flags.overflow = true;
+            flags.inexact = true;
+        } else if value == 0.0 && v != 0.0 {
+            // A non-zero double that narrows to zero has underflowed -- the
+            // one underflow case this module can detect without the exact
+            // pre-rounding result.
+            flags.underflow = true;
+            flags.inexact = true;
+        } else if f64::from(value) != v {
+            flags.inexact = true;
+        }
+    }
+    Outcome { value, flags }
+}
+
+/// `2^63`, the bound an `i64` conversion must stay strictly below.
+const TWO_POW_63: f64 = 9_223_372_036_854_775_808.0;
+
+/// `2^52` — above this magnitude every `f64` is already an integer, so the
+/// rounding helpers can return the value untouched.
+const F64_INTEGRAL_THRESHOLD: f64 = 4_503_599_627_370_496.0;
+
+/// `|v|`, by clearing the sign bit.
+///
+/// `f64::abs` and friends live in `std`; this crate is `#![no_std]`, so the
+/// handful of float operations the FPU needs are implemented here rather than
+/// pulling in `libm` for four functions.
+const fn fabs(v: f64) -> f64 {
+    f64::from_bits(v.to_bits() & 0x7FFF_FFFF_FFFF_FFFF)
+}
+
+/// Truncate toward zero.
+fn trunc(v: f64) -> f64 {
+    if !v.is_finite() || fabs(v) >= F64_INTEGRAL_THRESHOLD {
+        // Already integral (or not a number), so there is nothing to remove.
+        return v;
+    }
+    (v as i64) as f64
+}
+
+/// Round toward −∞.
+fn floor(v: f64) -> f64 {
+    let t = trunc(v);
+    if v < 0.0 && t != v { t - 1.0 } else { t }
+}
+
+/// Round toward +∞.
+fn ceil(v: f64) -> f64 {
+    let t = trunc(v);
+    if v > 0.0 && t != v { t + 1.0 } else { t }
+}
+
+/// Round to nearest, **ties to even**.
+///
+/// Not "round half away from zero", which is what most `round` functions do and
+/// which no MIPS rounding mode selects.
+fn round_ties_even(v: f64) -> f64 {
+    if !v.is_finite() || fabs(v) >= F64_INTEGRAL_THRESHOLD {
+        return v;
+    }
+    let f = floor(v);
+    let diff = v - f;
+    if diff > 0.5 {
+        f + 1.0
+    } else if diff < 0.5 {
+        f
+    } else if (f as i64) % 2 == 0 {
+        // Exactly halfway: pick the even neighbor.
+        f
+    } else {
+        f + 1.0
+    }
+}
+
+/// Round a float to an integer under an explicit [`Rounding`] mode.
+///
+/// Split out because `CVT.W`, `ROUND.W`, `TRUNC.W`, `CEIL.W` and `FLOOR.W`
+/// differ **only** in this: `CVT` uses `FCSR.RM`, and the other four hard-code
+/// one mode each. Sharing the body means a rounding bug cannot exist in one and
+/// not the others.
+#[must_use]
+pub fn round_f64(v: f64, mode: Rounding) -> f64 {
+    match mode {
+        // `round_ties_even` rather than `round`, which rounds half AWAY from
+        // zero -- a different mode that no MIPS setting selects.
+        Rounding::Nearest => round_ties_even(v),
+        Rounding::TowardZero => trunc(v),
+        Rounding::TowardPlusInf => ceil(v),
+        Rounding::TowardMinusInf => floor(v),
+    }
+}
+
+/// Convert a float to a 32-bit integer under `mode`.
+///
+/// An out-of-range or NaN input raises **Invalid**. The value returned in that
+/// case is `i32::MAX`, which is the conventional MIPS result — and a *choice*
+/// here, since the architecture leaves it undefined when the exception is
+/// masked.
+#[must_use]
+pub fn to_i32(v: f64, mode: Rounding) -> Outcome<i32> {
+    let r = round_f64(v, mode);
+    if v.is_nan() || r < f64::from(i32::MIN) || r > f64::from(i32::MAX) {
+        return Outcome {
+            value: i32::MAX,
+            flags: Flags::INVALID,
+        };
+    }
+    let value = r as i32;
+    let mut flags = Flags::NONE;
+    if f64::from(value) != v {
+        flags.inexact = true;
+    }
+    Outcome { value, flags }
+}
+
+/// Convert a float to a 64-bit integer under `mode`.
+#[must_use]
+pub fn to_i64(v: f64, mode: Rounding) -> Outcome<i64> {
+    let r = round_f64(v, mode);
+    // The bounds are compared as f64 deliberately: `i64::MAX` is not exactly
+    // representable, so `r > i64::MAX as f64` is the correct test and
+    // `r as i64 == i64::MAX` is not.
+    if v.is_nan() || !(-TWO_POW_63..TWO_POW_63).contains(&r) {
+        return Outcome {
+            value: i64::MAX,
+            flags: Flags::INVALID,
+        };
+    }
+    let value = r as i64;
+    let mut flags = Flags::NONE;
+    if value as f64 != v {
+        flags.inexact = true;
+    }
+    Outcome { value, flags }
+}
+
+/// `fmt` for single precision, as the COP1 encoding gives it.
+pub const FMT_S: u8 = 16;
+/// `fmt` for double precision.
+pub const FMT_D: u8 = 17;
+/// `fmt` for 32-bit fixed point (`W`), the source format of `CVT.fmt.W`.
+pub const FMT_W: u8 = 20;
+/// `fmt` for 64-bit fixed point (`L`).
+pub const FMT_L: u8 = 21;
+
+/// Pipeline cycles for a COP1 arithmetic instruction — **UM Table 7-14**.
+///
+/// A direct transcription of the table, indexed by `funct` and the source
+/// `fmt`. Written as data for the same reason the COP0 tables are: every entry
+/// is a documented number with no generating rule, and a `match` over prose
+/// becomes a place to forget one.
+///
+/// | Instruction | S | D | W | L |
+/// | --- | --- | --- | --- | --- |
+/// | `ADD`/`SUB` | 3 | 3 | | |
+/// | `MUL` | 5 | 8 | | |
+/// | `DIV`/`SQRT` | 29 | 58 | | |
+/// | `ABS`/`MOV`/`NEG` | 1 | 1 | | |
+/// | `ROUND`/`TRUNC`/`CEIL`/`FLOOR` (`.W` and `.L`) | 5 | 5 | | |
+/// | `CVT.S` | — | 2 | 5 | 5 |
+/// | `CVT.D` | 1 | — | 5 | 5 |
+/// | `CVT.W`/`CVT.L` | 5 | 5 | | |
+/// | `C.cond` | 1 | 1 | | |
+///
+/// # What a `1` means, and why it is not charged
+///
+/// One cycle is what an ordinary instruction already takes, so a rate of 1 is
+/// *no* stall — `ABS`, `MOV`, `NEG` and `C.cond` cost nothing extra. Charging
+/// them one cycle would make them uniquely slow among single-cycle
+/// instructions.
+///
+/// # The `+1` for a dependent consumer is not in this table
+///
+/// The manual's note is that *"if a floating-point result for these
+/// instructions is needed by the subsequent instruction, the latency is the
+/// execution rate plus one, due to the fact that an EX-to-RF bypass is not
+/// performed"*. That extra cycle is not added here: the stall these numbers
+/// produce holds the whole pipeline, so the consumer spends its own cycle after
+/// the stall drains and arrives at rate + 1 on its own.
+///
+/// # Not modeled: the early exit
+///
+/// UM §7.5.6 and this table's own note 2 say a multicycle operation whose
+/// result is *obvious* — a zero or infinity operand, a power-of-two multiplier
+/// — completes in two cycles instead. That is documented behavior we do not
+/// yet reproduce, so trivial operands are charged the full rate and the model
+/// runs **slower** than hardware there. Accuracy ledger C-29.
+#[must_use]
+// One arm per table row, kept separate on purpose. Clippy would merge the arms
+// that happen to share a number and fold the 1s into the wildcard; that turns a
+// transcription anyone can check line-by-line against the manual into an
+// expression they have to re-derive. The rows are the documentation.
+#[allow(clippy::match_same_arms, clippy::manual_range_patterns)]
+pub const fn delay_cycles(funct: u8, fmt: u8) -> u32 {
+    let double = fmt == FMT_D;
+    match funct {
+        // ADD, SUB.
+        0o00 | 0o01 => 3,
+        // MUL.
+        0o02 => {
+            if double {
+                8
+            } else {
+                5
+            }
+        }
+        // DIV, and SQRT which costs the same.
+        0o03 | 0o04 => {
+            if double {
+                58
+            } else {
+                29
+            }
+        }
+        // ABS, MOV, NEG — one cycle, i.e. no stall.
+        0o05 | 0o06 | 0o07 => 1,
+        // ROUND.L, TRUNC.L, CEIL.L, FLOOR.L, ROUND.W, TRUNC.W, CEIL.W, FLOOR.W.
+        0o10..=0o17 => 5,
+        // CVT.S: 2 from double, 5 from a fixed-point format.
+        0o40 => {
+            if double {
+                2
+            } else {
+                5
+            }
+        }
+        // CVT.D: 1 from single, 5 from a fixed-point format.
+        0o41 => {
+            if fmt == FMT_S {
+                1
+            } else {
+                5
+            }
+        }
+        // CVT.W, CVT.L.
+        0o44 | 0o45 => 5,
+        // C.cond.fmt and anything else: one cycle.
+        _ => 1,
+    }
+}
+
+/// The stall a COP1 arithmetic instruction adds, in `PCycle`s.
+///
+/// Zero for the single-cycle operations; see [`delay_cycles`].
+#[must_use]
+pub const fn stall_cycles(funct: u8, fmt: u8) -> u32 {
+    let rate = delay_cycles(funct, fmt);
+    if rate > 1 { rate } else { 0 }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// **The VR4300 NaN convention is inverted from IEEE-754:2008**: the
+    /// significand MSB **set** means *signaling*, not quiet.
+    ///
+    /// So `0x7FC0_0001` — what every modern language calls a quiet NaN, and
+    /// what Rust produces — raises Invalid here, and `0x7F80_0001` does not.
+    /// The bit patterns are named for what they are *on this processor*, since
+    /// naming them the IEEE way is what made the original implementation
+    /// backwards. Accuracy ledger C-12.
+    #[test]
+    fn the_signaling_nan_is_the_one_with_the_significand_msb_set() {
+        let signals_here = f32::from_bits(0x7FC0_0001); // IEEE would call this quiet
+        let quiet_here = f32::from_bits(0x7F80_0001); // IEEE would call this signaling
+        assert!(
+            is_snan_f32(signals_here),
+            "MSB set is SIGNALING on the VR4300"
+        );
+        assert!(!is_snan_f32(quiet_here), "MSB clear is quiet");
+        assert!(!is_snan_f32(f32::INFINITY), "infinity is not a NaN");
+
+        assert!(add_s(signals_here, 1.0, Rounding::Nearest).flags.invalid);
+        assert!(
+            !add_s(quiet_here, 1.0, Rounding::Nearest).flags.invalid,
+            "a quiet NaN propagates quietly"
+        );
+
+        // Rust's own NaN is signaling to this processor. Stated explicitly
+        // because it is the case most likely to be reintroduced by someone
+        // "fixing" the convention back to IEEE.
+        assert!(is_snan_f32(f32::NAN), "even f32::NAN signals here");
+    }
+
+    /// The same, for doubles — the bit sits at a different position, so this is
+    /// not a free consequence of the `f32` case.
+    #[test]
+    fn the_double_precision_signaling_bit_is_at_bit_51() {
+        let signals_here = f64::from_bits(0x7FF8_0000_0000_0001);
+        let quiet_here = f64::from_bits(0x7FF0_0000_0000_0001);
+        assert!(is_snan_f64(signals_here));
+        assert!(!is_snan_f64(quiet_here));
+        assert!(add_d(signals_here, 1.0, Rounding::Nearest).flags.invalid);
+        assert!(!add_d(quiet_here, 1.0, Rounding::Nearest).flags.invalid);
+    }
+
+    /// The processor's own default NaN result must be **quiet by its own
+    /// convention**, or every invalid operation would produce a value that
+    /// re-traps the moment anything touches it.
+    ///
+    /// This is the corroboration that the inverted convention is real rather
+    /// than a curve fit to the compare tests: `0x7FBF_FFFF` is the value
+    /// hardware delivers, and it is only sane under the VR4300 reading.
+    #[test]
+    fn the_default_nan_result_is_quiet_by_the_vr4300_convention() {
+        use crate::softfloat::{F32, F64};
+        assert!(!is_snan_f32(f32::from_bits(F32.default_nan() as u32)));
+        assert!(!is_snan_f64(f64::from_bits(F64.default_nan())));
+    }
+
+    /// **`x/0` is `DivByZero`; `0/0` is Invalid.** They are different flags, and a
+    /// handler distinguishes them — collapsing both into `DivByZero` reports a
+    /// division fault for what is actually an undefined form.
+    #[test]
+    fn divide_by_zero_and_zero_over_zero_raise_different_flags() {
+        let f = div_s(1.0, 0.0, Rounding::Nearest).flags;
+        assert!(f.div_by_zero, "finite non-zero over zero");
+        assert!(!f.invalid);
+        assert!(!f.overflow, "infinite, but not an overflow");
+
+        let f = div_s(0.0, 0.0, Rounding::Nearest).flags;
+        assert!(f.invalid, "0/0 is an undefined form");
+        assert!(!f.div_by_zero);
+    }
+
+    /// **`inf / 0` is not a division by zero.** IEEE reserves the flag for a
+    /// *finite* non-zero numerator, because only there does a zero divisor
+    /// create an infinity out of nothing — `inf / 0` was already infinite.
+    ///
+    /// The condition originally tested `!a.is_nan()`, which let infinities
+    /// through and disagreed with the comment directly above it.
+    #[test]
+    fn an_infinite_numerator_over_zero_is_not_a_division_by_zero() {
+        for a in [f32::INFINITY, f32::NEG_INFINITY] {
+            let f = div_s(a, 0.0, Rounding::Nearest).flags;
+            assert!(!f.div_by_zero, "{a} / 0 is not DivByZero");
+            assert!(!f.invalid, "nor is it an undefined form");
+        }
+        // The finite case still is.
+        assert!(div_s(1.0, 0.0, Rounding::Nearest).flags.div_by_zero);
+        assert!(div_d(-2.5, 0.0, Rounding::Nearest).flags.div_by_zero);
+        for a in [f64::INFINITY, f64::NEG_INFINITY] {
+            assert!(!div_d(a, 0.0, Rounding::Nearest).flags.div_by_zero);
+        }
+    }
+
+    /// A double that narrows to zero has **underflowed** — the one underflow
+    /// case detectable without the exact pre-rounding result.
+    #[test]
+    fn a_double_narrowing_to_zero_underflows() {
+        let out = cvt_s_d(1e-300);
+        assert!(out.underflowed(), "1e-300 has no f32 representation");
+        assert!(out.flags.inexact);
+        assert_eq!(out.value, 0.0);
+        // A representable small value does not.
+        assert!(!cvt_s_d(1e-30).underflowed());
+        // ...and a genuine zero is not an underflow.
+        assert!(!cvt_s_d(0.0).underflowed());
+    }
+
+    /// A NaN produced from **non-NaN** inputs is an undefined form and raises
+    /// Invalid — `∞ - ∞` here — even though neither operand was a NaN.
+    #[test]
+    fn a_nan_from_finite_or_infinite_inputs_is_invalid() {
+        let f = sub_s(f32::INFINITY, f32::INFINITY, Rounding::Nearest).flags;
+        assert!(f.invalid, "inf - inf is an undefined form");
+        let f = mul_s(0.0, f32::INFINITY, Rounding::Nearest).flags;
+        assert!(f.invalid, "0 * inf likewise");
+    }
+
+    /// Overflow from finite operands sets both Overflow and Inexact.
+    #[test]
+    fn overflow_from_finite_operands_is_also_inexact() {
+        let f = mul_s(f32::MAX, 2.0, Rounding::Nearest).flags;
+        assert!(f.overflow);
+        assert!(f.inexact, "an overflowed result is never exact");
+        // But an infinity that was already infinite is not an overflow.
+        assert!(!add_s(f32::INFINITY, 1.0, Rounding::Nearest).flags.overflow);
+    }
+
+    /// `ABS`/`NEG` are **bit operations**, so they pass NaN payloads through
+    /// rather than canonicalizing. `f32::abs` happens to agree, but specifying
+    /// it as a bit clear is what makes the NaN behavior predictable.
+    #[test]
+    fn abs_and_neg_are_bit_operations_that_preserve_nan_payloads() {
+        let nan = f32::from_bits(0xFF80_1234); // negative NaN with a payload
+        assert_eq!(
+            abs_s(nan).to_bits(),
+            0x7F80_1234,
+            "sign cleared, payload kept"
+        );
+        assert_eq!(neg_s(nan).to_bits(), 0x7F80_1234, "sign flipped");
+        assert_eq!(
+            neg_s(neg_s(nan)).to_bits(),
+            nan.to_bits(),
+            "and is an involution"
+        );
+        assert_eq!(abs_s(-0.0).to_bits(), 0.0f32.to_bits(), "negative zero too");
+    }
+
+    /// `FCSR.RM` decodes per UM §7.2.4, and the default is nearest-even.
+    #[test]
+    fn the_rounding_mode_decodes_from_rm() {
+        assert_eq!(Rounding::from_rm(0), Rounding::Nearest);
+        assert_eq!(Rounding::from_rm(1), Rounding::TowardZero);
+        assert_eq!(Rounding::from_rm(2), Rounding::TowardPlusInf);
+        assert_eq!(Rounding::from_rm(3), Rounding::TowardMinusInf);
+        assert_eq!(
+            Rounding::from_rm(0xFC),
+            Rounding::Nearest,
+            "masked to 2 bits"
+        );
+    }
+
+    /// Flags map onto **both** the `Cause` and sticky `Flags` fields, because
+    /// hardware sets them together. Writing only one leaves software unable to
+    /// distinguish "raised now" from "raised at some point".
+    #[test]
+    fn flags_populate_both_the_cause_and_sticky_fields() {
+        let bits = Flags {
+            invalid: true,
+            ..Flags::NONE
+        }
+        .to_fcsr_bits();
+        assert_ne!(bits & (1 << 16), 0, "Cause.invalid");
+        assert_ne!(bits & (1 << 6), 0, "Flags.invalid");
+
+        let bits = Flags {
+            div_by_zero: true,
+            inexact: true,
+            ..Flags::NONE
+        }
+        .to_fcsr_bits();
+        assert_eq!(bits, (1 << 15) | (1 << 5) | (1 << 12) | (1 << 2));
+        assert_eq!(Flags::NONE.to_fcsr_bits(), 0);
+    }
+
+    /// **Exact** arithmetic raises nothing — the flags must not be noisy, or
+    /// software with the enables set traps constantly.
+    ///
+    /// # Why the operands are all dyadic
+    ///
+    /// This case previously included `(1e10, 1e-4)`, which is *not* exact in
+    /// `f32` for any of the four operations. It passed only because `inexact`
+    /// was never detected (accuracy ledger C-11), so the test was asserting the
+    /// absence of a flag the implementation could not raise — and would have
+    /// gone on passing however wrong the arithmetic became.
+    ///
+    /// Every pair below is a dyadic rational whose sum, difference, product
+    /// **and** quotient are all exactly representable, so "no flags" is a real
+    /// claim about the result rather than a claim about missing machinery.
+    #[test]
+    fn exact_arithmetic_raises_no_flags() {
+        for (a, b) in [
+            (1.0f32, 2.0f32),
+            (-3.5, 0.25),
+            (6.0, 0.5),
+            // Large but still exact: 2^20 and 2^12, whose product 2^32 and
+            // quotient 2^8 both land on the grid.
+            (1_048_576.0, 4096.0),
+        ] {
+            for out in [
+                add_s(a, b, Rounding::Nearest),
+                sub_s(a, b, Rounding::Nearest),
+                mul_s(a, b, Rounding::Nearest),
+                div_s(a, b, Rounding::Nearest),
+            ] {
+                assert_eq!(out.flags, Flags::NONE, "{a} op {b} raised something");
+            }
+        }
+        // Exact bit comparison, not a tolerance: these values are exactly
+        // representable, so anything but the exact result is a bug -- and a
+        // tolerance would hide it.
+        assert_eq!(
+            add_d(1.0, 2.0, Rounding::Nearest).value.to_bits(),
+            3.0f64.to_bits()
+        );
+        assert_eq!(
+            mul_d(3.0, 4.0, Rounding::Nearest).value.to_bits(),
+            12.0f64.to_bits()
+        );
+    }
+
+    /// The condition field is **systematic**, so this checks the named mnemonics
+    /// against the derivation rather than trusting it.
+    #[test]
+    fn the_named_compare_conditions_fall_out_of_the_bit_encoding() {
+        // cond, name, expected for [1<2, 2==2, 3>2, NaN]
+        let cases: &[(u8, &str, [bool; 4])] = &[
+            (0, "F", [false, false, false, false]),
+            (1, "UN", [false, false, false, true]),
+            (2, "EQ", [false, true, false, false]),
+            (3, "UEQ", [false, true, false, true]),
+            (4, "OLT", [true, false, false, false]),
+            (5, "ULT", [true, false, false, true]),
+            (6, "OLE", [true, true, false, false]),
+            (7, "ULE", [true, true, false, true]),
+        ];
+        for &(cond, name, want) in cases {
+            let got = [
+                compare_s(1.0, 2.0, cond).value,
+                compare_s(2.0, 2.0, cond).value,
+                compare_s(3.0, 2.0, cond).value,
+                compare_s(f32::NAN, 2.0, cond).value,
+            ];
+            assert_eq!(got, want, "C.{name} (cond {cond})");
+        }
+    }
+
+    /// **The signaling forms raise Invalid on any unordered compare**, even for
+    /// a *quiet* NaN. That is the entire difference between `C.EQ` and `C.SEQ`,
+    /// and it means the quiet/signaling test used elsewhere is not sufficient
+    /// on its own here.
+    #[test]
+    fn the_signaling_compare_forms_raise_on_a_quiet_nan() {
+        // Quiet **by the VR4300 convention**: significand MSB clear (C-12).
+        let qnan = f32::from_bits(0x7F80_0001);
+        assert!(!is_snan_f32(qnan), "it really is quiet");
+
+        let out = compare_s(qnan, 1.0, 2); // C.EQ
+        assert!(!out.value);
+        assert!(!out.flags.invalid, "the non-signaling form stays quiet");
+
+        let out = compare_s(qnan, 1.0, 10); // C.SEQ
+        assert!(!out.value, "the comparison result is unchanged");
+        assert!(out.flags.invalid, "only the exception differs");
+    }
+
+    /// A **signaling** NaN raises Invalid whatever the condition, including the
+    /// non-signaling forms.
+    #[test]
+    fn a_signaling_nan_operand_raises_for_every_condition() {
+        // Signaling **by the VR4300 convention**: significand MSB set (C-12).
+        let snan = f32::from_bits(0x7FC0_0001);
+        for cond in 0..16u8 {
+            assert!(
+                compare_s(snan, 1.0, cond).flags.invalid,
+                "cond {cond} must raise on a signaling NaN"
+            );
+        }
+    }
+
+    /// `Greater` appears in **no** condition bit — it is "none of less, equal or
+    /// unordered", which is why three bits suffice for the relation.
+    #[test]
+    fn greater_matches_no_condition_bit() {
+        for cond in 0..8u8 {
+            assert!(
+                !compare_s(3.0, 2.0, cond).value,
+                "cond {cond}: greater matches no bit"
+            );
+        }
+    }
+
+    /// Doubles use the same derivation, and `-0.0 == 0.0` as IEEE requires.
+    #[test]
+    fn double_compares_agree_and_signed_zeros_are_equal() {
+        assert!(compare_d(1.0, 2.0, 4).value, "C.OLT");
+        assert!(compare_d(2.0, 2.0, 2).value, "C.EQ");
+        assert!(compare_d(-0.0, 0.0, 2).value, "-0.0 == 0.0 (IEEE)");
+        assert!(compare_d(f64::NAN, 1.0, 1).value, "C.UN");
+        assert!(
+            !compare_d(f64::NAN, 1.0, 2).value,
+            "C.EQ is false when unordered"
+        );
+    }
+
+    /// **The VR4300 long-conversion restriction** (UM §7.5.2): bits 63:55 must
+    /// be all-zero or all-one. This is a *hardware limitation*, not IEEE
+    /// behavior — the value is representable, the processor declines.
+    ///
+    /// Converting it anyway produces a correct number where hardware traps, so
+    /// software's fixup path never runs and the divergence surfaces far
+    /// downstream from its cause.
+    #[test]
+    fn cvt_from_long_rejects_values_outside_the_vr4300_range() {
+        // Small positives and negatives: bits 63:55 uniform.
+        for v in [0i64, 1, -1, 1 << 40, -(1 << 40), (1 << 55) - 1] {
+            assert!(long_convertible(v), "{v} must be convertible");
+        }
+        // Bits 63:55 mixed -- declines.
+        for v in [1i64 << 55, 1 << 60, i64::MAX, i64::MIN + 1] {
+            assert!(!long_convertible(v), "{v} must be rejected");
+        }
+        // i64::MIN is 0x8000_0000_0000_0000, so bits 63:55 are 0b1_0000_0000 --
+        // neither all-zero nor all-one, so it is NOT convertible. Easy to
+        // assume otherwise from "the sign bit is set".
+        assert!(!long_convertible(i64::MIN));
+        // The largest magnitudes that ARE convertible sit at the 2^55 boundary.
+        assert!(long_convertible((1i64 << 55) - 1));
+        assert!(long_convertible(-(1i64 << 55)));
+    }
+
+    /// `Unimplemented` is **not** `Invalid`: it means "this processor cannot do
+    /// this", not "the operation is undefined". Conflating them sends the
+    /// handler down the numerical-error path for a hardware limitation.
+    #[test]
+    fn unimplemented_is_a_different_cause_bit_from_invalid() {
+        assert_eq!(CAUSE_UNIMPLEMENTED, 1 << 17);
+        assert_ne!(
+            CAUSE_UNIMPLEMENTED,
+            Flags::INVALID.to_fcsr_bits() & 0x0003_F000,
+            "distinct from the Invalid cause bit"
+        );
+    }
+
+    /// Integer-to-float rounding lives in `softfloat::from_int`, not here.
+    ///
+    /// This module used to carry `cvt_s_w`/`cvt_s_l`/`cvt_d_w`/`cvt_d_l`, each a
+    /// Rust `as` cast plus a round-trip inexact check. They were **deleted**
+    /// rather than left unused once the pipeline moved to `softfloat::from_int`:
+    /// an `as` cast rounds to nearest-even unconditionally, so every one of them
+    /// ignored `FCSR.RM`, and an unused function that quietly gets an operation
+    /// wrong is the inert-API hazard `docs/engineering-lessons.md` §3.2
+    /// describes. `addr.rs` deleted a stale `translate` for the same reason.
+    ///
+    /// [`long_convertible`] stays: it is the VR4300 range restriction, which is
+    /// a separate rule from the rounding and is still consulted.
+    #[test]
+    fn int_to_single_rounding_is_not_in_this_module() {
+        // A value needing more than 24 significand bits, converted toward zero.
+        // Nearest-even would give 0x4E93_2C06; the mode must be honored.
+        let r =
+            crate::softfloat::from_int(1_234_567_891, crate::softfloat::F32, Rounding::TowardZero);
+        assert_eq!(r.bits as u32, 0x4E93_2C05);
+        assert!(r.flags.inexact);
+    }
+
+    /// `CVT.S.D` can overflow; `CVT.D.S` never can, since every `f32` is an
+    /// `f64`.
+    #[test]
+    fn narrowing_can_overflow_but_widening_cannot() {
+        let out = cvt_s_d(1e300);
+        assert!(out.flags.overflow, "1e300 has no f32 representation");
+        assert!(out.flags.inexact);
+        assert!(!cvt_s_d(1.0).flags.overflow);
+        assert_eq!(cvt_d_s(1.5).value.to_bits(), 1.5f64.to_bits());
+        assert_eq!(cvt_d_s(f32::MAX).flags, Flags::NONE, "widening is exact");
+    }
+
+    /// The four rounding modes differ, and `Nearest` is **ties-to-even** — not
+    /// `f64::round`, which rounds half away from zero and matches no MIPS mode.
+    #[test]
+    fn the_rounding_modes_differ_and_nearest_is_ties_to_even() {
+        assert_eq!(round_f64(2.5, Rounding::Nearest), 2.0, "ties to EVEN");
+        assert_eq!(round_f64(3.5, Rounding::Nearest), 4.0);
+        assert_eq!(round_f64(2.5, Rounding::TowardZero), 2.0);
+        assert_eq!(round_f64(2.5, Rounding::TowardPlusInf), 3.0);
+        assert_eq!(round_f64(2.5, Rounding::TowardMinusInf), 2.0);
+        assert_eq!(round_f64(-2.5, Rounding::TowardZero), -2.0);
+        assert_eq!(round_f64(-2.5, Rounding::TowardMinusInf), -3.0);
+    }
+
+    /// Out-of-range and NaN conversions raise Invalid rather than wrapping.
+    #[test]
+    fn an_out_of_range_conversion_raises_invalid() {
+        for v in [1e30f64, -1e30, f64::NAN, f64::INFINITY] {
+            let out = to_i32(v, Rounding::Nearest);
+            assert!(out.flags.invalid, "{v} does not fit in an i32");
+            assert_eq!(out.value, i32::MAX, "the conventional MIPS result");
+        }
+        assert_eq!(to_i32(42.0, Rounding::Nearest).value, 42);
+        assert_eq!(to_i32(42.0, Rounding::Nearest).flags, Flags::NONE);
+        assert!(to_i32(42.5, Rounding::TowardZero).flags.inexact);
+    }
+
+    /// The 64-bit bound is compared as an `f64` because `i64::MAX` is **not
+    /// exactly representable** — `r > i64::MAX as f64` is the correct test, and
+    /// casting first is not.
+    #[test]
+    fn the_64_bit_conversion_bound_accounts_for_representability() {
+        // 2^63 exactly: out of range, since i64::MAX is 2^63 - 1.
+        let out = to_i64(9_223_372_036_854_775_808.0, Rounding::Nearest);
+        assert!(out.flags.invalid, "2^63 does not fit in an i64");
+        // Just inside.
+        let out = to_i64(9_223_372_036_854_774_784.0, Rounding::Nearest);
+        assert!(!out.flags.invalid);
+        assert_eq!(to_i64(-1.0, Rounding::Nearest).value, -1);
+    }
+
+    /// The FP multiplication erratum is **detectable but not reproducible**:
+    /// the trigger is documented, the corrupted output never was.
+    ///
+    /// Selecting the affected stepping therefore changes no arithmetic. That is
+    /// deliberate — inventing a plausible wrong value would be the
+    /// fitted-constant failure the accuracy ledger forbids, and every later
+    /// result built on it would stop being evidence.
+    /// **UM Table 7-14, asserted row by row.** These are documented numbers with
+    /// no generating rule, so the test is the transcription check.
+    #[test]
+    fn the_fpu_delay_table_matches_the_manual() {
+        // ADD, SUB: 3 in both formats.
+        for funct in [0o00, 0o01] {
+            assert_eq!(delay_cycles(funct, FMT_S), 3);
+            assert_eq!(delay_cycles(funct, FMT_D), 3);
+        }
+        assert_eq!(delay_cycles(0o02, FMT_S), 5, "MUL.S");
+        assert_eq!(delay_cycles(0o02, FMT_D), 8, "MUL.D");
+        for funct in [0o03, 0o04] {
+            assert_eq!(delay_cycles(funct, FMT_S), 29, "DIV/SQRT.S");
+            assert_eq!(delay_cycles(funct, FMT_D), 58, "DIV/SQRT.D");
+        }
+        // ABS, MOV, NEG and C.cond are single-cycle, so they add no stall.
+        for funct in [0o05, 0o06, 0o07, 0o60, 0o62, 0o74] {
+            assert_eq!(delay_cycles(funct, FMT_S), 1);
+            assert_eq!(stall_cycles(funct, FMT_S), 0, "no stall for a 1-cycle op");
+        }
+        // The eight ROUND/TRUNC/CEIL/FLOOR forms.
+        for funct in 0o10..=0o17 {
+            assert_eq!(delay_cycles(funct, FMT_S), 5);
+            assert_eq!(delay_cycles(funct, FMT_D), 5);
+        }
+        // The CVT rows are the only ones that differ by SOURCE format, which is
+        // the part a uniform table would get wrong.
+        assert_eq!(delay_cycles(0o40, FMT_D), 2, "CVT.S from double");
+        assert_eq!(delay_cycles(0o40, FMT_W), 5, "CVT.S from word");
+        assert_eq!(delay_cycles(0o40, FMT_L), 5, "CVT.S from long");
+        assert_eq!(delay_cycles(0o41, FMT_S), 1, "CVT.D from single");
+        assert_eq!(delay_cycles(0o41, FMT_W), 5, "CVT.D from word");
+        assert_eq!(delay_cycles(0o41, FMT_L), 5, "CVT.D from long");
+        assert_eq!(delay_cycles(0o44, FMT_S), 5, "CVT.W");
+        assert_eq!(delay_cycles(0o45, FMT_D), 5, "CVT.L");
+    }
+
+    /// A rate of 1 is an ordinary instruction, not a one-cycle penalty.
+    #[test]
+    fn single_cycle_fpu_ops_are_charged_nothing() {
+        assert_eq!(stall_cycles(0o06, FMT_S), 0, "MOV.S");
+        assert_eq!(stall_cycles(0o41, FMT_S), 0, "CVT.D.S is one cycle");
+        assert_eq!(stall_cycles(0o02, FMT_D), 8, "but MUL.D is not");
+    }
+
+    #[test]
+    fn the_multiplication_erratum_is_modeled_but_not_invented() {
+        assert!(!Stepping::default().has_mul_erratum(), "fixed by default");
+        assert!(Stepping::Early.has_mul_erratum());
+
+        // Selecting the affected stepping changes nothing about a multiply,
+        // because there is nothing documented to change it to.
+        let a = mul_s(3.0, 4.0, Rounding::Nearest);
+        assert_eq!(a.value, 12.0, "arithmetic is stepping-independent today");
+        assert_eq!(a.flags, Flags::NONE);
+    }
+
+    /// The trigger is a property of the **previous** multiply's operands: a NaN,
+    /// zero or infinity. It is tested now so a future characterization has
+    /// somewhere correct to attach the output.
+    #[test]
+    fn the_erratum_trigger_keys_off_the_previous_multiplys_operands() {
+        for (a, b) in [
+            (f64::NAN, 1.0),
+            (0.0, 1.0),
+            (1.0, -0.0),
+            (f64::INFINITY, 1.0),
+            (1.0, f64::NEG_INFINITY),
+        ] {
+            assert!(mul_erratum_triggers(a, b), "{a} * {b} arms the erratum");
+        }
+        assert!(!mul_erratum_triggers(2.0, 3.0), "ordinary operands do not");
+        assert!(!mul_erratum_triggers(-1.5, 1e30));
+    }
+}

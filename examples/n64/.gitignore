@@ -1,0 +1,6 @@
+out/
+*.rbxl
+place/rom/
+target/
+*.rbxl.lock
+*.ppm

@@ -2239,7 +2239,12 @@ impl<'a, 'tcx> FnLower<'a, 'tcx> {
                         finish(self);
                         return;
                     }
-                    // use the fallback body
+                    // use the fallback body -- only if there is one: an intrinsic without a
+                    // body gets a placeholder MIR of `unreachable`, which would silently make
+                    // every caller dead code
+                    if tcx.intrinsic(def_id).map(|i| i.must_be_overridden).unwrap_or(true) {
+                        self.fatal(format!("unsupported intrinsic `{}` for {:?}", tcx.item_name(def_id), inst.args));
+                    }
                     callee_inst = Some(Instance::new_raw(def_id, inst.args));
                 }
                 InstanceKind::Shim(ShimKind::DropGlue(_, None)) => {

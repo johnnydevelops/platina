@@ -1,0 +1,57 @@
+[package]
+name = "rustyn64-core"
+version = "0.8.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[features]
+default = ["std"]
+std = []
+# ADR 0011 / ADR 0012: the optional block-based fast-path scheduler. Default-OFF,
+# and additive — with it disabled this crate contains no behavior change at all,
+# because the fast path is a separate entry point (`System::run_until_fast`)
+# rather than a branch inside the accurate one. It adds no field to `System`, so
+# the save-state layout is identical either way and ADR 0011 §4's mode marker is
+# not needed yet; that becomes due only when the fast path acquires state of its
+# own.
+fast-scheduler = []
+# ADR 0013: the instruction-granular execution mode. INDEPENDENT of
+# `fast-scheduler` — neither implies the other, because one is tick-identical and
+# one deliberately is not, so they are graded by different predicates (ADR 0013
+# §1). Where both are enabled, `fast-exec`'s scheduler is the one that runs.
+fast-exec = ["rustyn64-cpu/fast-exec"]
+# ADR 0014: capture the RDP command stream as the Bus feeds it to the RDP, so an
+# out-of-core rasterizer can be given the same stream. Default-OFF and purely
+# additive: it adds one `#[serde(skip)]` field, so the save-state layout is
+# identical either way, and it changes no emulated behavior.
+rdp-tap = []
+# Work-unit counters: RSP instructions executed and Bus accesses serviced, per
+# frame. They exist to settle a question a sampled profile cannot answer —
+# whether a bucket that grew is doing MORE WORK or merely being CHARGED
+# differently by the inliner (`docs/performance.md`). Default-OFF, because the
+# Bus increment sits in the hottest path in the emulator and a shipped build must
+# not pay for a measurement. Both fields are `#[serde(skip)]`, so the save-state
+# layout is identical either way (ADR 0005).
+work-counters = ["rustyn64-rsp/work-counters", "rustyn64-cpu/work-counters", "rustyn64-rdp/work-counters"]
+
+[dependencies]
+serde = { version = "1", default-features = false, features = ["derive", "alloc"] }
+serde-big-array = "0.5"
+rustyn64-snapshot = { path = "../rustyn64-snapshot", version = "0.8.0" }
+rustyn64-cpu = { path = "../rustyn64-cpu", version = "0.8.0", default-features = false }
+rustyn64-rsp = { path = "../rustyn64-rsp", version = "0.8.0", default-features = false }
+rustyn64-rdp = { path = "../rustyn64-rdp", version = "0.8.0", default-features = false }
+rustyn64-audio = { path = "../rustyn64-audio", version = "0.8.0", default-features = false }
+rustyn64-cart = { path = "../rustyn64-cart", version = "0.8.0", default-features = false }
+
+[dev-dependencies]
+# The `fast-scheduler` differential gate compares two machines by serializing
+# both and requiring the bytes to match. A dev-dependency, so it is absent from
+# every shipped build and cannot affect `no_std`. Same version the frontend's
+# save-states already use, so the two agree on the encoding by construction.
+bincode = "1"
+
+[lints]
+workspace = true

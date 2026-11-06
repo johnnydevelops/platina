@@ -1,0 +1,141 @@
+# Rust
+/target/
+**/target/
+**/*.rs.bk
+*.pdb
+Cargo.lock.bak
+
+# IDE
+.idea/
+.vscode/
+*.iml
+*.swp
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Merge / patch artifacts
+*.orig
+*.rej
+
+# Generated
+*.profraw
+*.profdata
+/coverage/
+/perf.data*
+/flamegraph.svg
+
+# Workflow output reproduced locally (e.g. under `act`): pages.yml assembles the
+# Pages artifact in _site/, release.yml stages packaged archives in dist/.
+/_site/
+/dist/
+/site/
+
+# Release archives, if built by hand rather than by the release workflow
+/rustyn64-*.tar.gz
+/rustyn64-*.zip
+/SHA256SUMS
+
+# Per-developer
+.envrc
+.direnv/
+CLAUDE.local.md
+.claude/settings.local.json
+
+# Agent tooling (Master-Claude writes *.mc-bak on every mc-apply/retrofit run)
+*.mc-bak
+
+# Pre-edit snapshots taken before instrumenting a file, so cleanup is a restore
+# of a known copy rather than a `git checkout` that would also discard unrelated
+# uncommitted work.
+*.preedit
+*.pre
+
+# Extracted reference text. The VR4300 User's Manual is a 600-page PDF under
+# `n64brew_wiki/` (itself gitignored); `mutool draw -F txt` output is a large
+# derived artifact that is cheap to regenerate and must not be committed --
+# `pdftotext` scrambles this file, so the extraction is not reproducible by the
+# obvious command and someone will be tempted to commit the result.
+/um.txt
+*.um.txt
+
+# Node (markdownlint-cli is run via npx; guard against a local install)
+node_modules/
+package-lock.json
+
+# Python (scripts/ tooling; py_compile and imports drop bytecode caches)
+__pycache__/
+*.py[cod]
+.ruff_cache/
+.venv/
+
+# Large local N64brew Wiki mirror (reference only; rebuild with
+# scripts/mirror_n64brew_wiki.py). Upstream https://n64brew.dev is
+# authoritative -- see n64brew_wiki/README.md.
+/n64brew_wiki/
+
+# --- Commercial ROMs: NEVER commit. Fail closed. ---------------------------
+# Layer 1 of 3 (see also the pre-commit hook and the `no-commercial-roms` CI
+# job). Belt and braces on purpose: the directory rule below is the intent, and
+# the extension rules catch a ROM dropped anywhere else in the tree by accident.
+#
+# These extensions are ignored EVERYWHERE, not just under tests/roms/external/.
+# When the committed CC0/homebrew suites land (the `test-roms` feature), add an
+# explicit negation for just that path, e.g.:
+#     !/tests/roms/homebrew/**/*.z64
+# Never relax these globally.
+*.z64
+*.n64
+*.v64
+*.ndd
+
+# Re-include the COMMITTED tier: permissively-licensed test suites only, each
+# shipping its upstream LICENSE verbatim. Keep this list in step with ALLOW_RE
+# in scripts/check_no_roms.sh, and see tests/roms/README.md for the tier rules.
+# Copyleft and unlicensed corpora do NOT get a negation -- they stay external.
+!/tests/roms/n64-systemtest/*.z64
+# Our own MIT OR Apache-2.0 homebrew fixtures (assembled from committed sources
+# under tests/roms/homebrew/): our code, so committable like any other output.
+!/tests/roms/homebrew/**/*.z64
+# PeterLemon (krom) CPU/CP1 instruction-timing test ROMs — Unlicense (public
+# domain), so committable as curated timing oracles (see tests/roms/peterlemon-timing/README.md).
+# Re-included by exact filename (not a directory-wide `*.z64`) so a stray image
+# cannot ride the negation in; the check_no_roms size cap + CI guard back this.
+!/tests/roms/peterlemon-timing/CPUTIMINGNTSC.z64
+!/tests/roms/peterlemon-timing/CP1TIMINGNTSC.z64
+
+# First-party homebrew timing ROMs (authored here, MIT OR Apache-2.0; no Nintendo
+# code). Re-included by exact filename. See tools/mrdram-timing-rom/.
+!/tools/mrdram-timing-rom/mrdram_timing.z64
+!/tools/mrdram-timing-rom/icache_timing.z64
+
+# ...then hard-exclude the external tier again, so no negation above can ever
+# accidentally re-include a commercial dump. Order matters: this comes last.
+/tests/roms/external/
+
+# rusty-console-forge additions
+/ref-proj/
+
+# Emulator-oracle build trees and captured traces. The ORACLES are patched
+# locally (cen64 gains an instruction-trace hook, ares a raw (pc,word) dump);
+# those patches live in the gitignored `ref-proj/` clones above and are
+# regenerated, never committed. The captured raw traces are large and
+# reproducible, so they stay out too -- only the truncated, provenance-headed
+# `tests/golden/*.log` is committed.
+*.trace
+/tests/golden/*.raw
+/tests/captures/
+/perf-logs/
+/web/dist/
+
+# Antigravity PR reviewer: large-diff on-disk handoff (transient, removed by the script).
+/.agy-review-work/
+
+# Trunk wasm build output (frontend browser demo)
+crates/rustyn64-frontend/web/dist/
+
+# CodeGraph local index (per-developer, not committed)
+.codegraph/

@@ -1,0 +1,407 @@
+//! `rustyn64-cpu` — NEC VR4300 (MIPS R4300i) main CPU.
+//!
+//! 64-bit MIPS III core: 32 general-purpose registers, HI/LO, the CP0
+//! system-control coprocessor (TLB + exceptions), the CP1 FPU, and the `SysAD`
+//! bus interface. This is a **skeleton** — the real interpreter/JIT, the TLB,
+//! and the FPU are major roadmap phases. Behavior is pinned against
+//! `n64-systemtest` FIRST (test-ROM-is-spec), then implemented until it passes.
+//!
+//! Part of the one-directional chip-crate graph (see `docs/architecture.md`):
+//! this crate does NOT depend on any other chip crate. It talks to the rest of
+//! the machine through the [`Bus`] trait, which `rustyn64-core` implements.
+//! `#![no_std]` + `alloc` so it cross-compiles to a bare-metal target; only the
+//! frontend carries `std` + `unsafe`.
+
+#![no_std]
+#![forbid(unsafe_code)]
+#![warn(missing_docs)]
+// Truncating / sign casts are the canonical encoding for MIPS register
+// arithmetic; we annotate once at module level rather than per line.
+#![allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_lossless,
+    clippy::cast_possible_wrap,
+    clippy::cast_sign_loss
+)]
+// Skeleton `tick`/step methods are deliberately non-`const`: they will gain
+// real (non-const) bus-driven bodies as the chip is implemented. Accept the
+// pedantic const-fn suggestion at module level rather than salt every stub.
+#![allow(clippy::missing_const_for_fn)]
+
+extern crate alloc;
+
+use serde::{Deserialize, Serialize};
+
+pub mod addr;
+pub mod alu;
+pub mod cache;
+pub mod cop0;
+pub mod cop1;
+pub mod decode;
+pub mod exception;
+pub mod exec;
+pub mod fpr;
+pub mod fpu;
+pub mod mem;
+pub mod pipeline;
+pub mod regs;
+pub mod softfloat;
+pub mod sysad;
+pub mod tlb;
+
+pub use addr::{Cached, Physical, Segment, segment, translate_via};
+pub use alu::{HiLo, MulDiv};
+pub use decode::{Decoded, Op, decode};
+pub use exec::{Executed, WriteBack, execute};
+pub use mem::{LoadKind, StoreKind};
+#[cfg(feature = "work-counters")]
+pub use pipeline::commit_class;
+pub use pipeline::{Exception, Interlock, Latch, Pipeline, Stage};
+pub use regs::Regs;
+pub use sysad::{BlockOrder, Phase, Transaction, Width, block_order};
+
+/// Which half of a `SysAD` bus transaction is on the wire.
+///
+/// The VR4300 talks to the RCP over the `SysAD` bus, which multiplexes the command
+/// and the data onto the same lines; `SYSCMD` bit 4 is documented as "Command or
+/// Data" and this enum mirrors that split.
+///
+/// **This describes the bus protocol and carries no interrupt semantics.** An
+/// earlier revision paired it with a `poll_irq_at_phase(BusPhase)` hook, on the
+/// assumption that interrupts are sampled at a particular half of a transaction.
+/// No such coupling is documented anywhere — not in the User's Manual, not on the
+/// wiki. The documented rule (UM §4.7.1) is per-`PCycle` and gated on stall state:
+/// *"NMI and interrupt exception requests are accepted only if the previous
+/// `PCycle` was a run cycle."* That hook was shaped on the wrong axis and was
+/// removed rather than completed (ADR 0007).
+///
+/// `SysAD` runs at `SClock` = `MClock` = 62.5 MHz, so one bus cycle is 1.5 `PCycles` — 3
+/// master ticks against the CPU's 2 (ADR 0006). This is *not* the deferred ADR
+/// 0005 refactor, which concerns resolution finer than one `PClock`.
+///
+/// TODO(T-11-008): the transaction model that actually uses this.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
+pub enum BusPhase {
+    /// The command half — the CPU drives `SYSCMD` and the address.
+    Command,
+    /// The data half — the transfer itself, and where the result commits.
+    Data,
+}
+
+/// The system-memory bus the VR4300 borrows during [`Cpu::tick`].
+///
+/// Implemented by `rustyn64-core::Bus`. Kept as a trait so the CPU can be
+/// fuzzed and benchmarked against a tiny in-crate bus without pulling in the
+/// rest of the machine.
+pub trait Bus {
+    /// Read a byte at a 32-bit physical address (post-TLB).
+    fn read_u8(&mut self, addr: u32) -> u8;
+    /// Write a byte at a 32-bit physical address (post-TLB).
+    fn write_u8(&mut self, addr: u32, val: u8);
+
+    /// Read an aligned big-endian 32-bit word. Default composes four byte
+    /// reads; `rustyn64-core` overrides with a fast RDRAM path.
+    fn read_u32(&mut self, addr: u32) -> u32 {
+        let b = [
+            self.read_u8(addr),
+            self.read_u8(addr.wrapping_add(1)),
+            self.read_u8(addr.wrapping_add(2)),
+            self.read_u8(addr.wrapping_add(3)),
+        ];
+        u32::from_be_bytes(b)
+    }
+
+    /// Write an aligned big-endian 32-bit word.
+    fn write_u32(&mut self, addr: u32, val: u32) {
+        let b = val.to_be_bytes();
+        self.write_u8(addr, b[0]);
+        self.write_u8(addr.wrapping_add(1), b[1]);
+        self.write_u8(addr.wrapping_add(2), b[2]);
+        self.write_u8(addr.wrapping_add(3), b[3]);
+    }
+
+    /// Write `value` as a `width`-byte store, **carrying the access width and
+    /// the untruncated source register to the bus**.
+    ///
+    /// The CPU cannot narrow the value itself, because whether narrowing is
+    /// correct is a property of the *target*, not of the instruction. RDRAM
+    /// honors the byte enables and stores exactly `width` bytes; every device
+    /// on the RCP's internal bus ignores the access size entirely and latches
+    /// the whole 32-bit word the VR4300 placed on `SysAD` — including the bits
+    /// of the source register that a narrow store was never meant to send
+    /// (N64brew *Memory map* §Physical Memory Map accesses).
+    ///
+    /// So the width and the full register both have to survive the call, and
+    /// the implementor decides. The default here is the RDRAM-style narrowing,
+    /// which is right for a plain memory and for the test buses; `rustyn64-core`
+    /// overrides it to model the RCP's size-blindness.
+    fn write_sized(&mut self, addr: u32, width: u64, value: u64) {
+        match width {
+            1 => self.write_u8(addr, value as u8),
+            2 => {
+                self.write_u8(addr, (value >> 8) as u8);
+                self.write_u8(addr.wrapping_add(1), value as u8);
+            }
+            4 => self.write_u32(addr, value as u32),
+            8 => {
+                self.write_u32(addr, (value >> 32) as u32);
+                self.write_u32(addr.wrapping_add(4), value as u32);
+            }
+            _ => {}
+        }
+    }
+
+    /// Does this host offer the **EMUX** emulator extensions?
+    ///
+    /// Default: **no**, and that default is the load-bearing part. Real hardware
+    /// has no EMUX — COP0 CO `funct` 0x20-0x3F retires inertly (ledger C-8), so
+    /// `xdetect` leaves its destination register untouched and the guest
+    /// concludes no extensions exist. Advertising them changes which console
+    /// path n64-systemtest takes -- it changes the instruction stream.
+    ///
+    /// ares takes exactly this position: every EMUX handler in its `emux.cpp`
+    /// opens with `if(!system.homebrewMode) return;`, off by default. A default
+    /// build of `RustyN64` must behave like hardware; a harness that wants the
+    /// faster console opts in deliberately.
+    fn emux_enabled(&self) -> bool {
+        false
+    }
+
+    /// `EMUX xlog`: the guest has asked the *emulator* to print `bytes`.
+    ///
+    /// Default: discard. `rustyn64-core` collects it. This is n64-systemtest's
+    /// out-of-band console channel — it reaches the host without any PI, SI or
+    /// `ISViewer` emulation, which is why it is worth implementing well before the
+    /// cartridge subsystem exists.
+    fn emux_log(&mut self, bytes: &[u8]) {
+        let _ = bytes;
+    }
+
+    /// `EMUX xioctl(EXIT)`: the guest has asked the emulator to terminate.
+    ///
+    /// Default: ignore. A harness that honors it gets a definite end-of-run
+    /// signal instead of a tick budget, which is the difference between "the
+    /// suite finished" and "we stopped watching".
+    fn emux_exit(&mut self) {}
+
+    /// Sample the pending-interrupt level: the MI lines masked by `MI_MASK`.
+    ///
+    /// Default: no interrupt pending. `rustyn64-core` overrides it.
+    ///
+    /// Sampling happens **once per `PClock` in the DC stage** (UM Figure 4-12 and
+    /// §4.7.6, which lists the interrupt exception among the DC-stage priorities)
+    /// and is accepted only if the previous `PCycle` was a run cycle (§4.7.1). The
+    /// run-cycle gate lives in the pipeline, not here — this hook only reports the
+    /// level. Exactly one recognition predicate exists in the tree.
+    fn poll_irq(&mut self) -> bool {
+        false
+    }
+}
+
+/// NEC VR4300 architectural state.
+///
+/// This is the **skeleton** register file only; the decode/execute pipeline,
+/// the CP0 TLB, and the CP1 FPU are roadmap phases left as marked TODOs.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Cpu {
+    /// The register file: 32 GPRs plus `HI`/`LO`. `$zero`'s hardwiring lives in
+    /// [`Regs::read`]/[`Regs::write`] so no call site can forget it.
+    pub regs: Regs,
+    /// Program counter (virtual address).
+    pub pc: u64,
+    /// The five-stage pipeline: four inter-stage latches plus control state
+    /// (ADR 0007). Advanced one `PClock` per [`Cpu::tick`].
+    pub pipeline: Pipeline,
+    /// Retired-work tally: instructions retired since power-on, for the
+    /// golden-log differ.
+    ///
+    /// This is **not** a time position and nothing schedules against it — the
+    /// scheduler derives every cycle position from its one `master_ticks` counter
+    /// (ADR 0006). A work tally is the one kind of counter that is still allowed
+    /// to be incremented; see `System::cpu_cycles()` for the CPU's *position*.
+    pub retired: u64,
+    // This struct deliberately holds no CP0/TLB/CP1/LL state. All of it exists and
+    // lives one level down, in [`Pipeline`], because it is pipelined state rather
+    // than architectural state the fetch loop owns (ADR 0007): `pipeline.cop0`,
+    // `pipeline.tlb`, `pipeline.fpr`, `pipeline.ll_bit`, and the branch-delay-slot
+    // flag as `in_delay_slot` riding in the inter-stage latch rather than a global
+    // CPU flag.
+    //
+    // Stated positively because this previously read as a `TODO` listing all five
+    // as unimplemented, long after they shipped.
+}
+
+impl Default for Cpu {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Cpu {
+    /// Construct at power-on / cold reset.
+    ///
+    /// `gpr[0]` is the architectural zero register. Any phase alignment, where
+    /// applicable, comes from the *seeded* scheduler PRNG (the determinism
+    /// contract — see `docs/adr/0004`), never the OS RNG.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            regs: Regs::new(),
+            // The reset vector, as a SIGN-EXTENDED 64-bit address. In 32-bit
+            // addressing mode every valid address is one, and `0x0000_0000_BFC0_0000`
+            // is not the same address -- it is an address error. n64-systemtest
+            // asserts exactly that distinction ("LW with address not sign
+            // extended"), so the truncated form is not a harmless shorthand.
+            pc: 0xFFFF_FFFF_BFC0_0000,
+            pipeline: Pipeline::new(),
+            retired: 0,
+        }
+    }
+
+    /// Set the program counter (used by golden-log automation harnesses).
+    pub const fn set_pc(&mut self, pc: u64) {
+        self.pc = pc;
+    }
+
+    /// Advance the CPU by **one `PClock`** — not one instruction.
+    ///
+    /// The scheduler calls this on every CPU edge (every 2nd master tick, ADR
+    /// 0006). At least 5 `PCycles` are required to execute an instruction (UM
+    /// §4.1), and `DDIV` stalls the whole pipeline for 69 (UM Table 3-12), so a
+    /// tick is emphatically not an instruction.
+    ///
+    /// Hot path: keep allocation-free (no `Vec`/`Box` in `tick`). The `bus`
+    /// argument is the `&mut Bus` the scheduler hands down each step.
+    /// **Prefer [`Cpu::tick_at`] when a scheduler is present.** This path holds
+    /// the COP0 `Count` timeline still, because `Count` is derived from the
+    /// master clock (ADR 0006) and this function has no access to it — so
+    /// `Count`/`Compare` and the timer interrupt do not advance. That is
+    /// deliberate: guessing a rate here would be wrong, and `Count` runs at half
+    /// `PClock`, not one step per call.
+    pub fn tick<B: Bus>(&mut self, bus: &mut B) {
+        self.pipeline.advance(bus, &mut self.regs, &mut self.pc);
+        self.retired = self.pipeline.retired;
+    }
+
+    /// Step one `PCycle` with the scheduler's `Count` timeline supplied.
+    ///
+    /// The scheduler owns `master_ticks` and derives `count_ticks` from it
+    /// (ADR 0006); the CPU turns that into the architectural, guest-writable
+    /// `Count`. Passing it in rather than incrementing locally is what keeps
+    /// `master_ticks` the only incremented counter in the core.
+    pub fn tick_at<B: Bus>(&mut self, bus: &mut B, count_now: u64) {
+        self.pipeline
+            .advance_at(bus, &mut self.regs, &mut self.pc, count_now);
+        self.retired = self.pipeline.retired;
+    }
+
+    /// Whether the CPU is parked at a recognized self-branch idle loop.
+    #[cfg(feature = "fast-exec")]
+    #[must_use]
+    pub const fn is_parked_in_idle_loop(&self) -> bool {
+        matches!(self.pipeline.idle_pc, Some(pc) if pc == self.pc)
+    }
+
+    /// `Count` ticks the scheduler may batch before the timer could latch `IP7`.
+    /// One idle pair is exactly one `Count` tick, so this is also a pair count.
+    #[cfg(feature = "fast-exec")]
+    #[must_use]
+    pub const fn count_ticks_until_timer_match(&self) -> u64 {
+        self.pipeline.cop0.count_ticks_until_timer_match()
+    }
+
+    /// Retire `pairs` iterations of a recognized idle loop.
+    ///
+    /// The per-boundary path's state changes for the idle pair, applied `pairs`
+    /// times: two instructions retired and `Random` ticked twice. Everything the
+    /// per-boundary path does *besides* this — sampling the interrupt lines,
+    /// the NMI check, `set_now` — is what the caller has established cannot
+    /// change across the batch, and is why this is not simply a loop over
+    /// [`Cpu::step_instruction_at`].
+    ///
+    /// `Random` advances through [`Cop0::tick_random_by`], which is the closed
+    /// form of the wrap-at-`Wired` walk (UM §6.3.3) rather than `random -= 2n` —
+    /// that shortcut is wrong exactly when the batch crosses the wrap, and the
+    /// batch is long precisely when it would.
+    #[cfg(feature = "fast-exec")]
+    pub fn retire_idle_pairs(&mut self, pairs: u64) {
+        self.pipeline.retired = self.pipeline.retired.wrapping_add(pairs.wrapping_mul(2));
+        self.pipeline.cop0.tick_random_by(pairs.wrapping_mul(2));
+        self.retired = self.pipeline.retired;
+    }
+
+    /// Execute one instruction (plus its delay slot, if it branches) and return
+    /// the `PCycle`s it cost — the **instruction-granular** path (ADR 0013),
+    /// behind the default-off `fast-exec` feature.
+    ///
+    /// A **separate entry point**, not a branch inside [`Cpu::tick_at`], for the
+    /// same reason `System::run_until_fast` is one: with the feature off this
+    /// function does not exist, so ADR 0011 §1's "default builds are unchanged" is
+    /// true by construction rather than by inspection, and the accurate path
+    /// carries no branch that exists only for its sibling.
+    ///
+    /// The unit differs from every other step function in this crate, and the
+    /// signature says so: [`Cpu::tick`] and [`Cpu::tick_at`] advance **one
+    /// `PClock`** and return nothing; this one advances **one instruction** and
+    /// returns what that cost. A caller that treats the return value as a tick
+    /// count will run the machine roughly five times too fast.
+    ///
+    /// `count_now` is the scheduler's derived COP0 `Count` position, passed in for
+    /// the same reason [`Cpu::tick_at`] takes it (ADR 0006).
+    #[cfg(feature = "fast-exec")]
+    #[must_use = "the return value is the instruction's cost in PCycles; \
+                  discarding it makes the machine run at one PCycle per instruction"]
+    pub fn step_instruction_at<B: Bus>(&mut self, bus: &mut B, count_now: u64) -> u32 {
+        let cost = self
+            .pipeline
+            .step_instruction(bus, &mut self.regs, &mut self.pc, count_now);
+        self.retired = self.pipeline.retired;
+        cost
+    }
+}
+
+/// Returns the crate version string.
+#[must_use]
+pub const fn version() -> &'static str {
+    env!("CARGO_PKG_VERSION")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct NullBus;
+    impl Bus for NullBus {
+        fn read_u8(&mut self, _addr: u32) -> u8 {
+            0
+        }
+        fn write_u8(&mut self, _addr: u32, _val: u8) {}
+    }
+
+    #[test]
+    fn constructs_with_zero_register() {
+        let cpu = Cpu::new();
+        assert_eq!(cpu.regs.read(0), 0);
+        assert_eq!(cpu.pc, 0xFFFF_FFFF_BFC0_0000);
+    }
+
+    /// A tick is one `PClock`, not one instruction. The pipeline is 5 stages
+    /// deep, so nothing retires until it has filled (UM §4.1: "at least 5
+    /// `PCycle`s are required to execute an instruction").
+    #[test]
+    fn a_tick_is_a_pclock_not_an_instruction() {
+        let mut cpu = Cpu::new();
+        let mut bus = NullBus;
+        for cycle in 1..=4 {
+            cpu.tick(&mut bus);
+            assert_eq!(cpu.retired, 0, "retired on cycle {cycle}, before WB ran");
+        }
+        cpu.tick(&mut bus);
+        assert_eq!(cpu.retired, 1, "the first instruction retires on cycle 5");
+    }
+
+    #[test]
+    fn version_is_non_empty() {
+        assert!(!version().is_empty());
+    }
+}

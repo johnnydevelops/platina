@@ -1,0 +1,1042 @@
+//! The canonical master-clock scheduler — the heart of the emulator.
+//!
+//! # Timebase model (ADR 0006)
+//!
+//! The tick unit is **187.5 MHz** ([`MASTER_HZ`]) — the LCM of the VR4300's
+//! 93.75 MHz `PClock` and the RCP's 62.5 MHz `MClock`. That makes **every** emulated
+//! clock domain an integer divisor of one counter:
+//!
+//! | Component | Rate | Divider |
+//! |-----------|------------|---------|
+//! | VR4300 `PClock` | 93.75 MHz | 2 |
+//! | RCP (`MClock` / `SClock`) | 62.5 MHz | 3 |
+//! | COP0 `Count` (half `PClock`) | 46.875 MHz | 4 |
+//! | Serial Interface | 15.625 MHz | 12 |
+//! | Cartridge / PIF | 1.953125 MHz | 96 |
+//!
+//! No accumulator, no remainder, no drift — drift is *unrepresentable* rather
+//! than merely avoided. Note the hardware derives the CPU **from** `MClock` (a 3/2
+//! PLL at `DivMode = 0b01`), not the reverse; ADR 0001 had the CPU as master,
+//! which inverted that and is why the RCP needed a fractional remainder.
+//!
+//! Only the VI (VCLK, ~48.68 MHz, off a *different* crystal) and the AI genuinely
+//! are not rational multiples of this tick; those keep a fractional accumulator.
+//!
+//! # The one rule
+//!
+//! **`master_ticks` is the only counter in the core that is ever incremented.**
+//! Every other cycle position is *derived* — see [`System::cpu_cycles`] and
+//! [`System::rcp_cycles`], which are accessors rather than fields. A second
+//! incremented counter agrees with the first only because every call site
+//! remembers to step it: an invariant held by construction rather than by
+//! derivation, correct until one path forgets. The `residue_invariants_never_move`
+//! test exists to catch exactly that.
+//!
+//! A *retired-work* tally is a different thing and is legitimate
+//! (`Cpu::retired`); it counts work done and nothing schedules against it.
+//!
+//! # Lockstep, edge to edge
+//!
+//! This is **LOCKSTEP**, not catch-up: an RCP event (a DP-done IRQ, an SP halt) is
+//! visible to the very next CPU step. But nothing iterates 187.5M times a second —
+//! the CPU lands on every 2nd tick and the RCP on every 3rd, so the pattern repeats
+//! every 6 ticks and [`System::step_to_next_edge`] jumps straight to the next tick
+//! where something is due. The unit is a time base, not a loop counter.
+//!
+//! There are **never** OS threads in the core; one timeline is the whole reason the
+//! determinism contract holds (ADR 0004). Rollback / run-ahead live in the frontend.
+//!
+//! See `docs/scheduler.md` and `docs/adr/0006-one-canonical-master-clock.md`.
+
+// The PRNG step and the skeleton `reset` are flagged const-able, but they will
+// gain non-const bodies (reset warms the Bus subsystems); accept at module level.
+#![allow(clippy::missing_const_for_fn)]
+
+use crate::bus::Bus;
+use rustyn64_cpu::Cpu;
+use serde::{Deserialize, Serialize};
+
+/// The canonical master tick rate: **187.5 MHz**, the LCM of the CPU and RCP clocks.
+///
+/// Beware the name: the *hardware* documentation uses `MasterClock` for the
+/// 62.5 MHz [`RCP_HZ`], and superseded ADR 0001 used it for [`CPU_HZ`]. Always
+/// state the rate — see `docs/glossary.md`.
+pub const MASTER_HZ: u64 = 187_500_000;
+
+/// The VR4300 pipeline clock (`PClock`), 93.75 MHz. `MASTER_HZ / CPU_DIVIDER`.
+pub const CPU_HZ: u64 = 93_750_000;
+
+/// The RCP clock (`MClock`, and the CPU's `SClock` bus rate), 62.5 MHz.
+pub const RCP_HZ: u64 = 62_500_000;
+
+/// Master ticks per VR4300 `PClock`.
+pub const CPU_DIVIDER: u64 = 2;
+
+/// Master ticks per RCP (`MClock`) cycle.
+pub const RCP_DIVIDER: u64 = 3;
+
+/// Ticks after which the whole edge schedule repeats: `lcm(CPU_DIVIDER,
+/// RCP_DIVIDER)`.
+///
+/// A domain steps when `(tick + phase) % divider == 0`, and the phases are
+/// power-on constants (ADR 0006), so *which* domains are due at a tick is a
+/// function of `tick mod` this period and nothing else. The `fast-scheduler`
+/// block is exactly one period: its shape is computed once and replayed, which is
+/// only sound because this really is the repeat length.
+///
+/// Written as an explicit LCM rather than the literal 6 so that changing a divider
+/// cannot leave a stale period behind — a period that is too short would replay a
+/// pattern that no longer aligns, silently stepping the wrong domains.
+pub const EDGE_PERIOD: u64 = {
+    // `lcm(a, b) = a / gcd(a, b) * b`, const-evaluated.
+    const fn gcd(a: u64, b: u64) -> u64 {
+        if b == 0 { a } else { gcd(b, a % b) }
+    }
+    CPU_DIVIDER / gcd(CPU_DIVIDER, RCP_DIVIDER) * RCP_DIVIDER
+};
+
+const _: () = {
+    assert!(
+        EDGE_PERIOD.is_multiple_of(CPU_DIVIDER) && EDGE_PERIOD.is_multiple_of(RCP_DIVIDER),
+        "EDGE_PERIOD must be a common multiple of both dividers, or the \
+         fast-scheduler's replayed pattern drifts out of alignment"
+    );
+};
+
+/// [`EDGE_PERIOD`] as an array length.
+///
+/// The cast cannot truncate — it is the LCM of two single-digit divider constants,
+/// so it is 6 on every target — but clippy sees only `u64 as usize` and cannot know
+/// the value. The assertion below checks exactly that: **that the value survives
+/// the narrowing**, which is the property at issue. (It is not a general round-trip
+/// proof, and an earlier version of this comment overstated it as one.) That is the
+/// difference between a justified `allow` and a silenced lint.
+#[allow(
+    clippy::cast_possible_truncation,
+    reason = "value-checked by the const assertion immediately below"
+)]
+const EDGE_PERIOD_LEN: usize = EDGE_PERIOD as usize;
+
+const _: () = {
+    assert!(
+        EDGE_PERIOD_LEN as u64 == EDGE_PERIOD,
+        "EDGE_PERIOD does not survive narrowing to usize on this target"
+    );
+};
+
+/// Master ticks per COP0 `Count` increment — `Count` runs at **half** `PClock`
+/// (46.875 MHz), per VR4300 User's Manual §6.3.3 Figure 6-3. Forgetting the
+/// halving is a documented source of 2x timing bugs.
+pub const COUNT_DIVIDER: u64 = 4;
+
+/// Master ticks per Serial Interface cycle (15.625 MHz).
+pub const SI_DIVIDER: u64 = 12;
+
+/// Master ticks per cartridge / PIF cycle (1.953125 MHz).
+pub const PIF_DIVIDER: u64 = 96;
+
+/// The CPU:RCP interleaving period: `lcm(CPU_DIVIDER, RCP_DIVIDER)` master ticks.
+///
+/// The CPU lands on ticks 0, 2, 4 and the RCP on 0, 3, so they coincide only
+/// every 6. Seeded power-on phases are offsets within this period.
+pub const PHASE_PERIOD: u64 = 6;
+
+/// A tiny deterministic `SplitMix64` PRNG.
+///
+/// Used ONLY for the seeded power-on phase alignment — the determinism contract
+/// forbids the OS RNG (and system time / thread scheduling) anywhere in the core.
+#[derive(Debug, Clone)]
+struct SplitMix64 {
+    state: u64,
+}
+
+impl SplitMix64 {
+    const fn new(seed: u64) -> Self {
+        Self { state: seed }
+    }
+
+    fn next_u64(&mut self) -> u64 {
+        self.state = self.state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = self.state;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
+    }
+}
+
+/// The seeded power-on phase offsets, one per clock domain.
+///
+/// These are **constants, not counters** — nothing increments them, so the
+/// one-incremented-counter rule is intact. They must be per-domain: if every
+/// domain keyed off the same absolute tick, the CPU/RCP interleaving would be
+/// byte-identical for every seed from tick 6 onward, and the seeded phase ADR 0004
+/// requires would be decorative — `reset_preserves_phase` would still pass while
+/// testing nothing.
+///
+/// The hardware basis is UM Table 11-1's "**1 to 2** `PCycles`: synchronize with
+/// `SClock`" line, an indeterminacy the vendor documents at exactly this boundary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+struct Phases {
+    cpu: u64,
+    rcp: u64,
+}
+
+impl Phases {
+    /// Derive both offsets from one seed. Split out so the modulo reduction is
+    /// provably in range and never appears in the hot path.
+    fn from_seed(seed: u64) -> Self {
+        let mut rng = SplitMix64::new(seed);
+        Self {
+            cpu: rng.next_u64() % CPU_DIVIDER,
+            rcp: rng.next_u64() % RCP_DIVIDER,
+        }
+    }
+}
+
+/// Index names for [`System::rcp_occupancy`].
+#[cfg(feature = "work-counters")]
+pub mod occupancy {
+    /// Total RCP steps taken.
+    pub const STEPS: usize = 0;
+    /// Steps where the RSP was halted — stepping it did no microcode work.
+    pub const RSP_HALTED: usize = 1;
+    /// Steps where the RDP answered from its own state without touching the bus.
+    pub const RDP_IDLE: usize = 2;
+    /// Number of counters.
+    pub const COUNT: usize = 3;
+}
+
+/// Owns the run loop and ties the CPU to the Bus on one timeline.
+///
+/// Determinism contract: same seed + ROM + input ⇒ bit-identical A/V (ADR 0004).
+#[derive(Debug, Serialize, Deserialize)]
+pub struct System {
+    /// Per-RCP-step occupancy census: how often each chip had nothing to do.
+    ///
+    /// The ceiling on an event-driven scheduler is the idle fraction, and a
+    /// profile share cannot supply it — a share says what a chip costs *when it
+    /// runs*, not how often it is stepped for nothing.
+    ///
+    /// A counter (ADR 0006): nothing schedules against it, and `#[serde(skip)]`
+    /// keeps it out of the save-state layout (ADR 0011 §4).
+    #[cfg(feature = "work-counters")]
+    #[serde(skip)]
+    pub rcp_occupancy: [u64; occupancy::COUNT],
+    /// The CPU.
+    pub cpu: Cpu,
+    /// The Bus — owns everything else mutable (RDRAM / RSP / RDP / AI / cart /
+    /// controllers / RCP registers).
+    pub bus: Bus,
+    /// **The** counter. Nothing else in the core is incremented.
+    master_ticks: u64,
+    /// Seeded per-domain power-on phase offsets (constants, not counters).
+    phases: Phases,
+    /// The determinism seed, retained so `reset` re-derives the same phases.
+    seed: u64,
+}
+
+impl System {
+    /// Power on with a determinism seed (drives the per-domain phase alignment).
+    #[must_use]
+    pub fn new(seed: u64) -> Self {
+        Self {
+            #[cfg(feature = "work-counters")]
+            rcp_occupancy: [0; occupancy::COUNT],
+            cpu: Cpu::new(),
+            bus: Bus::default(),
+            master_ticks: 0,
+            phases: Phases::from_seed(seed),
+            seed,
+        }
+    }
+
+    /// Reset (warm). Re-derives the SAME phase alignment from the retained seed
+    /// so a reset mid-run stays deterministic.
+    pub fn reset(&mut self) {
+        self.phases = Phases::from_seed(self.seed);
+        self.master_ticks = 0;
+        self.cpu = Cpu::new();
+        // The VI scan timeline is keyed off `master_ticks`, so it must rebase to
+        // the new zero — otherwise its delta baseline stays in the old timeline
+        // and the VI interrupt is suppressed until the run catches up.
+        self.bus.vi.reset_scan();
+        // Unlock the PIF ROM and clear the boot NMI freeze so a warm reset can
+        // re-run IPL1→IPL2 on the real-PIF path (the PIF unlocks its ROM on the
+        // reset NMI, `PIF-NUS.md` §Console Reset). No-op under HLE. `Cpu::new`
+        // above already put the PC back at the reset vector `0xBFC0_0000`.
+        self.bus.reset_boot_latches();
+        // TODO(T-CORE-03): warm-reset the remaining Bus subsystems (RSP halt,
+        // clear DMA) without zeroing RDRAM — see `docs/scheduler.md`.
+    }
+
+    /// Master ticks elapsed since power-on. The canonical time position.
+    #[must_use]
+    pub const fn master_ticks(&self) -> u64 {
+        self.master_ticks
+    }
+
+    /// The CPU's position on the timeline, in `PClock`s. **Derived, not stored.**
+    ///
+    /// This is a *position*, not a count of work done — with a nonzero seeded
+    /// phase it is nonzero before the CPU has stepped, which is correct and is
+    /// what the residue invariant pins. For work retired, use [`Cpu::retired`].
+    #[must_use]
+    pub const fn cpu_cycles(&self) -> u64 {
+        (self.master_ticks + self.phases.cpu) / CPU_DIVIDER
+    }
+
+    /// The RCP's position on the timeline, in `MClock`s. **Derived, not stored.**
+    #[must_use]
+    pub const fn rcp_cycles(&self) -> u64 {
+        (self.master_ticks + self.phases.rcp) / RCP_DIVIDER
+    }
+
+    /// The COP0 `Count` *offset* since power-on, at half `PClock`.
+    ///
+    /// Not the architectural register: `Count` is guest-writable via `MTC0`, so
+    /// the real value is affine — `epoch_value + (master_ticks - epoch_tick) /
+    /// COUNT_DIVIDER`, re-based on every write. The affine half lives in the CPU
+    /// (`rustyn64_cpu::cop0`, T-12-003) and is fed from here via `tick_at`; this
+    /// is the timeline half.
+    #[must_use]
+    pub const fn count_ticks(&self) -> u64 {
+        (self.master_ticks + self.phases.cpu) / COUNT_DIVIDER
+    }
+
+    /// Is `tick` an edge for a domain with this divider and phase?
+    const fn is_edge(tick: u64, phase: u64, divider: u64) -> bool {
+        (tick + phase).is_multiple_of(divider)
+    }
+
+    /// The next tick strictly after `tick` at which this domain steps.
+    const fn next_edge_after(tick: u64, phase: u64, divider: u64) -> u64 {
+        let next = tick + 1;
+        let rem = (next + phase) % divider;
+        if rem == 0 {
+            next
+        } else {
+            next + (divider - rem)
+        }
+    }
+
+    /// The next tick strictly after the current one at which any domain is due.
+    const fn next_edge(&self) -> u64 {
+        let next_cpu = Self::next_edge_after(self.master_ticks, self.phases.cpu, CPU_DIVIDER);
+        let next_rcp = Self::next_edge_after(self.master_ticks, self.phases.rcp, RCP_DIVIDER);
+        if next_cpu < next_rcp {
+            next_cpu
+        } else {
+            next_rcp
+        }
+    }
+
+    /// Step every domain due at the *current* tick.
+    ///
+    /// CPU first, then the RCP, so an RCP event lands where the next CPU step
+    /// sees it. Reversing this changes which engine observes whose write first
+    /// and is a determinism-visible change.
+    fn step_due_here(&mut self) {
+        let cpu = Self::is_edge(self.master_ticks, self.phases.cpu, CPU_DIVIDER);
+        let rcp = Self::is_edge(self.master_ticks, self.phases.rcp, RCP_DIVIDER);
+        self.step_domains(cpu, rcp);
+    }
+
+    /// Step the domains the caller has *already determined* are due here.
+    ///
+    /// Split out of [`System::step_due_here`] so the fast path can drive it from a
+    /// precomputed schedule instead of re-deriving the same two predicates on every
+    /// edge. The ordering rule above lives here, in the one place both callers
+    /// reach, so it cannot come apart between them.
+    fn step_domains(&mut self, cpu: bool, rcp: bool) {
+        // A failed real-PIF boot checksum freezes the CPU via NMI until power-off
+        // (`PIF-NUS.md`). Stop stepping it; the RCP keeps running, as on hardware.
+        if cpu && !self.bus.boot_nmi_halt() {
+            // `count_ticks` is derived from `master_ticks`, never incremented,
+            // and the CPU turns it into the guest-writable `Count` (ADR 0006).
+            let count_now = self.count_ticks();
+            self.cpu.tick_at(&mut self.bus, count_now);
+        }
+        if rcp {
+            self.step_rcp();
+        }
+    }
+
+    /// Advance to the next tick at which **any** domain is due, and step every
+    /// domain due at that tick. Returns the tick landed on.
+    ///
+    /// Edge-to-edge: the master tick is never iterated. Hot path — allocation-free.
+    ///
+    /// Note the tick the machine currently sits on is never re-stepped, so tick 0
+    /// is a position rather than an executed edge. Only the *intervals* between
+    /// ticks carry work, which is what keeps the residue invariant constant.
+    pub fn step_to_next_edge(&mut self) -> u64 {
+        self.master_ticks = self.next_edge();
+        self.step_due_here();
+        self.master_ticks
+    }
+
+    /// Run until `master_ticks() == target`, stepping every domain on every edge
+    /// in `(now, target]` — and **not** one past it.
+    ///
+    /// Overshooting would make "how many CPU steps in N ticks" depend on where
+    /// the edges happened to fall, which is exactly the kind of off-by-a-phase
+    /// error the residue invariant is meant to make impossible.
+    pub fn run_until(&mut self, target: u64) {
+        while self.next_edge() <= target {
+            self.master_ticks = self.next_edge();
+            self.step_due_here();
+        }
+        if self.master_ticks < target {
+            self.master_ticks = target;
+        }
+    }
+
+    /// The **fast-path** counterpart to [`System::run_until`] (ADR 0011 / ADR 0012),
+    /// behind the default-off `fast-scheduler` feature.
+    ///
+    /// **The block is one period of the edge schedule**, replayed from a shape
+    /// computed once instead of re-derived per edge. The tail — a partial period,
+    /// plus the `master_ticks = target` landing — still goes through the accurate
+    /// path, which is the ADR 0011 §6 fallback and is where the "bailout" in that
+    /// section's language now lives.
+    ///
+    /// It is a **separate entry point**, not a branch inside `run_until`, which is
+    /// what keeps ADR 0011 §1 exactly true: with the feature off this function does
+    /// not exist and the accurate path has no added test. It also stores no mode on
+    /// [`System`], so the save-state layout is untouched and ADR 0011 §4's header
+    /// marker is not yet owed — that falls due when the fast path acquires state of
+    /// its own.
+    ///
+    /// **The bailout invariant** (ADR 0011 §6) — the accurate scheduler must resume
+    /// with exactly the state it would have held had it run that stretch itself,
+    /// the same `master_ticks` above all, since right state at the wrong tick is
+    /// *correct-but-late* and no AV comparison can see it — is satisfied here **by
+    /// construction rather than by argument**: this enumerates the same edges in the
+    /// same order at the same ticks, so there is no divergence to resynchronize.
+    /// A later slice that skips or reorders work will have to earn the invariant
+    /// instead of inheriting it, and the differential gate is what will say whether
+    /// it did.
+    ///
+    /// # The return value is ADR 0012's completion witness
+    ///
+    /// [`FastRunReport`](crate::fastpath::FastRunReport) says how many whole blocks
+    /// ran and which
+    /// [`BailOut`](crate::fastpath::BailOut) reasons handed a stretch back. ADR
+    /// 0012 §2 makes both suite-wide gate failures — *"the fast path never
+    /// engaged"* and *"no bail-out boundary was reached"* — and neither is
+    /// observable from the outside otherwise: a fast path that quietly deferred
+    /// everything would agree with the accurate one perfectly, which is exactly
+    /// what #224 shipped on purpose while the gate was being written.
+    ///
+    /// It is a **return value, not a field and not a hook**. A field would make
+    /// ADR 0011 §4's save-state mode marker fall due; a hook compiled into a
+    /// release build for its tests is what ADR 0011 §6 forbids. A return value
+    /// adds neither state nor a branch — the function already knows both numbers.
+    #[cfg(feature = "fast-scheduler")]
+    pub fn run_until_fast(&mut self, target: u64) -> crate::fastpath::FastRunReport {
+        use crate::fastpath::{BailOut, BailOutSet, FastRunReport};
+        // The edge schedule is PERIODIC. A domain steps when
+        // `(tick + phase) % divider == 0`, so the pattern of which domains are due
+        // repeats every `lcm(CPU_DIVIDER, RCP_DIVIDER)` ticks — and the phases are
+        // constants fixed at power-on (ADR 0006), so it never changes mid-run
+        // either. The accurate loop re-derives it on every single edge anyway:
+        // `next_edge` for the position, then two `is_edge` tests to attribute it.
+        //
+        // So the block here is one period. Its shape is computed once and then
+        // replayed, which removes the per-edge arithmetic without changing which
+        // domains step, in what order, or at which `master_ticks` — the fast path
+        // is a different *enumeration* of the same edges, not a different schedule.
+        // That is why the bailout invariant (ADR 0011 §6) is satisfied by
+        // construction rather than by argument: there is nothing to resynchronize,
+        // because nothing ever diverged.
+        // Nothing to do, and saying so up front keeps every addition below inside a
+        // range the loop condition has already bounded.
+        //
+        // This is NOT a bail-out: nothing is handed to the accurate scheduler,
+        // because there is nothing to run on either path. Recording it as a reason
+        // would put a variant in the coverage witness that says only "someone
+        // called this twice", and ADR 0012 §2's enumeration is about exits to the
+        // accurate scheduler, not about every early return.
+        if target <= self.master_ticks {
+            return FastRunReport::default();
+        }
+
+        // Only the two predicates are stored: the offset is always `index + 1`, so
+        // keeping it in the array would be a third of the footprint carrying no
+        // information.
+        //
+        // Offsets are 1..=EDGE_PERIOD because `run_until` advances to the next edge
+        // *strictly after* the current tick; offset 0 is the position the machine
+        // already sits on and has already been stepped.
+        let mut pattern = [(false, false); EDGE_PERIOD_LEN];
+        for (i, slot) in pattern.iter_mut().enumerate() {
+            // `saturating_add`: `master_ticks` is at most `u64::MAX`, and a machine
+            // that close to the end of a 3,000-year timeline has no edges left to
+            // find. Saturating keeps the probe from wrapping to an early tick and
+            // reporting an edge that is not there; the loop below then does not run,
+            // because no `base + EDGE_PERIOD` can be `<= target`.
+            let t = self.master_ticks.saturating_add(i as u64 + 1);
+            *slot = (
+                Self::is_edge(t, self.phases.cpu, CPU_DIVIDER),
+                Self::is_edge(t, self.phases.rcp, RCP_DIVIDER),
+            );
+        }
+
+        // Whole periods only. `base` tracks the period boundary while
+        // `master_ticks` lands on each edge inside it, which is what keeps the
+        // pattern's alignment valid: `base` advances by exactly one period, so
+        // `(base + off + phase) % divider` is invariant across iterations.
+        //
+        // `checked_add` on the bound rather than `base + EDGE_PERIOD`: the sum is
+        // the loop's own guard, so it is the one addition here that is not already
+        // bounded by something else. Overflow ends the loop, which is correct —
+        // there is no whole period left below `target`.
+        let mut base = self.master_ticks;
+        let mut blocks = 0u64;
+        while base
+            .checked_add(EDGE_PERIOD)
+            .is_some_and(|end| end <= target)
+        {
+            for (i, &(cpu, rcp)) in pattern.iter().enumerate() {
+                if cpu || rcp {
+                    // In range: `base + EDGE_PERIOD <= target <= u64::MAX`.
+                    self.master_ticks = base + i as u64 + 1;
+                    self.step_domains(cpu, rcp);
+                }
+            }
+            base += EDGE_PERIOD;
+            blocks += 1;
+        }
+
+        // The tail — a partial period, plus the `master_ticks = target` landing —
+        // goes through the accurate path. It is at most `EDGE_PERIOD` ticks, so the
+        // fallback costs nothing measurable, and reusing it means the two paths
+        // cannot disagree about the end of a run.
+        //
+        // The reason is recorded on the tail being non-empty, NOT on this call
+        // happening: `run_until(target)` runs unconditionally, and when `target`
+        // falls exactly on a period boundary all it does is the landing assignment.
+        // Reporting `PartialPeriodTail` there would make the witness true of every
+        // call, which is the same as it being true of none.
+        let mut bailed = BailOutSet::new();
+        if target > base {
+            bailed.insert(BailOut::PartialPeriodTail);
+        }
+        self.run_until(target);
+
+        FastRunReport {
+            work_units: blocks,
+            bailed,
+        }
+    }
+
+    /// The **instruction-granular** counterpart to [`System::run_until`]
+    /// (ADR 0013), behind the default-off `fast-exec` feature.
+    ///
+    /// # How time advances here
+    ///
+    /// The accurate loop walks edge to edge and steps whichever domains are due.
+    /// This one lets the **CPU set the pace**: it executes one instruction, is told
+    /// what that cost in `PCycles`, advances `master_ticks` by that many CPU
+    /// periods, and runs the RCP over every one of its edges in the span that just
+    /// elapsed. The CPU therefore no longer lands on a derived edge at all — which
+    /// is precisely the relaxation ADR 0013 §2 authorizes and ADR 0011 §5 excludes.
+    ///
+    /// **ADR 0006 still holds.** `master_ticks` remains the only counter that is
+    /// ever incremented, and every other position — the RCP's edges, COP0 `Count` —
+    /// is still derived from it. What changed is *how far* it moves per step, not
+    /// who owns it.
+    ///
+    /// # It may land PAST `target`, and that is the divergence, not a defect
+    ///
+    /// A cost is only known after the instruction has run, so the last instruction
+    /// of a call can carry `master_ticks` beyond `target` — by at most one
+    /// instruction's cost. Nothing drifts: the next call's `target` is absolute, so
+    /// an overshoot simply means less work next time. This is the timing divergence
+    /// ADR 0013 §4 requires to be *measured and bounded* rather than eliminated,
+    /// and it is the reason this returns a report rather than nothing.
+    ///
+    /// # A halted CPU advances on RCP edges
+    ///
+    /// A failed real-PIF boot checksum freezes the CPU via NMI while the RCP keeps
+    /// running (`PIF-NUS.md`). With no instruction to time the advance with, this
+    /// steps to the next RCP edge instead. It is deliberately **not** a bail-out to
+    /// the accurate scheduler: forcing an ADR 0012 bail-out reason here would need
+    /// a fixture that can reach a checksum failure, and ADR 0011 §6 only sanctions
+    /// a test-only seam where a boundary *genuinely* cannot be reached — which is
+    /// not the case when the fast path can simply handle it.
+    ///
+    /// `fast-exec` consequently adds **no new [`BailOut`](crate::fastpath::BailOut)
+    /// variant**. Saying so plainly is better than inventing an exit to justify the
+    /// machinery; the enumeration exists so that a *real* one cannot be added
+    /// silently.
+    #[cfg(feature = "fast-exec")]
+    pub fn run_until_exec(&mut self, target: u64) -> crate::fastpath::FastRunReport {
+        use crate::fastpath::FastRunReport;
+
+        let mut report = FastRunReport::default();
+        while self.master_ticks < target {
+            if self.bus.boot_nmi_halt() {
+                let next = Self::next_edge_after(self.master_ticks, self.phases.rcp, RCP_DIVIDER);
+                if next > target {
+                    break;
+                }
+                self.master_ticks = next;
+                self.step_rcp();
+                continue;
+            }
+
+            // `count_ticks` is derived from `master_ticks` and sampled BEFORE the
+            // instruction runs, which is the same instant the accurate path samples
+            // it at the CPU edge that would issue this instruction.
+            let count_now = self.count_ticks();
+            let cost = self.cpu.step_instruction_at(&mut self.bus, count_now);
+            report.work_units = report.work_units.saturating_add(1);
+
+            // One `PCycle` is `CPU_DIVIDER` master ticks (ADR 0006).
+            //
+            // **`checked`, not `saturating`.** Saturating was the first version and
+            // it is a real hazard here rather than a theoretical one: it can put
+            // `end` at `u64::MAX` *without the machine ever having run there*, and
+            // `next_edge_after` then evaluates `tick + 1` at `u64::MAX` — a panic in
+            // debug, and in release a wrap to a low tick that keeps `rcp <= end`
+            // true forever. That is the difference between this and the accurate
+            // loop, whose top-of-range is unreachable because reaching it means
+            // emulating three thousand years (the note in the fast-scheduler gate).
+            // Raised in review.
+            //
+            // Overflowing means the timeline is exhausted, so the run ends; the
+            // landing below carries `master_ticks` to `target` if it is not already
+            // past it.
+            // **This loop's termination depends on `cost > 0`, and nothing here
+            // enforced it.** `Pipeline::step_instruction` charges one `PCycle` to
+            // issue before adding anything, so zero is not reachable today — but
+            // that is an invariant held in another crate, and a reader of *this*
+            // loop cannot see it. A zero would leave `end == master_ticks`, step no
+            // RCP edges, and spin forever. Raised in review as blocking, correctly:
+            // the hazard is that the guarantee is remote, not that it is absent.
+            //
+            // The `debug_assert` is the real check; the `max(1)` is a floor so a
+            // release build makes progress rather than hanging. It is deliberately
+            // NOT a fix — a zero cost would be a defect either way — but running
+            // one `PCycle` fast is a far better way to report one than a hang.
+            debug_assert!(
+                cost > 0,
+                "an instruction cost 0 PCycles, which cannot happen"
+            );
+            let Some(end) = u64::from(cost.max(1))
+                .checked_mul(CPU_DIVIDER)
+                .and_then(|span| self.master_ticks.checked_add(span))
+            else {
+                break;
+            };
+
+            // The RCP catches up over the span the instruction consumed, on its own
+            // edges. CPU-before-RCP still holds: the instruction has already run.
+            let mut rcp = Self::next_edge_after(self.master_ticks, self.phases.rcp, RCP_DIVIDER);
+            while rcp <= end {
+                self.master_ticks = rcp;
+                self.step_rcp();
+                // `end` is a real tick because it came from `checked_add` above, so
+                // this cannot be asked for an edge past `u64::MAX`: the loop
+                // condition fails at or before it.
+                rcp = Self::next_edge_after(rcp, self.phases.rcp, RCP_DIVIDER);
+            }
+            self.master_ticks = end;
+
+            // **The idle batch.** The boundary just executed established, for this
+            // instant, that no NMI and no interrupt is pending — otherwise it
+            // would have vectored and the CPU would no longer be parked. From
+            // that fact the loop below can run further idle pairs *without*
+            // re-evaluating the boundary, because every input to that evaluation
+            // is either constant or bounded:
+            //
+            // * `Cause.IP2` follows `poll_irq`, which flips only when an RCP chip
+            //   sets `mi_intr` — and that can happen only at an RCP step, which
+            //   this loop performs itself and tests after.
+            // * `Cause.IP7` follows `Cop0::timer_edge`, a delta against
+            //   `last_count`. `count_ticks_until_timer_match` bounds the batch so
+            //   the crossing lands on the boundary the per-instruction path would
+            //   have found it on, not later.
+            // * `Status`'s masks cannot move: no instruction executes here.
+            // * `boot_nmi_halt` is bus state, so it too changes only across an
+            //   RCP step, and is tested on the same edge.
+            //
+            // Leaving the batch does not consume the boundary that ends it — the
+            // outer loop runs it through the ordinary path, which is what keeps
+            // the interrupt on its original cycle.
+            if self.cpu.is_parked_in_idle_loop() {
+                self.run_idle_batch(target, &mut report);
+            }
+        }
+        // Only reachable through the halted branch's `break`; an executing CPU has
+        // already carried `master_ticks` to or past `target`.
+        if self.master_ticks < target {
+            self.master_ticks = target;
+        }
+        report
+    }
+    /// Run idle-loop pairs in bulk, stopping the moment anything the boundary
+    /// check reads could have changed. See the call site for why that is sound.
+    ///
+    /// Returns with `master_ticks` on an instruction boundary, so the caller's
+    /// ordinary path resumes exactly where a per-instruction walk would be.
+    #[cfg(feature = "fast-exec")]
+    fn run_idle_batch(&mut self, target: u64, report: &mut crate::fastpath::FastRunReport) {
+        /// One idle pair: two `PCycle`s, and — because `COUNT_DIVIDER` is twice
+        /// `CPU_DIVIDER` — exactly one COP0 `Count` tick, which is what lets the
+        /// timer bound below be counted in pairs.
+        const PAIR_TICKS: u64 = 2 * CPU_DIVIDER;
+
+        let room = (target.saturating_sub(self.master_ticks)) / PAIR_TICKS;
+        let pairs = room.min(self.cpu.count_ticks_until_timer_match());
+        if pairs == 0 {
+            return;
+        }
+
+        let mut rcp = Self::next_edge_after(self.master_ticks, self.phases.rcp, RCP_DIVIDER);
+        let mut done = 0u64;
+        while done < pairs {
+            let end = self.master_ticks + PAIR_TICKS;
+            while rcp <= end {
+                self.master_ticks = rcp;
+                self.step_rcp();
+                rcp = Self::next_edge_after(rcp, self.phases.rcp, RCP_DIVIDER);
+            }
+            self.master_ticks = end;
+            done += 1;
+            // Tested after the RCP has run, because the RCP is the only thing
+            // that can raise either. The boundary at `end` is then handed back to
+            // the caller unconsumed.
+            if rustyn64_cpu::Bus::poll_irq(&mut self.bus) || self.bus.boot_nmi_halt() {
+                break;
+            }
+        }
+        self.cpu.retire_idle_pairs(done);
+        report.work_units = report.work_units.saturating_add(done);
+    }
+
+    /// One RCP step: the RSP microcode unit, then the RDP rasterizer, then the
+    /// AI/interface DMA progress — all on the SAME `&mut self.bus`.
+    fn step_rcp(&mut self) {
+        // One RCP step, charged here rather than inside a chip's tick — see
+        // `Bus::charge_rcp_step`.
+        self.bus.charge_rcp_step();
+        // **Occupancy census** (`work-counters`), the measurement that sizes an
+        // event-driven scheduler before one is written.
+        //
+        // Today every chip is stepped on every RCP step -- ~1.04 M steps a frame
+        // -- whether or not it has anything to do. An event scheduler's whole
+        // value is skipping the idle ones, so its ceiling IS the idle fraction,
+        // and that fraction has never been counted. Sizing it from a profile
+        // share instead would repeat this program's most expensive mistake: the
+        // share tells you what the RSP costs when it runs, not how often it is
+        // halted.
+        //
+        // ADR 0006: counters only, nothing schedules against them.
+        #[cfg(feature = "work-counters")]
+        {
+            self.rcp_occupancy[occupancy::STEPS] += 1;
+            if self.bus.rsp.sp.halted() {
+                self.rcp_occupancy[occupancy::RSP_HALTED] += 1;
+            }
+        }
+        // The chips each see only their narrow trait of `self.bus`.
+        //
+        // **The LLE RSP is stepped only when it is running.** It is halted on
+        // **78.11%** of RCP steps (`docs/performance.md` §*The RCP occupancy
+        // census*), and `su::su_step` already returns a default `StepResult`
+        // immediately in that case — so this guard is provably behavior-identical
+        // rather than an approximation: every field `rsp_tick` acts on
+        // (`interrupt_change`, `dma`, `dp_write`) is `None` in that default, and
+        // the halt check inside `su_step` sits *above* the retire counter, so
+        // nothing is counted either.
+        //
+        // What it removes on those steps is the call, the `StepResult`
+        // construction and three `Option` tests, in exchange for one `SP_STATUS`
+        // read. This is the RSP half of the event-driven scheduler, taken as a
+        // guard because that is where the occupancy census pointed; the AI, PI and
+        // VI ticks are cheap by comparison and are left stepping.
+        self.bus.rsp_tick();
+        // The RDP consumes the DPC command stream and rasterizes the implemented
+        // commands (FILL, triangles, texture rects, sync); the live path is still
+        // incomplete — remaining opcodes are recognized-not-dispatched (T-31-004)
+        // and per-command timing is deferred. See ledger R-18 for the end-to-end
+        // commercial-video gap.
+        // The RDP census is sampled HERE, not with the RSP's above, and the
+        // difference is not cosmetic. The RSP's `dp_write` submits a command list
+        // during `rsp_tick`, and `rdp_tick` consumes it immediately — so sampling
+        // before `rsp_tick` sees an empty FIFO on *every* step and reports 100%
+        // idle, which is an artifact of the sampling instant rather than a fact
+        // about the RDP. This is the instant `rdp_tick` itself decides at.
+        #[cfg(feature = "work-counters")]
+        if self.bus.rdp.is_idle_for_census() {
+            self.rcp_occupancy[occupancy::RDP_IDLE] += 1;
+        }
+        self.bus.rdp_tick();
+        // AI / interface sub-clock advance — derives sample emission off the
+        // canonical `master_ticks` (ADR 0006), like the VI scan below.
+        self.bus.audio_tick(self.master_ticks);
+        // The PI's asynchronous direct-I/O write finalizes on this clock.
+        self.bus.pi_tick();
+        // The VI scan position advances off `master_ticks` (the one fractional
+        // domain, ADR 0006 / `docs/scheduler.md`); a `VI_V_INTR` crossing raises
+        // the VI line into the MI.
+        if self.bus.vi.tick(self.master_ticks) {
+            self.bus.rcp.mi_intr.vi = true;
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alloc::vec::Vec;
+
+    /// `rustyn64-audio` duplicates `MASTER_HZ` (the chip-crate graph forbids it
+    /// depending on `-core`); this pins the two copies together so the AI's DAC
+    /// period cannot silently drift from the canonical clock.
+    #[test]
+    fn audio_crate_master_hz_matches() {
+        assert_eq!(rustyn64_audio::MASTER_HZ, MASTER_HZ);
+    }
+
+    /// The divisors must be exact. A wrong one is silent and poisons everything.
+    #[test]
+    fn every_divider_is_exact() {
+        assert_eq!(MASTER_HZ / CPU_DIVIDER, CPU_HZ);
+        assert_eq!(MASTER_HZ % CPU_DIVIDER, 0);
+        assert_eq!(MASTER_HZ / RCP_DIVIDER, RCP_HZ);
+        assert_eq!(MASTER_HZ % RCP_DIVIDER, 0);
+        // COP0 Count is half `PClock` (UM §6.3.3).
+        assert_eq!(MASTER_HZ / COUNT_DIVIDER, CPU_HZ / 2);
+        assert_eq!(MASTER_HZ / SI_DIVIDER, 15_625_000);
+        assert_eq!(MASTER_HZ / PIF_DIVIDER, 1_953_125);
+        // 187.5 MHz really is the LCM of the two core clocks.
+        assert_eq!(CPU_HZ * CPU_DIVIDER, MASTER_HZ);
+        assert_eq!(RCP_HZ * RCP_DIVIDER, MASTER_HZ);
+    }
+
+    /// **The RCP step counter measures the clock, not a chip.**
+    ///
+    /// `rcp_steps` used to be incremented at the tail of `Bus::rsp_tick`, so "RCP
+    /// steps" actually meant "RSP ticks". That was invisible while the RSP was
+    /// stepped unconditionally, and wrong the moment a halted-RSP skip was tried:
+    /// the counter stopped with the chip and
+    /// `three_cpu_and_two_rcp_steps_per_six_ticks` went red.
+    ///
+    /// The skip itself measured neutral and was reverted (see `step_rcp`), but the
+    /// counter bug it exposed was real, so the charge now lives in the scheduler
+    /// and this pins it there. A step counter that stops when a chip stops is
+    /// measuring the chip, not the clock.
+    ///
+    /// Mutation check: move `charge_rcp_step` back inside `rsp_tick` and this stays
+    /// green only because the RSP is stepped unconditionally today — which is
+    /// exactly why the assertion is written against an all-idle machine.
+    #[test]
+    fn an_rcp_step_is_charged_even_when_every_chip_is_idle() {
+        // A machine with no ROM never starts the RSP, so it stays halted throughout —
+        // which is precisely the case the guard skips, and the case where a mistaken
+        // skip would be invisible unless something is asserted.
+        let mut sys = System::new(0);
+        let ticks = 100_000;
+        sys.run_until(ticks);
+
+        assert!(
+            sys.bus.rsp.sp.halted(),
+            "this test is only meaningful while the RSP is halted; it is not"
+        );
+        // The RSP's retire counter is behind `work-counters`; when it is compiled
+        // in, a halted RSP must have retired nothing. `su_step` increments it AFTER
+        // the halt check, so a halted step that did work would move this.
+        #[cfg(feature = "work-counters")]
+        assert_eq!(sys.bus.rsp.retired(), 0, "a halted RSP must retire nothing");
+        // RCP steps are charged by the scheduler, so they must advance whether or not
+        // the RSP ran. This is the assertion that caught the counter living inside
+        // `rsp_tick`, where the skip silently stopped the clock.
+        assert!(
+            sys.bus.rcp_steps_for_test() > 0,
+            "RCP steps must be charged even when every chip is idle — a step counter \
+         that stops when a chip stops is measuring the chip, not the clock"
+        );
+    }
+
+    #[test]
+    fn three_cpu_and_two_rcp_steps_per_six_ticks() {
+        for seed in [0, 1, 0xDEAD_BEEF, u64::MAX] {
+            let mut sys = System::new(seed);
+            let rcp_before = sys.bus.rcp_steps_for_test();
+            // Count CPU *steps* from the derived position, not from `Cpu::retired`
+            // -- since ADR 0007 the CPU is a 5-stage pipeline, so retirement lags
+            // stepping by the pipeline depth and the two are not interchangeable.
+            let cpu_before = sys.cpu_cycles();
+            sys.run_until(PHASE_PERIOD);
+            assert_eq!(
+                sys.cpu_cycles() - cpu_before,
+                3,
+                "3 CPU steps per 6 master ticks (seed {seed})"
+            );
+            assert_eq!(
+                sys.bus.rcp_steps_for_test() - rcp_before,
+                2,
+                "2 RCP steps per 6 master ticks (seed {seed})"
+            );
+        }
+    }
+
+    #[test]
+    fn reset_preserves_phase() {
+        let mut sys = System::new(0xDEAD_BEEF);
+        let phases = sys.phases;
+        sys.step_to_next_edge();
+        sys.reset();
+        assert_eq!(sys.phases, phases);
+        assert_eq!(sys.master_ticks(), 0);
+    }
+
+    /// Different seeds must produce genuinely different CPU↔RCP interleavings,
+    /// not merely a different starting point in an identical pattern.
+    ///
+    /// This is the test that fails if the per-domain phase offsets are ever
+    /// collapsed into one offset on `master_ticks` — the defect the ADR review
+    /// caught in the design before it was written.
+    #[test]
+    fn seeds_produce_distinct_interleavings() {
+        let fingerprint = |seed: u64| -> Vec<(bool, bool)> {
+            let sys = System::new(seed);
+            (0..PHASE_PERIOD)
+                .map(|t| {
+                    (
+                        System::is_edge(t, sys.phases.cpu, CPU_DIVIDER),
+                        System::is_edge(t, sys.phases.rcp, RCP_DIVIDER),
+                    )
+                })
+                .collect()
+        };
+        let mut seen: Vec<Vec<(bool, bool)>> = Vec::new();
+        for seed in 0..64u64 {
+            let f = fingerprint(seed);
+            if !seen.contains(&f) {
+                seen.push(f);
+            }
+        }
+        assert!(
+            seen.len() > 1,
+            "all seeds produced one interleaving -- the per-domain phase offsets \
+             have collapsed and the seeded power-on phase is decorative"
+        );
+    }
+
+    /// **The residue invariant.** Every derived position must stay in a fixed
+    /// affine relationship with `master_ticks`. A position that has become
+    /// independently incremented drifts out of it on the first path that forgets
+    /// to step it — the failure mode ADR 0006 exists to prevent.
+    #[test]
+    fn residue_invariants_never_move() {
+        fn sample(s: &System) -> (i64, i64, i64) {
+            let master = i64::try_from(s.master_ticks()).unwrap();
+            let cpu_pos = i64::try_from(s.cpu_cycles()).unwrap();
+            let rcp_pos = i64::try_from(s.rcp_cycles()).unwrap();
+            (
+                master - i64::try_from(CPU_DIVIDER).unwrap() * cpu_pos,
+                master - i64::try_from(RCP_DIVIDER).unwrap() * rcp_pos,
+                // the two domains against each other -- catches inter-domain
+                // drift even if each stayed affine to master individually.
+                // NOT `cpu.retired`: since ADR 0007 the CPU is a 5-stage
+                // pipeline, so retirement lags stepping and is a CPU property
+                // rather than a clock one.
+                i64::try_from(CPU_DIVIDER).unwrap() * cpu_pos
+                    - i64::try_from(RCP_DIVIDER).unwrap() * rcp_pos,
+            )
+        }
+
+        let mut sys = System::new(0x1234_5678_9ABC_DEF0);
+        // Sample at period boundaries so the comparison point is consistent; the
+        // residues must then be constant forever.
+        sys.run_until(PHASE_PERIOD);
+        let first = sample(&sys);
+        for period in 1..64u64 {
+            sys.run_until(PHASE_PERIOD * (period + 1));
+            assert_eq!(
+                sample(&sys),
+                first,
+                "residues moved at period {period} -- a cycle position is being \
+                 incremented independently instead of derived from master_ticks"
+            );
+        }
+    }
+
+    /// Same seed ⇒ identical timeline. The determinism contract's floor.
+    #[test]
+    fn same_seed_same_timeline() {
+        let mut a = System::new(42);
+        let mut b = System::new(42);
+        for _ in 0..256 {
+            assert_eq!(a.step_to_next_edge(), b.step_to_next_edge());
+            assert_eq!(a.cpu_cycles(), b.cpu_cycles());
+            assert_eq!(a.rcp_cycles(), b.rcp_cycles());
+        }
+    }
+
+    #[test]
+    fn edges_are_never_skipped() {
+        let mut sys = System::new(7);
+        let mut prev = sys.master_ticks();
+        for _ in 0..512 {
+            let now = sys.step_to_next_edge();
+            assert!(now > prev, "the scheduler must advance");
+            // The gap can never exceed the coarsest divider we step on.
+            assert!(now - prev <= RCP_DIVIDER, "an edge was skipped");
+            prev = now;
+        }
+    }
+
+    /// **A running system raises the VI interrupt as the scan crosses
+    /// `VI_V_INTR`.** With a standard NTSC field (525 half-lines) and the VI on,
+    /// stepping past `per-half-line × V_INTR` master ticks drives `MI_INTR.vi`
+    /// through the scheduler's per-step `Vi::tick` call.
+    #[test]
+    fn a_running_system_raises_the_vi_interrupt_at_v_intr() {
+        use crate::vi::{VI_CTRL, VI_V_INTR, VI_V_TOTAL};
+        let mut sys = System::new(1);
+        sys.bus.vi.regs[VI_V_TOTAL as usize] = 524; // 525 half-lines
+        sys.bus.vi.regs[VI_V_INTR as usize] = 2;
+        sys.bus.vi.regs[VI_CTRL as usize] = 2; // VI on
+        assert!(!sys.bus.rcp.mi_intr.vi, "clear before running");
+        // per-half-line ≈ 5952 ticks; 15_000 is well past half-line 2.
+        while sys.master_ticks() < 15_000 {
+            sys.step_to_next_edge();
+        }
+        assert!(
+            sys.bus.rcp.mi_intr.vi,
+            "the VI interrupt fired during the run"
+        );
+    }
+
+    /// **The VI keeps firing after a reset.** A reset zeroes `master_ticks`, so
+    /// the VI scan timeline must rebase (`Vi::reset_scan`) — otherwise its delta
+    /// baseline stays in the old timeline and the interrupt is suppressed until
+    /// the new run catches up. Acknowledge → reset → the next field fires again.
+    #[test]
+    fn a_reset_rebases_the_vi_scan_so_it_fires_again() {
+        use crate::vi::{VI_CTRL, VI_V_INTR, VI_V_TOTAL};
+        let mut sys = System::new(2);
+        sys.bus.vi.regs[VI_V_TOTAL as usize] = 524;
+        sys.bus.vi.regs[VI_V_INTR as usize] = 2;
+        sys.bus.vi.regs[VI_CTRL as usize] = 2;
+        while sys.master_ticks() < 15_000 {
+            sys.step_to_next_edge();
+        }
+        assert!(sys.bus.rcp.mi_intr.vi, "fires before reset");
+        sys.bus.rcp.mi_intr.vi = false; // the CPU would ack via VI_V_CURRENT
+        sys.reset();
+        assert!(!sys.bus.rcp.mi_intr.vi, "clear immediately after reset");
+        while sys.master_ticks() < 15_000 {
+            sys.step_to_next_edge();
+        }
+        assert!(
+            sys.bus.rcp.mi_intr.vi,
+            "fires again after the reset rebases"
+        );
+    }
+}

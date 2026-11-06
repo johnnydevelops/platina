@@ -227,11 +227,55 @@ pub fn lower_intrinsic<'tcx>(
             let rv = mir::Rvalue::BinaryOp(op, Box::new((args[0].node.clone(), args[1].node.clone())));
             fx.i_rvalue(dest, &rv);
         }
+        "saturating_add" | "saturating_sub" if matches!(leaf_of(tyarg(0)), Some(LeafKind::I64 { .. } | LeafKind::I128 { .. })) => {
+            let a = arg!(0);
+            let b = arg!(1);
+            let (signed, wide) = match leaf_of(tyarg(0)).unwrap() {
+                LeafKind::I64 { signed } => (signed, false),
+                LeafKind::I128 { signed } => (signed, true),
+                _ => unreachable!(),
+            };
+            let add = n == "saturating_add";
+            let helper = match (add, wide) {
+                (true, false) => "addo64",
+                (false, false) => "subo64",
+                (true, true) => "addo128",
+                (false, true) => "subo128",
+            };
+            let nl = a.len();
+            let mut args = a.clone();
+            args.extend(b);
+            args.push(Operand::Bool(signed));
+            let r = fx.i_helper(helper, &args, nl + 1);
+            let ov = fx.i_un(Un::NumToBool, r[nl]);
+            // clamp: unsigned add -> MAX, unsigned sub -> 0, signed -> MIN/MAX by a's sign
+            let top = |i: usize| i + 1 == nl;
+            let neg = if signed {
+                Some(fx.i_bin(Bin::Le, Operand::Num(2147483648.0), a[nl - 1]))
+            } else {
+                None
+            };
+            let mut out = vec![];
+            for i in 0..nl {
+                let sat = match (signed, add) {
+                    (false, true) => Operand::Num(4294967295.0),
+                    (false, false) => Operand::Num(0.0),
+                    (true, _) => {
+                        // a < 0 -> MIN (only the sign bit), else MAX
+                        let min = if top(i) { 2147483648.0 } else { 0.0 };
+                        let max = if top(i) { 2147483647.0 } else { 4294967295.0 };
+                        fx.i_assign(l::Ty::Num, Rv::Select(neg.unwrap(), Operand::Num(min), Operand::Num(max)))
+                    }
+                };
+                out.push(fx.i_assign(l::Ty::Num, Rv::Select(ov, sat, r[i])));
+            }
+            fx.i_write(dest, out);
+        }
         "saturating_add" | "saturating_sub" => {
             let a = arg!(0);
             let b = arg!(1);
             let k = leaf_of(tyarg(0)).unwrap();
-            let LeafKind::Int(ik) = k else { return false };
+            let LeafKind::Int(ik) = k else { fx.i_fatal(format!("{n} on {} is unsupported", tyarg(0))) };
             let r = if n == "saturating_add" { fx.i_bin(Bin::Add, a[0], b[0]) } else { fx.i_bin(Bin::Sub, a[0], b[0]) };
             let r = fx.i_bin(Bin::Max, r, Operand::Num(ik.min()));
             let r = fx.i_bin(Bin::Min, r, Operand::Num(ik.max()));
@@ -402,6 +446,31 @@ fn bit_count<'tcx>(fx: &mut FnLower<'_, 'tcx>, n: &str, k: LeafKind, v: &[Operan
             }
             "bswap" => fx.i_fatal("bswap64 must be handled as pair"),
             _ => fx.i_fatal("bitreverse64 unsupported"),
+        },
+        LeafKind::I128 { .. } => match n {
+            "ctpop" => {
+                let mut acc = Operand::Num(0.0);
+                for limb in v.iter() {
+                    let c = fx.popcnt_inline(*limb);
+                    acc = fx.i_bin(Bin::Add, acc, c);
+                }
+                acc
+            }
+            "ctlz" | "ctlz_nonzero" | "cttz" | "cttz_nonzero" => {
+                // scan limbs from the significant end: count = 32*k + clz(limb_k) for the first
+                // non-zero limb
+                let lead = n.starts_with("ctlz");
+                let order: Vec<usize> = if lead { vec![3, 2, 1, 0] } else { vec![0, 1, 2, 3] };
+                let mut acc = Operand::Num(128.0);
+                for (k, &i) in order.iter().enumerate().rev() {
+                    let nz = fx.i_bin(Bin::Ne, v[i], Operand::Num(0.0));
+                    let c = fx.i_un(if lead { Un::Clz } else { Un::Ctz }, v[i]);
+                    let c = fx.i_bin(Bin::Add, c, Operand::Num(32.0 * k as f64));
+                    acc = fx.i_assign(l::Ty::Num, Rv::Select(nz, c, acc));
+                }
+                acc
+            }
+            _ => fx.i_fatal(format!("{n} on 128-bit integers is unsupported")),
         },
         _ => fx.i_fatal("bad bit intrinsic"),
     }

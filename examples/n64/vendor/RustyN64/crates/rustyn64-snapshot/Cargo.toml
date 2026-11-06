@@ -1,0 +1,19 @@
+[package]
+name = "rustyn64-snapshot"
+description = "RustyN64: serde helpers for save-state serialization (boxed big arrays)"
+version = "0.8.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[dependencies]
+serde = { version = "1", default-features = false, features = ["derive", "alloc"] }
+serde-big-array = "0.5"
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+serde_json = "1"

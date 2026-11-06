@@ -1,0 +1,21 @@
+[package]
+name = "n64"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+crate-type = ["rlib"]
+
+[[bin]]
+name = "n64-native"
+path = "src/native.rs"
+
+[dependencies]
+rustyn64-core = { path = "vendor/RustyN64/crates/rustyn64-core", default-features = false, features = ["fast-exec"] }
+
+[profile.release]
+debug = false
+panic = "abort"
+
+[workspace]
+exclude = ["vendor"]

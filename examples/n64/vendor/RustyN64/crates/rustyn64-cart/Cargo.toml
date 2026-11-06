@@ -1,0 +1,20 @@
+[package]
+name = "rustyn64-cart"
+version = "0.8.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[features]
+default = ["std"]
+std = []
+
+[dependencies]
+serde = { version = "1", default-features = false, features = ["derive", "alloc"] }
+serde-big-array = "0.5"
+rustyn64-snapshot = { path = "../rustyn64-snapshot" }
+bitflags = { version = "2", features = ["serde"] }
+
+[lints]
+workspace = true
