@@ -380,7 +380,12 @@ impl<'a, 'tcx> FnLower<'a, 'tcx> {
         }
 
         // lower reachable blocks (constant-folding switches on compile-time-known conditions)
-        let reachable = self.reachable_blocks();
+        let mut reachable = self.reachable_blocks();
+        if crate::platform::is_body_override(tcx, self.instance) {
+            reachable.iter_mut().for_each(|r| *r = false);
+            self.cur = self.bbs[0];
+            crate::platform::override_body(self);
+        }
         for (bb, data) in mir.basic_blocks.iter_enumerated() {
             if data.is_cleanup || !reachable[bb.as_usize()] {
                 self.cur = self.bbs[bb.as_usize()];
@@ -1173,10 +1178,30 @@ impl<'a, 'tcx> FnLower<'a, 'tcx> {
                         self.int_cast(&t, tk, dk)
                     }
                     TagEncoding::Niche { untagged_variant, ref niche_variants, niche_start } => {
-                        if bits > 32 {
-                            self.fatal("64-bit niche tags not supported yet");
-                        }
                         let relative_max = niche_variants.last.as_u32() - niche_variants.start.as_u32();
+                        if bits > 32 {
+                            // wide tag: rel = (tag - niche_start) mod 2^bits via limbs
+                            let wk = if bits == 64 { LeafKind::I64 { signed: false } } else { LeafKind::I128 { signed: false } };
+                            let start = const_bits(niche_start, wk);
+                            let mut args = t.clone();
+                            args.extend(start);
+                            let rel = self.call_helper(if bits == 64 { "sub64" } else { "sub128" }, &args, t.len());
+                            let mut upper_zero = Operand::Bool(true);
+                            for limb in &rel[1..] {
+                                let z = self.bin(Bin::Eq, *limb, Operand::Num(0.0));
+                                upper_zero = self.bin(Bin::And, upper_zero, z);
+                            }
+                            let le = self.bin(Bin::Le, rel[0], Operand::Num(relative_max as f64));
+                            let is_niche = self.bin(Bin::And, upper_zero, le);
+                            let ns = niche_variants.start.as_u32() as f64;
+                            let tagged = self.bin(Bin::Add, rel[0], Operand::Num(ns));
+                            let r = self.num(Rv::Select(is_niche, tagged, Operand::Num(untagged_variant.as_u32() as f64)));
+                            return match dk {
+                                LeafKind::I64 { .. } => vec![r, Operand::Num(0.0)],
+                                LeafKind::I128 { .. } => vec![r, Operand::Num(0.0), Operand::Num(0.0), Operand::Num(0.0)],
+                                _ => vec![r],
+                            };
+                        }
                         let start = niche_start as f64;
                         let ns = niche_variants.start.as_u32() as f64;
                         let uk = IntKind { bits, signed: false };
@@ -2059,6 +2084,13 @@ impl<'a, 'tcx> FnLower<'a, 'tcx> {
         let mut callee_inst = None;
         if let ty::FnDef(def_id, fn_args) = *fn_ty.kind() {
             let inst = Instance::expect_resolve(tcx, typing_env(), def_id, fn_args, si.span);
+            {
+                let dest_pv = self.place(dest);
+                if crate::platform::lower_override(self, inst, args, &dest_pv) {
+                    finish(self);
+                    return;
+                }
+            }
             match inst.def {
                 InstanceKind::Intrinsic(_) => {
                     let dest_pv = self.place(dest);
@@ -2082,6 +2114,31 @@ impl<'a, 'tcx> FnLower<'a, 'tcx> {
                     if name == rustc_symbol_mangling::mangle_internal_symbol(tcx, "__rust_no_alloc_shim_is_unstable_v2") {
                         finish(self);
                         return;
+                    }
+                    // default allocator (no #[global_allocator]): the Luau runtime heap
+                    if self.cx.resolve_symbol(&name).is_none() {
+                        let item = tcx.item_name(d);
+                        let rt = match item.as_str() {
+                            "__rust_alloc" => Some(("rt_alloc", 1)),
+                            "__rust_alloc_zeroed" => Some(("rt_alloc_zeroed", 1)),
+                            "__rust_dealloc" => Some(("rt_dealloc", 0)),
+                            "__rust_realloc" => Some(("rt_realloc", 1)),
+                            _ => None,
+                        };
+                        if let Some((h, nret)) = rt {
+                            let mut flat = vec![];
+                            for a in args {
+                                let (v, _) = self.operand_regs(&a.node);
+                                flat.extend(v);
+                            }
+                            let r = self.call_helper(h, &flat, nret);
+                            if nret > 0 {
+                                let dp = self.place(dest);
+                                self.write_place(&dp, Val::Regs(r));
+                            }
+                            finish(self);
+                            return;
+                        }
                     }
                     let resolved = self.cx.resolve_symbol(&name).or_else(|| {
                         // allocator shim: __rust_X falls back to the default __rdl_X
@@ -2322,6 +2379,24 @@ impl<'a, 'tcx> FnLower<'a, 'tcx> {
     }
     pub(crate) fn i_lcx(&self) -> LCx<'tcx> {
         self.lcx
+    }
+    pub(crate) fn i_write_variant(&mut self, dest: &PlaceV<'tcx>, v: VariantIdx, vals: Vec<Operand>) {
+        let d = self.downcast(dest, v);
+        if !vals.is_empty() {
+            let fp = self.field(&d, FieldIdx::ZERO);
+            self.write_place(&fp, Val::Regs(vals));
+        }
+        self.set_discriminant(dest, v);
+    }
+    pub(crate) fn i_param(&self, i: usize) -> Vec<Operand> {
+        let (vars, _) = self.local_leaves(Local::from_usize(i + 1));
+        vars.iter().map(|v| Operand::Var(*v)).collect()
+    }
+    pub(crate) fn i_temp_slot(&mut self, l: TyAndLayout<'tcx>) -> Operand {
+        self.temp_slot(l)
+    }
+    pub(crate) fn i_leaf_tys(&self, l: TyAndLayout<'tcx>) -> Vec<l::Ty> {
+        abi::ltys(&abi::leaves(self.lcx, l).unwrap_or_default())
     }
     pub(crate) fn i_rvalue(&mut self, dest: &PlaceV<'tcx>, rv: &Rvalue<'tcx>) {
         self.rvalue(dest, rv)

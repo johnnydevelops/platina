@@ -8,8 +8,8 @@
   "data-layout": "e-m:e-p:32:32-i64:64-i128:128-n32:64-S128",
   "llvm-target": "wasm32-unknown-unknown",
   "target-pointer-width": 32,
-  "os": "roblox",
-  "vendor": "unknown",
+  "os": "unknown",
+  "vendor": "roblox",
   "panic-strategy": "abort",
   "singlethread": true,
   "max-atomic-width": 64,
@@ -22,5 +22,5 @@
   "has-thread-local": false,
   "emit-debug-gdb-scripts": false,
   "linker-is-gnu": false,
-  "metadata": { "description": "Luau (Roblox) via rustc_codegen_luau", "std": false, "host_tools": false, "tier": 3 }
+  "metadata": { "description": "Luau (Roblox) via rustc_codegen_luau", "std": true, "host_tools": false, "tier": 3 }
 }

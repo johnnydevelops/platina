@@ -55,7 +55,18 @@ pub fn emit_program(p: &Program) -> Result<String, String> {
     let mut order: Vec<usize> = (0..p.funcs.len()).collect();
     order.sort_by_key(|i| std::cmp::Reverse(counts[*i]));
     let mut local = vec![false; p.funcs.len()];
-    for i in order.into_iter().take(MAX_LOCAL_FUNCS) {
+    // module scope budget: 200 locals minus the prelude's and our own (MEM, SP, HEAP_BASE, FN, FT, ...)
+    let prelude_locals: usize = PRELUDE
+        .lines()
+        .filter(|l| l.starts_with("local "))
+        .map(|l| {
+            let decl = l.trim_start_matches("local function ").trim_start_matches("local ");
+            let names = decl.split(['=', '(']).next().unwrap_or("");
+            names.split(',').count()
+        })
+        .sum();
+    let budget = MAX_LOCAL_FUNCS.min(190usize.saturating_sub(prelude_locals + 8));
+    for i in order.into_iter().take(budget) {
         local[i] = true;
     }
     let names_cb = ProgNames { local: local.clone() };

@@ -34,7 +34,8 @@ pub fn lower_intrinsic<'tcx>(
 
     match n {
         "abort" => {
-            fx.i_term_trap(vec![TrapPart::Str("aborted".into())]);
+            fx.i_helper("rt_abort", &[], 0);
+            fx.i_set_unreachable();
         }
         "unreachable" => fx.i_set_unreachable(),
         "cold_path" | "breakpoint" | "assert_inhabited" | "assert_zero_valid" | "assert_mem_uninitialized_valid" => {}
@@ -290,6 +291,19 @@ pub fn lower_intrinsic<'tcx>(
         "atomic_fence" | "atomic_singlethreadfence" => {}
         _ if n.starts_with("atomic_") => return atomic(fx, n, inst, args, dest),
         _ => {
+            // generic float intrinsics (`fabs::<f64>`): append the type suffix
+            let generic = inst.args.types().next().and_then(|t| match t.kind() {
+                ty::Float(ty::FloatTy::F32) => Some(format!("{n}f32")),
+                ty::Float(ty::FloatTy::F64) => Some(format!("{n}f64")),
+                _ => None,
+            });
+            if let Some(g) = generic.as_deref() {
+                if !n.ends_with("f32") && !n.ends_with("f64") {
+                    if let Some(r) = float_intrinsic(fx, g, args, dest) {
+                        return r;
+                    }
+                }
+            }
             if let Some(r) = float_intrinsic(fx, n, args, dest) {
                 return r;
             }

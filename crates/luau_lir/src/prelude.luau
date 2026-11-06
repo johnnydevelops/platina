@@ -269,7 +269,110 @@ local function ctz64(lo: number, hi: number): number
 	return 32 + bit32.countrz(hi)
 end
 
--- runtime imports (extern "C" fn __luau_NAME)
+-- runtime imports (extern "C" fn __luau_NAME) and the std platform layer
+
+-- heap: power-of-two size classes with free lists, bump allocation, growable buffer
+local HEAP_TOP: number = HEAP_BASE
+local FREE: { number } = table.create(20, 0)
+local function heap_grow(need: number)
+	local len = buffer.len(MEM)
+	local newlen = math.max(need, len + len // 2)
+	newlen = (newlen + 65535) // 65536 * 65536
+	if newlen > 0x40000000 then
+		newlen = math.max(need, 0x40000000)
+		if newlen > 0x40000000 then error("out of memory (buffer limit)", 0) end
+	end
+	local nb = buffer.create(newlen)
+	buffer.copy(nb, 0, MEM, 0, len)
+	MEM = nb
+end
+local function heap_bump(size: number, align: number): number
+	local start = (HEAP_TOP + align - 1) // align * align
+	local new = start + size
+	if new > buffer.len(MEM) then heap_grow(new) end
+	HEAP_TOP = new
+	return start
+end
+local function rt_alloc(size: number, align: number): number
+	local n = math.max(size, align, 8)
+	local c = 29 - bit32.countlz(n - 1)
+	if c < 20 then
+		local head = FREE[c + 1]
+		if head ~= 0 then
+			FREE[c + 1] = buffer.readu32(MEM, head)
+			return head
+		end
+		local bs = bit32.lshift(8, c)
+		return heap_bump(bs, math.min(bs, 4096))
+	end
+	return heap_bump(size, math.max(align, 8))
+end
+local function rt_dealloc(p: number, size: number, align: number)
+	local n = math.max(size, align, 8)
+	local c = 29 - bit32.countlz(n - 1)
+	if c < 20 then
+		buffer.writeu32(MEM, p, FREE[c + 1])
+		FREE[c + 1] = p
+	end
+end
+local function rt_alloc_zeroed(size: number, align: number): number
+	local p = rt_alloc(size, align)
+	buffer.fill(MEM, p, 0, size)
+	return p
+end
+local function rt_realloc(p: number, size: number, align: number, newsize: number): number
+	local n0 = math.max(size, align, 8)
+	local n1 = math.max(newsize, align, 8)
+	local c0 = 29 - bit32.countlz(n0 - 1)
+	if c0 < 20 and c0 == 29 - bit32.countlz(n1 - 1) then return p end
+	local q = rt_alloc(newsize, align)
+	buffer.copy(MEM, q, MEM, p, math.min(size, newsize))
+	rt_dealloc(p, size, align)
+	return q
+end
+
+-- stdio: line buffered; stdout -> print, stderr -> warn (recent stderr kept for abort)
+local LINEBUF: { string } = { "", "" }
+local RECENT_ERR: { string } = {}
+local warn_ = (warn :: any) or function(...) print(...) end
+local function rt_write(fd: number, p: number, n: number)
+	local s = LINEBUF[fd] .. buffer.readstring(MEM, p, n)
+	while true do
+		local i = string.find(s, "\n", 1, true)
+		if not i then break end
+		local line = string.sub(s, 1, i - 1)
+		s = string.sub(s, i + 1)
+		if fd == 1 then
+			print(line)
+		else
+			warn_(line)
+			table.insert(RECENT_ERR, line)
+			if #RECENT_ERR > 16 then table.remove(RECENT_ERR, 1) end
+		end
+	end
+	LINEBUF[fd] = s
+end
+local function rt_abort()
+	if LINEBUF[2] ~= "" then
+		table.insert(RECENT_ERR, LINEBUF[2])
+		LINEBUF[2] = ""
+	end
+	local msg = table.concat(RECENT_ERR, "\n")
+	table.clear(RECENT_ERR)
+	error(if msg == "" then "aborted" else msg, 0)
+end
+
+-- std panic hook: message (ptr,len; ptr 0 = non-string payload) and &Location field offsets
+local function rt_panic_msg(mp: number, ml: number, loc: number, fo: number, lo: number, co: number)
+	local msg = if mp ~= 0 then buffer.readstring(MEM, mp, ml) else "Box<dyn Any>"
+	local where_ = ""
+	if loc ~= 0 then
+		local fp = buffer.readu32(MEM, loc + fo)
+		local fl = buffer.readu32(MEM, loc + fo + 4)
+		where_ = string.format(" at %s:%d:%d", buffer.readstring(MEM, fp, fl), buffer.readu32(MEM, loc + lo), buffer.readu32(MEM, loc + co))
+	end
+	table.insert(RECENT_ERR, "panicked" .. where_ .. ":\n" .. msg)
+end
 local function rt_print(p: number, n: number)
 	print(buffer.readstring(MEM, p, n))
 end
@@ -281,9 +384,7 @@ local function rt_mem_size(): number
 end
 local function rt_mem_grow(n: number): number
 	local old = buffer.len(MEM)
-	local nb = buffer.create(old + n)
-	buffer.copy(nb, 0, MEM, 0, old)
-	MEM = nb
+	heap_grow(old + n)
 	return old
 end
 local function rt_clock(): number
@@ -291,6 +392,18 @@ local function rt_clock(): number
 end
 local function rt_heap_base(): number
 	return HEAP_BASE
+end
+-- time as (secs lo, secs hi, nanos)
+local function rt_instant(): (number, number, number)
+	local t = os.clock()
+	local secs = math.floor(t)
+	return secs, 0, math.floor((t - secs) * 1e9)
+end
+local function rt_systime(): (number, number, number)
+	local dt = (DateTime :: any)
+	local ms = if dt then dt.now().UnixTimestampMillis else os.time() * 1000
+	local secs = ms // 1000
+	return secs % 0x100000000, secs // 0x100000000, (ms % 1000) * 1000000
 end
 
 -- 128-bit integers as four u32 limbs (least significant first)

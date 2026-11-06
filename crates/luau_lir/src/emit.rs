@@ -812,9 +812,18 @@ impl<'a> FnEmitter<'a> {
             .collect();
         let mut out = format!("{header}({})\n", params.join(", "));
         self.color_vars();
-        let decls: Vec<String> = self.ncolors.iter().enumerate().map(|(c, t)| format!("r{c}: {}", ty_name(*t))).collect();
+        // initialized so reads of uninitialized Rust bytes (e.g. the payload of a `None`) see a
+        // number/boolean rather than nil
+        let decls: Vec<(String, &str)> = self
+            .ncolors
+            .iter()
+            .enumerate()
+            .map(|(c, t)| (format!("r{c}: {}", ty_name(*t)), if *t == Ty::Bool { "false" } else { "0" }))
+            .collect();
         for chunk in decls.chunks(16) {
-            self.line(&format!("local {}", chunk.join(", ")));
+            let names: Vec<&str> = chunk.iter().map(|d| d.0.as_str()).collect();
+            let vals: Vec<&str> = chunk.iter().map(|d| d.1).collect();
+            self.line(&format!("local {} = {}", names.join(", "), vals.join(", ")));
         }
         if st.uses_label_var {
             self.line("local lbl = 0");

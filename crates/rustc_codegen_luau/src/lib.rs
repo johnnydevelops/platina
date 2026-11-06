@@ -18,6 +18,7 @@ mod abi;
 mod cx;
 mod intrinsics;
 mod lower;
+mod platform;
 
 use std::any::Any;
 

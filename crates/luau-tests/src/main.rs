@@ -57,6 +57,10 @@ fn luau(root: &Path, test: &Path, name: &str) -> Result<String, String> {
 }
 
 fn build_luau(root: &Path, name: &str, glue: &str) -> Result<PathBuf, String> {
+    build_luau_mode(root, name, glue, false)
+}
+
+fn build_luau_mode(root: &Path, name: &str, glue: &str, std: bool) -> Result<PathBuf, String> {
     let krate = root.join("target/luau-tests/crates").join(name);
     std::fs::create_dir_all(krate.join("src")).unwrap();
     std::fs::write(
@@ -69,10 +73,11 @@ fn build_luau(root: &Path, name: &str, glue: &str) -> Result<PathBuf, String> {
     .unwrap();
     std::fs::write(krate.join("src/lib.rs"), glue).unwrap();
     let backend = root.join("target/debug/librustc_codegen_luau.so");
-    let target_dir = root.join("target/luau-tests/target");
+    let target_dir = root.join(if std { "target/luau-tests/target-std" } else { "target/luau-tests/target" });
+    let build_std = if std { "-Zbuild-std=std,panic_abort" } else { "-Zbuild-std=core,alloc" };
     sh(Command::new("cargo")
         .arg(format!("+{TOOLCHAIN}"))
-        .args(["build", "--release", "-q", "-Zbuild-std=core,alloc", "-Zjson-target-spec", "--target"])
+        .args(["build", "--release", "-q", build_std, "-Zjson-target-spec", "--target"])
         .arg(root.join("targets/luau32-unknown-roblox.json"))
         .current_dir(&krate)
         .env("CARGO_TARGET_DIR", &target_dir)
@@ -119,6 +124,65 @@ fn bench(root: &Path, filters: &[String]) {
         }
         let out = sh(cmd.current_dir(root)).unwrap_or_else(|e| e);
         println!("{name:<12} native: {}  luau: {}", native.trim(), out.trim());
+    }
+}
+
+/// std tests: `tests/std/*.rs` define `pub fn run()` and print with `println!`.
+fn std_native(root: &Path, test: &Path, name: &str) -> Result<String, String> {
+    let dir = root.join("target/luau-tests/native");
+    std::fs::create_dir_all(&dir).unwrap();
+    let main = dir.join(format!("std_{name}.rs"));
+    std::fs::write(&main, format!("#![allow(dead_code, unused)]\nmod t {{ include!({test:?}); }}\nfn main() {{ t::run(); }}\n")).unwrap();
+    let bin = dir.join(format!("std_{name}"));
+    sh(Command::new("rustc").args(["--edition", "2024", "-O", "-o"]).arg(&bin).arg(&main))?;
+    sh(&mut Command::new(&bin))
+}
+
+fn std_luau(root: &Path, test: &Path, name: &str) -> Result<String, String> {
+    let glue = format!(
+        "#![allow(dead_code, unused)]\nmod t {{ include!({test:?}); }}\n#[unsafe(no_mangle)]\npub extern \"C\" fn main() {{ t::run(); }}\n"
+    );
+    let module = build_luau_mode(root, &format!("std_{name}"), &glue, true)?;
+    let out = Command::new("timeout")
+        .args(["60", "lune", "run"])
+        .arg(root.join("tests/runner.luau"))
+        .arg(&module)
+        .current_dir(root)
+        .output()
+        .map_err(|e| e.to_string())?;
+    // stdout only: stderr carries warn() output
+    let s = String::from_utf8_lossy(&out.stdout).to_string();
+    if out.status.success() { Ok(s) } else { Err(s + &String::from_utf8_lossy(&out.stderr)) }
+}
+
+fn compare(name: &str, expected: Result<String, String>, got: Result<String, String>, pass: &mut u32, fail: &mut u32) {
+    match (expected, got) {
+        (Err(e), _) => {
+            println!("FAIL {name} (native build/run)\n{e}");
+            *fail += 1;
+        }
+        (Ok(e), Ok(g)) if e == g => {
+            println!("PASS {name}");
+            *pass += 1;
+        }
+        (Ok(e), Ok(g)) => {
+            println!("FAIL {name}: output mismatch");
+            for (i, (a, b)) in e.lines().zip(g.lines()).enumerate() {
+                if a != b {
+                    println!("  line {}: expected {a:?}\n          got      {b:?}", i + 1);
+                    break;
+                }
+            }
+            if e.lines().count() != g.lines().count() {
+                println!("  expected {} lines, got {}", e.lines().count(), g.lines().count());
+            }
+            *fail += 1;
+        }
+        (Ok(_), Err(g)) => {
+            let g: String = g.lines().take(25).collect::<Vec<_>>().join("\n");
+            println!("FAIL {name}\n{g}");
+            *fail += 1;
+        }
     }
 }
 
@@ -175,6 +239,19 @@ fn main() {
                 fail += 1;
             }
         }
+    }
+    let mut std_tests: Vec<PathBuf> = std::fs::read_dir(root.join("tests/std"))
+        .map(|d| d.map(|e| e.unwrap().path()).filter(|p| p.extension().is_some_and(|e| e == "rs")).collect())
+        .unwrap_or_default();
+    std_tests.sort();
+    for t in &std_tests {
+        let name = t.file_stem().unwrap().to_str().unwrap().to_string();
+        if !filters.is_empty() && !filters.iter().any(|f| name.contains(f.as_str())) {
+            continue;
+        }
+        let e = std_native(&root, t, &name);
+        let g = std_luau(&root, t, &name);
+        compare(&format!("std/{name}"), e, g, &mut pass, &mut fail);
     }
     println!("\n{pass} passed, {fail} failed");
     if fail > 0 {
