@@ -109,6 +109,14 @@ impl LeafKind {
 pub struct Leaf {
     pub off: u64,
     pub kind: LeafKind,
+    /// Known non-zero (rustc's scalar `valid_range` excludes 0: references, `NonNull`, `Box`,
+    /// fn pointers, `NonZero*`).
+    pub nz: bool,
+}
+
+fn scalar_nz<'tcx>(cx: LCx<'tcx>, s: Scalar) -> bool {
+    let r = s.valid_range(&cx);
+    r.start >= 1 && r.start <= r.end
 }
 
 pub fn int_kind(bits: u64, signed: bool) -> Option<LeafKind> {
@@ -184,7 +192,8 @@ fn collect<'tcx>(cx: LCx<'tcx>, layout: TyAndLayout<'tcx>, base: u64, out: &mut 
         return true;
     }
     if let Some(k) = prim_kind(layout.ty) {
-        out.push(Leaf { off: base, kind: k });
+        let nz = matches!(layout.backend_repr, BackendRepr::Scalar(sc) if scalar_nz(cx, sc));
+        out.push(Leaf { off: base, kind: k, nz });
         return true;
     }
     match layout.ty.kind() {
@@ -215,7 +224,7 @@ fn scalar_layout<'tcx>(cx: LCx<'tcx>, layout: TyAndLayout<'tcx>, base: u64, out:
     // Every variant's fields must line up exactly with the leaves (same offsets and sizes),
     // otherwise field projections can't be served from registers.
     if let Variants::Multiple { ref variants, .. } = layout.variants {
-        let mine: Vec<Leaf> = out[start..].iter().map(|l| Leaf { off: l.off - base, kind: l.kind }).collect();
+        let mine: Vec<Leaf> = out[start..].iter().map(|l| Leaf { off: l.off - base, kind: l.kind, nz: l.nz }).collect();
         for (vi, _) in variants.iter_enumerated() {
             let vl = layout.for_variant(&cx, vi);
             for fi in 0..vl.fields.count() {
@@ -255,7 +264,7 @@ fn scalar_layout_inner<'tcx>(cx: LCx<'tcx>, layout: TyAndLayout<'tcx>, base: u64
     match layout.backend_repr {
         BackendRepr::Scalar(s) => match scalar_kind(cx, s) {
             Some(k) => {
-                out.push(Leaf { off: base, kind: k });
+                out.push(Leaf { off: base, kind: k, nz: scalar_nz(cx, s) });
                 true
             }
             None => false,
@@ -264,8 +273,8 @@ fn scalar_layout_inner<'tcx>(cx: LCx<'tcx>, layout: TyAndLayout<'tcx>, base: u64
             let b_off = a.size(&cx).align_to(b.align(&cx).abi).bytes();
             match (scalar_kind(cx, a), scalar_kind(cx, b)) {
                 (Some(ka), Some(kb)) => {
-                    out.push(Leaf { off: base, kind: ka });
-                    out.push(Leaf { off: base + b_off, kind: kb });
+                    out.push(Leaf { off: base, kind: ka, nz: scalar_nz(cx, a) });
+                    out.push(Leaf { off: base + b_off, kind: kb, nz: scalar_nz(cx, b) });
                     true
                 }
                 _ => false,
@@ -330,6 +339,7 @@ pub fn ranges(leaves: &[Leaf]) -> Vec<Option<(f64, f64)>> {
     let mut v = Vec::new();
     for l in leaves {
         match l.kind {
+            LeafKind::Int(k) if l.nz && !k.signed => v.push(Some((1.0, k.max()))),
             LeafKind::Int(k) => v.push(Some((k.min(), k.max()))),
             LeafKind::I64 { .. } => v.extend([Some((0.0, 4294967295.0)); 2]),
             LeafKind::I128 { .. } => v.extend([Some((0.0, 4294967295.0)); 4]),

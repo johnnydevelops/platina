@@ -1,0 +1,17 @@
+[package]
+name = "llm"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+crate-type = ["rlib"]
+
+[[bin]]
+name = "llm-native"
+path = "src/native.rs"
+
+[profile.release]
+debug = false
+panic = "abort"
+
+[workspace]

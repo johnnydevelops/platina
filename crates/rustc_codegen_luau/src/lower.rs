@@ -689,7 +689,7 @@ impl<'a, 'tcx> FnLower<'a, 'tcx> {
                 for k in 0..lf.kind.nvars() {
                     vs.push(vars[offs[i] + k]);
                 }
-                ls.push(Leaf { off: lf.off - lo, kind: lf.kind });
+                ls.push(Leaf { off: lf.off - lo, kind: lf.kind, nz: lf.nz });
             }
         }
         (vs, ls)

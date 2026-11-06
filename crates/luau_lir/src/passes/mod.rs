@@ -293,6 +293,7 @@ fn simplify_inner(f: &mut Function) {
         }
         if enabled("cond") {
             changed |= cond::run(f);
+            changed |= cond::thread(f);
         }
         if enabled("range") {
             changed |= range::run(f);

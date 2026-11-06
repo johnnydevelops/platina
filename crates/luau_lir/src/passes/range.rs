@@ -325,6 +325,32 @@ pub fn run(f: &mut Function) -> bool {
             }
         }
     }
+    // 2. comparisons decided by ranges (e.g. `ptr == 0` on a non-null pointer)
+    for b in &mut f.blocks {
+        for s in &mut b.stmts {
+            if let Stmt::Assign(_, rv) = s {
+                if let Rv::Bin(op @ (Bin::Eq | Bin::Ne | Bin::Lt | Bin::Le), x, y) = rv {
+                    let (a, c) = (r.op(x), r.op(y));
+                    if a.0.is_nan() || a.1.is_nan() || c.0.is_nan() || c.1.is_nan() {
+                        continue;
+                    }
+                    let decided = match op {
+                        Bin::Eq | Bin::Ne => {
+                            let disjoint = a.1 < c.0 || c.1 < a.0;
+                            let same = a.0 == a.1 && c.0 == c.1 && a.0 == c.0;
+                            if disjoint { Some(*op == Bin::Ne) } else if same { Some(*op == Bin::Eq) } else { None }
+                        }
+                        Bin::Lt => if a.1 < c.0 { Some(true) } else if a.0 >= c.1 { Some(false) } else { None },
+                        _ => if a.1 <= c.0 { Some(true) } else if a.0 > c.1 { Some(false) } else { None },
+                    };
+                    if let Some(v) = decided {
+                        *rv = Rv::Use(Operand::Bool(v));
+                        changed = true;
+                    }
+                }
+            }
+        }
+    }
     changed |= sink_wraps(f);
     changed
 }
