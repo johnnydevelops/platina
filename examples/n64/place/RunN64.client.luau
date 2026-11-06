@@ -38,6 +38,12 @@ status.Text = "loading ROM..."
 status.Parent = bg
 gui.Parent = Players.LocalPlayer:WaitForChild("PlayerGui")
 
+-- let the first-load hitch settle before doing heavy work
+for i = 10, 1, -1 do
+	status.Text = string.format("starting in %d...", i)
+	task.wait(1)
+end
+
 -- ROM: base64 chunks in ReplicatedStorage.Rom (Rom.Part01 ...)
 local romFolder = ReplicatedStorage:WaitForChild("Rom")
 local parts = romFolder:GetChildren()

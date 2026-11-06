@@ -2,6 +2,9 @@
   "name": "n64",
   "tree": {
     "$className": "DataModel",
+    "Players": {
+      "$properties": { "CharacterAutoLoads": false }
+    },
     "ReplicatedStorage": {
       "N64": { "$path": "out/n64.luau" },
       "Rom": { "$path": "place/rom" }
