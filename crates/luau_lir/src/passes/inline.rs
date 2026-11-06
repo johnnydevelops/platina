@@ -7,7 +7,7 @@ fn cost(f: &Function) -> usize {
     f.blocks.iter().map(|b| b.stmts.len() + 1).sum()
 }
 
-const SMALL: usize = 24;
+const SMALL: usize = 40;
 const SINGLE_CALLER: usize = 120;
 const MAX_VARS: usize = 900;
 const MAX_COST: usize = 3000;

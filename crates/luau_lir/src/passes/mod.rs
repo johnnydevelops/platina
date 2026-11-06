@@ -5,6 +5,7 @@ use crate::ir::*;
 mod cond;
 mod inline;
 mod mem;
+mod promote;
 mod range;
 
 pub fn optimize(p: &mut Program) {
@@ -36,7 +37,11 @@ pub fn simplify(f: &mut Function) {
             changed |= range::run(f);
         }
         if enabled("mem") {
+            changed |= promote::addr_fold(f);
             changed |= mem::run(f);
+        }
+        if enabled("promote") {
+            changed |= promote::promote(f);
         }
         if enabled("coalesce") {
             changed |= coalesce(f);

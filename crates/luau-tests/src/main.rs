@@ -45,8 +45,8 @@ fn luau(root: &Path, test: &Path, name: &str) -> Result<String, String> {
         test
     );
     let module = build_luau(root, name, &glue)?;
-    let out = Command::new("lune")
-        .arg("run")
+    let out = Command::new("timeout")
+        .args(["60", "lune", "run"])
         .arg(root.join("tests/runner.luau"))
         .arg(&module)
         .current_dir(root)
@@ -111,8 +111,8 @@ fn bench(root: &Path, filters: &[String]) {
                 continue;
             }
         };
-        let mut cmd = Command::new("lune");
-        cmd.arg("run").arg(root.join("bench/runner.luau")).arg(&module).arg(n.to_string());
+        let mut cmd = Command::new("timeout");
+        cmd.args(["120", "lune", "run"]).arg(root.join("bench/runner.luau")).arg(&module).arg(n.to_string());
         let baseline = root.join(format!("bench/baseline/{name}.luau"));
         if baseline.exists() {
             cmd.arg(&baseline);
