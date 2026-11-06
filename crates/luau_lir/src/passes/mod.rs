@@ -3,6 +3,8 @@
 use crate::ir::*;
 
 mod inline;
+mod mem;
+mod range;
 
 pub fn optimize(p: &mut Program) {
     for f in &mut p.funcs {
@@ -15,6 +17,10 @@ pub fn optimize(p: &mut Program) {
     }
 }
 
+fn enabled(name: &str) -> bool {
+    std::env::var("LUAU_DISABLE").map(|v| !v.split(',').any(|x| x == name)).unwrap_or(true)
+}
+
 pub fn simplify(f: &mut Function) {
     for _ in 0..8 {
         let mut changed = false;
@@ -22,6 +28,15 @@ pub fn simplify(f: &mut Function) {
         changed |= copy_prop(f);
         changed |= fold_consts(f);
         changed |= dce(f);
+        if enabled("range") {
+            changed |= range::run(f);
+        }
+        if enabled("mem") {
+            changed |= mem::run(f);
+        }
+        if enabled("coalesce") {
+            changed |= coalesce(f);
+        }
         if !changed {
             break;
         }
@@ -316,6 +331,45 @@ fn cfg_simplify(f: &mut Function) -> bool {
             f.blocks[a].term = moved.term;
             preds[bb] = 0;
             changed = true;
+        }
+    }
+    changed
+}
+
+/// `t = rv; ...; x = t` (t single-def, single-use, same block, x untouched in between)
+/// becomes `x = rv`, so updates happen in place on the destination variable.
+fn coalesce(f: &mut Function) -> bool {
+    let defs = def_counts(f);
+    let uses = use_counts(f);
+    let mut changed = false;
+    for b in &mut f.blocks {
+        let mut i = 0;
+        while i < b.stmts.len() {
+            if let Stmt::Assign(x, Rv::Use(Operand::Var(t))) = b.stmts[i].clone() {
+                let (ti, xi) = (t as usize, x as usize);
+                if t != x && defs[ti] == 1 && uses[ti] == 1 && f.vars[ti].ty == f.vars[xi].ty {
+                    // find t's def earlier in this block
+                    if let Some(j) = (0..i).rev().find(|&j| matches!(&b.stmts[j], Stmt::Assign(d, _) if *d == t)) {
+                        let between = &b.stmts[j + 1..i];
+                        let touches_x = between.iter().any(|s| {
+                            s.def().contains(&x) || s.operands().iter().any(|o| **o == Operand::Var(x))
+                        });
+                        // x must keep its declared range invariant: only coalesce into a ranged
+                        // var if t's value is canonical anyway (t's def is a wrap or x is unranged)
+                        let canonical = f.vars[xi].range.is_none()
+                            || matches!(&b.stmts[j], Stmt::Assign(_, Rv::Un(Un::Wrap(_) | Un::WrapNear(..), _)))
+                            || f.vars[ti].range == f.vars[xi].range;
+                        if !touches_x && canonical {
+                            let Stmt::Assign(_, rv) = b.stmts[j].clone() else { unreachable!() };
+                            b.stmts[j] = Stmt::Assign(x, rv);
+                            b.stmts.remove(i);
+                            changed = true;
+                            continue;
+                        }
+                    }
+                }
+            }
+            i += 1;
         }
     }
     changed

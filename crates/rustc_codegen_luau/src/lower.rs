@@ -170,6 +170,18 @@ impl<'a, 'tcx> FnLower<'a, 'tcx> {
     fn var(&mut self, ty: l::Ty) -> VarId {
         self.f.new_var(ty)
     }
+    /// Fresh vars for the leaves of a value, with declared integer ranges.
+    fn leaf_vars(&mut self, leaves: &[Leaf]) -> Vec<VarId> {
+        abi::ltys(leaves)
+            .into_iter()
+            .zip(abi::ranges(leaves))
+            .map(|(t, r)| {
+                let v = self.var(t);
+                self.f.vars[v as usize].range = r;
+                v
+            })
+            .collect()
+    }
     fn assign(&mut self, ty: l::Ty, rv: Rv) -> Operand {
         // constant folding of trivial cases
         if let Rv::Use(o) = rv {
@@ -263,11 +275,7 @@ impl<'a, 'tcx> FnLower<'a, 'tcx> {
             };
             let rep = match lv {
                 Some(leaves) => {
-                    let mut vars = vec![];
-                    for t in abi::ltys(&leaves) {
-                        let v = self.var(t);
-                        vars.push(v);
-                    }
+                    let vars = self.leaf_vars(&leaves);
                     LocalRep::Regs { vars, leaves, layout }
                 }
                 None => {
@@ -310,12 +318,8 @@ impl<'a, 'tcx> FnLower<'a, 'tcx> {
                 match abi::leaves(self.lcx, *part) {
                     Some(pl) => {
                         // register param(s)
-                        let mut pvars = vec![];
-                        for t in abi::ltys(&pl) {
-                            let v = self.var(t);
-                            self.f.params.push(v);
-                            pvars.push(v);
-                        }
+                        let pvars = self.leaf_vars(&pl);
+                        self.f.params.extend(pvars.iter().copied());
                         match self.locals[local.as_usize()].clone() {
                             LocalRep::Regs { vars, leaves, .. } => {
                                 // find var range of this part in the local
@@ -2155,7 +2159,7 @@ impl<'a, 'tcx> FnLower<'a, 'tcx> {
 
         match ret_leaves {
             Some(rl) if target.is_some() => {
-                let dests: Vec<VarId> = abi::ltys(&rl).into_iter().map(|t| self.var(t)).collect();
+                let dests: Vec<VarId> = self.leaf_vars(&rl);
                 self.push(Stmt::Call { dests: dests.clone(), callee, args: call_args });
                 if !dests.is_empty() {
                     let ops = dests.into_iter().map(Operand::Var).collect();

@@ -147,6 +147,9 @@ pub fn mem_suffix(m: Mem) -> &'static str {
 
 /// Wrap expression `a` into the canonical range of `k`.
 pub fn wrap_expr(k: IntKind, a: E) -> E {
+    if k.bits == 32 && !k.signed {
+        return call("bit32.bor", vec![a, E::Num(0.0)]);
+    }
     let m = E::Num(k.modulus());
     if k.signed {
         let h = E::Num(k.modulus() / 2.0);
@@ -179,11 +182,29 @@ pub struct FnEmitter<'a> {
     /// vars that may be folded into their single use
     foldable: Vec<bool>,
     pending: HashMap<VarId, E>,
+    wrapnear_defs: std::collections::HashSet<VarId>,
 }
 
 impl<'a> FnEmitter<'a> {
     pub fn new(f: &'a Function, names: &'a dyn Names) -> Self {
-        FnEmitter { f, names, out: String::new(), indent: 1, top_decl: vec![], foldable: vec![], pending: HashMap::new() }
+        FnEmitter {
+            f,
+            names,
+            out: String::new(),
+            indent: 1,
+            top_decl: vec![],
+            foldable: vec![],
+            pending: HashMap::new(),
+            wrapnear_defs: f
+                .blocks
+                .iter()
+                .flat_map(|b| b.stmts.iter())
+                .filter_map(|s| match s {
+                    Stmt::Assign(v, Rv::Un(Un::WrapNear(..), _)) => Some(*v),
+                    _ => None,
+                })
+                .collect(),
+        }
     }
 
     fn vname(&self, v: VarId) -> String {
@@ -248,7 +269,7 @@ impl<'a> FnEmitter<'a> {
                 continue;
             }
             if single_block {
-                self.foldable[v] = i.uses == 1;
+                self.foldable[v] = i.uses == 1 && !self.wrapnear_defs.contains(&(v as VarId));
             } else {
                 self.top_decl[v] = true;
             }
@@ -334,6 +355,8 @@ impl<'a> FnEmitter<'a> {
                     Un::Not => E::Un("not", Box::new(a)),
                     Un::BNot => call("bit32.bnot", vec![a]),
                     Un::Wrap(k) => wrap_expr(*k, a),
+                    // only reached when the value had to be folded into an expression
+                    Un::WrapNear(k, ..) => wrap_expr(*k, a),
                     Un::F32Round => call("f32", vec![a]),
                     Un::Floor => call("math.floor", vec![a]),
                     Un::Ceil => call("math.ceil", vec![a]),
@@ -394,6 +417,19 @@ impl<'a> FnEmitter<'a> {
 
     fn stmt(&mut self, s: &Stmt) {
         match s {
+            Stmt::Assign(v, Rv::Un(Un::WrapNear(k, above, below), x)) => {
+                let e = self.operand(x);
+                let lhs = self.assign_lhs(&[*v]);
+                let name = self.vname(*v);
+                self.line(&format!("{lhs} = {}", e.to_string()));
+                let m = fmt_num(k.modulus());
+                if *above {
+                    self.line(&format!("if {name} > {} then {name} -= {m} end", fmt_num(k.max())));
+                }
+                if *below {
+                    self.line(&format!("if {name} < {} then {name} += {m} end", fmt_num(k.min())));
+                }
+            }
             Stmt::Assign(v, rv) => {
                 let e = self.rv(rv);
                 if self.foldable[*v as usize] {

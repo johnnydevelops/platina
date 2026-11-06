@@ -281,6 +281,20 @@ pub fn var_offsets(leaves: &[Leaf]) -> (Vec<usize>, usize) {
     (v, n)
 }
 
+/// Declared integer range of each var of the leaves (None for floats/bools).
+pub fn ranges(leaves: &[Leaf]) -> Vec<Option<(f64, f64)>> {
+    let mut v = Vec::new();
+    for l in leaves {
+        match l.kind {
+            LeafKind::Int(k) => v.push(Some((k.min(), k.max()))),
+            LeafKind::I64 { .. } => v.extend([Some((0.0, 4294967295.0)); 2]),
+            LeafKind::I128 { .. } => v.extend([Some((0.0, 4294967295.0)); 4]),
+            _ => v.push(None),
+        }
+    }
+    v
+}
+
 pub fn ltys(leaves: &[Leaf]) -> Vec<LTy> {
     let mut v = Vec::new();
     for l in leaves {

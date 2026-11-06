@@ -164,6 +164,9 @@ pub enum Un {
     BNot,
     /// Reduce to canonical range of the int kind.
     Wrap(IntKind),
+    /// Like `Wrap`, but the operand is known to be within one modulus of the range, so a
+    /// conditional correction suffices. `above`/`below`: which side can be exceeded.
+    WrapNear(IntKind, bool, bool),
     /// Round to nearest f32.
     F32Round,
     Floor,
@@ -248,6 +251,9 @@ pub struct Block {
 pub struct VarInfo {
     pub ty: Ty,
     pub name: Option<String>,
+    /// Declared value range: the variable always holds an integer in `[lo, hi]`
+    /// (canonical form of a Rust integer type).
+    pub range: Option<(f64, f64)>,
 }
 
 #[derive(Clone, Debug)]
@@ -265,7 +271,7 @@ impl Function {
         Function { name: name.into(), params: vec![], rets: vec![], vars: vec![], blocks: vec![], entry: 0 }
     }
     pub fn new_var(&mut self, ty: Ty) -> VarId {
-        self.vars.push(VarInfo { ty, name: None });
+        self.vars.push(VarInfo { ty, name: None, range: None });
         (self.vars.len() - 1) as VarId
     }
     pub fn new_block(&mut self) -> BlockId {
