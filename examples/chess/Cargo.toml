@@ -1,0 +1,10 @@
+[package]
+name = "chess"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+pleco = { git = "https://github.com/pleco-rs/Pleco" }
+luau_rt = { path = "../../crates/luau_rt", default-features = false, features = ["getrandom"] }
+
+[workspace]

@@ -1500,13 +1500,118 @@ impl<'a, 'tcx> FnLower<'a, 'tcx> {
         }
     }
 
+    /// Low 32 bits of a*b for a, b in [0, 2^32), as straight-line exact double arithmetic.
+    pub(crate) fn imul32_inline(&mut self, a: Operand, b: Operand) -> Operand {
+        let a0 = self.bin(Bin::BAnd, a, Operand::Num(65535.0));
+        let a1 = self.bin(Bin::Shr, a, Operand::Num(16.0));
+        let b0 = self.bin(Bin::BAnd, b, Operand::Num(65535.0));
+        let p0 = self.bin(Bin::Mul, a0, b); // < 2^48
+        let p1 = self.bin(Bin::Mul, a1, b0); // < 2^32
+        let p1 = self.bin(Bin::BAnd, p1, Operand::Num(65535.0));
+        let p1 = self.bin(Bin::Mul, p1, Operand::Num(65536.0));
+        let t = self.bin(Bin::Add, p0, p1);
+        self.un(Un::Wrap(IntKind::U32), t)
+    }
+
+    /// Full 64-bit product (lo, hi) of 64-bit values given as u32 limbs.
+    fn mul64_inline(&mut self, al: Operand, ah: Operand, bl: Operand, bh: Operand) -> Vec<Operand> {
+        let a0 = self.bin(Bin::BAnd, al, Operand::Num(65535.0));
+        let a1 = self.bin(Bin::Shr, al, Operand::Num(16.0));
+        let b0 = self.bin(Bin::BAnd, bl, Operand::Num(65535.0));
+        let b1 = self.bin(Bin::Shr, bl, Operand::Num(16.0));
+        let m1 = self.bin(Bin::Mul, a0, b1);
+        let m2 = self.bin(Bin::Mul, a1, b0);
+        let mid = self.bin(Bin::Add, m1, m2); // < 2^33
+        let midlo = self.bin(Bin::BAnd, mid, Operand::Num(65535.0));
+        let p00 = self.bin(Bin::Mul, a0, b0);
+        let ml = self.bin(Bin::Mul, midlo, Operand::Num(65536.0));
+        let lofull = self.bin(Bin::Add, p00, ml); // < 2^33
+        let lo = self.un(Un::Wrap(IntKind::U32), lofull);
+        let d = self.bin(Bin::Sub, lofull, lo);
+        let carry = self.bin(Bin::Mul, d, Operand::Num(1.0 / 4294967296.0));
+        let mh = self.bin(Bin::Sub, mid, midlo);
+        let mh = self.bin(Bin::Mul, mh, Operand::Num(1.0 / 65536.0));
+        let p11 = self.bin(Bin::Mul, a1, b1);
+        let h = self.bin(Bin::Add, p11, mh);
+        let h = self.bin(Bin::Add, h, carry);
+        let c1 = self.imul32_inline(al, bh);
+        let c2 = self.imul32_inline(ah, bl);
+        let h = self.bin(Bin::Add, h, c1);
+        let h = self.bin(Bin::Add, h, c2);
+        vec![lo, self.un(Un::Wrap(IntKind::U32), h)]
+    }
+
+    /// Population count of a u32 (SWAR, no multiply).
+    pub(crate) fn popcnt_inline(&mut self, x: Operand) -> Operand {
+        let t = self.bin(Bin::Shr, x, Operand::Num(1.0));
+        let t = self.bin(Bin::BAnd, t, Operand::Num(0x55555555 as f64));
+        let x = self.bin(Bin::Sub, x, t);
+        let a = self.bin(Bin::BAnd, x, Operand::Num(0x33333333 as f64));
+        let b = self.bin(Bin::Shr, x, Operand::Num(2.0));
+        let b = self.bin(Bin::BAnd, b, Operand::Num(0x33333333 as f64));
+        let x = self.bin(Bin::Add, a, b);
+        let c = self.bin(Bin::Shr, x, Operand::Num(4.0));
+        let x = self.bin(Bin::Add, x, c);
+        let x = self.bin(Bin::BAnd, x, Operand::Num(0x0F0F0F0F as f64));
+        let s8 = self.bin(Bin::Shr, x, Operand::Num(8.0));
+        let s16 = self.bin(Bin::Shr, x, Operand::Num(16.0));
+        let s24 = self.bin(Bin::Shr, x, Operand::Num(24.0));
+        let t = self.bin(Bin::Add, x, s8);
+        let t = self.bin(Bin::Add, t, s16);
+        let t = self.bin(Bin::Add, t, s24);
+        self.bin(Bin::BAnd, t, Operand::Num(63.0))
+    }
+
+    /// 64-bit shift by a variable amount n in [0, 63]: kind 0 = shl, 1 = shr, 2 = sar.
+    fn shift64_var(&mut self, a: &[Operand], n: Operand, kind: u8) -> Vec<Operand> {
+        let (lo, hi) = (a[0], a[1]);
+        let small = self.bin(Bin::Lt, n, Operand::Num(32.0));
+        let n32 = self.bin(Bin::Sub, n, Operand::Num(32.0));
+        let inv = self.bin(Bin::Sub, Operand::Num(32.0), n); // 32 when n == 0: bit32 shifts give 0
+        match kind {
+            0 => {
+                let l = self.bin(Bin::Shl, lo, n);
+                let h1 = self.bin(Bin::Shl, hi, n);
+                let h2 = self.bin(Bin::Shr, lo, inv);
+                let h = self.bin(Bin::BOr, h1, h2);
+                let hb = self.bin(Bin::Shl, lo, n32);
+                vec![
+                    self.num(Rv::Select(small, l, Operand::Num(0.0))),
+                    self.num(Rv::Select(small, h, hb)),
+                ]
+            }
+            _ => {
+                let sar = kind == 2;
+                let l1 = self.bin(Bin::Shr, lo, n);
+                let l2 = self.bin(Bin::Shl, hi, inv);
+                let l = self.bin(Bin::BOr, l1, l2);
+                let h = self.bin(if sar { Bin::Sar } else { Bin::Shr }, hi, n);
+                let lb = self.bin(if sar { Bin::Sar } else { Bin::Shr }, hi, n32);
+                let hb = if sar { self.bin(Bin::Sar, hi, Operand::Num(31.0)) } else { Operand::Num(0.0) };
+                vec![self.num(Rv::Select(small, l, lb)), self.num(Rv::Select(small, h, hb))]
+            }
+        }
+    }
+
+    pub(crate) fn i_shift64_var(&mut self, a: &[Operand], n: Operand, kind: u8) -> Vec<Operand> {
+        if let Operand::Num(c) = n {
+            return self.shift64_const(a, c as u32 & 63, kind, kind == 2);
+        }
+        self.shift64_var(a, n, kind)
+    }
+
     fn mul_wrap(&mut self, k: IntKind, a: Operand, b: Operand) -> Operand {
         let small = |o: &Operand| matches!(o, Operand::Num(n) if n.abs() < 2097152.0);
         if k.bits <= 16 || small(&a) || small(&b) {
             let r = self.bin(Bin::Mul, a, b);
             self.un(Un::Wrap(k), r)
         } else {
-            let r = self.bin(Bin::IMul32, a, b);
+            let (a, b) = if k.signed {
+                (self.un(Un::Wrap(IntKind::U32), a), self.un(Un::Wrap(IntKind::U32), b))
+            } else {
+                (a, b)
+            };
+            let r = self.imul32_inline(a, b);
             if k.signed { self.un(Un::Wrap(k), r) } else { r }
         }
     }
@@ -1534,7 +1639,7 @@ impl<'a, 'tcx> FnLower<'a, 'tcx> {
                 let h = self.bin(Bin::Sub, h, bn);
                 vec![lo, self.un(Un::Wrap(IntKind::U32), h)]
             }
-            BinOp::Mul | BinOp::MulUnchecked => self.call_helper("mul64", &ab, 2),
+            BinOp::Mul | BinOp::MulUnchecked => self.mul64_inline(ab[0], ab[1], ab[2], ab[3]),
             BinOp::Div => self.call_helper(&format!("{s}div64"), &ab, 2),
             BinOp::Rem => self.call_helper(&format!("{s}rem64"), &ab, 2),
             BinOp::BitAnd => vec![self.bin(Bin::BAnd, a[0], b[0]), self.bin(Bin::BAnd, a[1], b[1])],
@@ -1545,14 +1650,14 @@ impl<'a, 'tcx> FnLower<'a, 'tcx> {
                 if let Operand::Num(n) = amt {
                     return self.shift64_const(a, n as u32, 0, signed);
                 }
-                self.call_helper("shl64", &[a[0], a[1], amt], 2)
+                self.shift64_var(a, amt, 0)
             }
             BinOp::Shr | BinOp::ShrUnchecked => {
                 let amt = self.shift_amount(b, bl, 64, true);
                 if let Operand::Num(n) = amt {
                     return self.shift64_const(a, n as u32, if signed { 2 } else { 1 }, signed);
                 }
-                self.call_helper(if signed { "sar64" } else { "shr64" }, &[a[0], a[1], amt], 2)
+                self.shift64_var(a, amt, if signed { 2 } else { 1 })
             }
             BinOp::AddWithOverflow | BinOp::SubWithOverflow | BinOp::MulWithOverflow => {
                 let name = match op {
@@ -1891,6 +1996,19 @@ impl<'a, 'tcx> FnLower<'a, 'tcx> {
                     }
                 } else {
                     let kind = leaf_of(dl.ty).or_else(|| self.natural_leaves(dl).map(|l| l[0].kind)).unwrap();
+                    // wide int against a single value: compare limb by limb
+                    if matches!(kind, LeafKind::I64 { .. } | LeafKind::I128 { .. }) && targets.iter().count() == 1 {
+                        let (v, b) = targets.iter().next().unwrap();
+                        let limbs = const_bits(v, kind);
+                        let mut eq = Operand::Bool(true);
+                        for (x, c) in d.iter().zip(limbs) {
+                            let e = self.bin(Bin::Eq, *x, c);
+                            eq = self.bin(Bin::And, eq, e);
+                        }
+                        let (tb, ob) = (self.bbs[b.as_usize()], self.bbs[targets.otherwise().as_usize()]);
+                        self.term(Term::Br(eq, tb, ob));
+                        return;
+                    }
                     let x = match kind {
                         LeafKind::I64 { .. } | LeafKind::I128 { .. } => {
                             // switch on wide ints: values >= 2^32 never match (we use -2 for them)

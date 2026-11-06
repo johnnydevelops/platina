@@ -4,8 +4,13 @@ version = "0.1.0"
 edition = "2024"
 description = "Runtime support for Rust compiled to Luau by rustc_codegen_luau"
 
+[dependencies]
+getrandom02 = { package = "getrandom", version = "0.2", features = ["custom"], optional = true }
+
 [features]
 default = ["panic-handler", "alloc", "global-allocator"]
+# Randomness for crates using getrandom 0.2 (e.g. rand 0.8), backed by Luau's math.random.
+getrandom = ["dep:getrandom02"]
 panic-handler = []
 alloc = []
 global-allocator = ["alloc"]

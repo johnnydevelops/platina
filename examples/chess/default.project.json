@@ -1,0 +1,12 @@
+{
+  "name": "pleco-chess",
+  "tree": {
+    "$className": "DataModel",
+    "ReplicatedStorage": {
+      "Chess": { "$path": "out/chess.luau" }
+    },
+    "ServerScriptService": {
+      "RunChess": { "$path": "place/RunChess.server.luau" }
+    }
+  }
+}

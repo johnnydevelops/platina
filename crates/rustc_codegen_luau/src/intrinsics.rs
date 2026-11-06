@@ -173,7 +173,31 @@ pub fn lower_intrinsic<'tcx>(
                     vec![fx.i_un(Un::Wrap(ik), o)]
                 }
                 LeafKind::I64 { .. } => {
-                    fx.i_helper(if left { "rotl64" } else { "rotr64" }, &[v[0], v[1], s[0]], 2)
+                    // rotl(x, n) = shl(x, n) | shr(x, 64 - n), with n taken mod 64
+                    let n = match s[0] {
+                        Operand::Num(c) => Operand::Num(((c as i64).rem_euclid(64)) as f64),
+                        o => fx.i_bin(Bin::BAnd, o, Operand::Num(63.0)),
+                    };
+                    let n = if left { n } else {
+                        match n {
+                            Operand::Num(c) => Operand::Num(((64 - c as i64) % 64) as f64),
+                            o => {
+                                let t = fx.i_bin(Bin::Sub, Operand::Num(64.0), o);
+                                fx.i_bin(Bin::BAnd, t, Operand::Num(63.0))
+                            }
+                        }
+                    };
+                    let inv = match n {
+                        Operand::Num(c) => Operand::Num(((64 - c as i64) % 64) as f64),
+                        o => {
+                            let t = fx.i_bin(Bin::Sub, Operand::Num(64.0), o);
+                            fx.i_bin(Bin::BAnd, t, Operand::Num(63.0))
+                        }
+                    };
+                    let a = fx.i_shift64_var(&v, n, 0);
+                    let b = fx.i_shift64_var(&v, inv, 1);
+                    // n == 0: inv == 0 too, so a == b == x and the OR is still x
+                    vec![fx.i_bin(Bin::BOr, a[0], b[0]), fx.i_bin(Bin::BOr, a[1], b[1])]
                 }
                 _ => fx.i_fatal("bad rotate"),
             };
@@ -329,7 +353,7 @@ fn bit_count<'tcx>(fx: &mut FnLower<'_, 'tcx>, n: &str, k: LeafKind, v: &[Operan
             let bits = ik.bits as f64;
             let u = if ik.signed { fx.i_un(Un::Wrap(IntKind { bits: ik.bits, signed: false }), v[0]) } else { v[0] };
             match n {
-                "ctpop" => fx.i_un(Un::Popcnt, u),
+                "ctpop" => fx.popcnt_inline(u),
                 "ctlz" | "ctlz_nonzero" => {
                     let c = fx.i_un(Un::Clz, u);
                     if ik.bits == 32 { c } else { fx.i_bin(Bin::Sub, c, Operand::Num(32.0 - bits)) }
@@ -356,16 +380,29 @@ fn bit_count<'tcx>(fx: &mut FnLower<'_, 'tcx>, n: &str, k: LeafKind, v: &[Operan
                 }
             }
         }
-        LeafKind::I64 { .. } => {
-            let name = match n {
-                "ctpop" => "popcnt64",
-                "ctlz" | "ctlz_nonzero" => "clz64",
-                "cttz" | "cttz_nonzero" => "ctz64",
-                "bswap" => fx.i_fatal("bswap64 must be handled as pair"),
-                _ => fx.i_fatal("bitreverse64 unsupported"),
-            };
-            fx.i_helper(name, &[v[0], v[1]], 1)[0]
-        }
+        LeafKind::I64 { .. } => match n {
+            "ctpop" => {
+                let a = fx.popcnt_inline(v[0]);
+                let b = fx.popcnt_inline(v[1]);
+                fx.i_bin(Bin::Add, a, b)
+            }
+            "ctlz" | "ctlz_nonzero" => {
+                let hz = fx.i_bin(Bin::Eq, v[1], Operand::Num(0.0));
+                let ch = fx.i_un(Un::Clz, v[1]);
+                let cl = fx.i_un(Un::Clz, v[0]);
+                let cl = fx.i_bin(Bin::Add, cl, Operand::Num(32.0));
+                fx.i_assign(l::Ty::Num, Rv::Select(hz, cl, ch))
+            }
+            "cttz" | "cttz_nonzero" => {
+                let lz = fx.i_bin(Bin::Eq, v[0], Operand::Num(0.0));
+                let cl = fx.i_un(Un::Ctz, v[0]);
+                let ch = fx.i_un(Un::Ctz, v[1]);
+                let ch = fx.i_bin(Bin::Add, ch, Operand::Num(32.0));
+                fx.i_assign(l::Ty::Num, Rv::Select(lz, ch, cl))
+            }
+            "bswap" => fx.i_fatal("bswap64 must be handled as pair"),
+            _ => fx.i_fatal("bitreverse64 unsupported"),
+        },
         _ => fx.i_fatal("bad bit intrinsic"),
     }
 }

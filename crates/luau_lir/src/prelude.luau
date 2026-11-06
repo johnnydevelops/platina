@@ -400,6 +400,11 @@ local function rt_mem_grow(n: number): number
 	heap_grow(old + n)
 	return old
 end
+local function rt_random(p: number, n: number)
+	for i = 0, n - 1 do
+		buffer.writeu8(MEM, p + i, math.random(0, 255))
+	end
+end
 local function rt_clock(): number
 	return os.clock()
 end

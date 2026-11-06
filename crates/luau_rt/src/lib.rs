@@ -14,6 +14,7 @@ static GLOBAL: heap::LuauAlloc = heap::LuauAlloc::new();
 use core::fmt::{self, Write};
 
 unsafe extern "C" {
+    fn __luau_random(ptr: *mut u8, len: usize);
     fn __luau_print(ptr: *const u8, len: usize);
     fn __luau_trap(ptr: *const u8, len: usize) -> !;
     fn __luau_clock() -> f64;
@@ -23,6 +24,19 @@ unsafe extern "C" {
 pub fn print_line(s: &str) {
     unsafe { __luau_print(s.as_ptr(), s.len()) }
 }
+
+/// Fill `buf` with random bytes (`math.random`; not cryptographically secure).
+pub fn fill_random(buf: &mut [u8]) {
+    unsafe { __luau_random(buf.as_mut_ptr(), buf.len()) }
+}
+
+#[cfg(feature = "getrandom")]
+fn getrandom02_backend(buf: &mut [u8]) -> Result<(), getrandom02::Error> {
+    fill_random(buf);
+    Ok(())
+}
+#[cfg(feature = "getrandom")]
+getrandom02::register_custom_getrandom!(getrandom02_backend);
 
 /// Seconds since an arbitrary point (`os.clock()`).
 pub fn clock() -> f64 {
