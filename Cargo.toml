@@ -1,7 +1,7 @@
 [workspace]
 resolver = "2"
 members = ["crates/luau_lir", "crates/rustc_codegen_luau", "crates/cargo-roblox", "crates/luau-tests"]
-exclude = ["crates/luau_rt", "examples"]
+exclude = ["crates/luau_rt", "examples", "tests/crates"]
 
 [profile.dev]
 opt-level = 1

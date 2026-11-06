@@ -282,6 +282,18 @@ impl<'a> FnEmitter<'a> {
                 self.top_decl[v] = true;
             }
         }
+        // Large functions: block-scoped `local`s would pile up past Luau's 200-local limit, so
+        // route every non-folded var through the colored function-level registers instead.
+        let block_locals = (0..n).filter(|v| !self.top_decl[*v] && !self.foldable[*v] && info[*v].defs > 0 && !self.f.params.contains(&(*v as VarId))).count();
+        let top = self.top_decl.iter().filter(|t| **t).count();
+        if block_locals + top > 120 {
+            // foldable vars get a register too: used only if they must be materialized early
+            for v in 0..n {
+                if info[v].defs > 0 && !self.f.params.contains(&(v as VarId)) {
+                    self.top_decl[v] = true;
+                }
+            }
+        }
         // Multi-result calls declare all dests together: either all `local` or all top-level.
         for blk in &self.f.blocks {
             for s in &blk.stmts {
@@ -636,7 +648,8 @@ impl<'a> FnEmitter<'a> {
             let reads_def = defs.iter().any(|d| expr_reads_name(e, &self.vname(*d))) || expr_reads_name(e, "SP");
             if (effects && reads_mem) || reads_def {
                 let e = self.pending.remove(&k).unwrap();
-                self.line(&format!("local {} = {}", self.vname(k), e.to_string()));
+                let lhs = self.assign_lhs(&[k]);
+                self.line(&format!("{lhs} = {}", e.to_string()));
             }
         }
     }

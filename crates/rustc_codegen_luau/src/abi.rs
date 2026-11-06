@@ -208,6 +208,50 @@ fn collect<'tcx>(cx: LCx<'tcx>, layout: TyAndLayout<'tcx>, base: u64, out: &mut 
 }
 
 fn scalar_layout<'tcx>(cx: LCx<'tcx>, layout: TyAndLayout<'tcx>, base: u64, out: &mut Vec<Leaf>) -> bool {
+    let start = out.len();
+    if !scalar_layout_inner(cx, layout, base, out) {
+        return false;
+    }
+    // Every variant's fields must line up exactly with the leaves (same offsets and sizes),
+    // otherwise field projections can't be served from registers.
+    if let Variants::Multiple { ref variants, .. } = layout.variants {
+        let mine: Vec<Leaf> = out[start..].iter().map(|l| Leaf { off: l.off - base, kind: l.kind }).collect();
+        for (vi, _) in variants.iter_enumerated() {
+            let vl = layout.for_variant(&cx, vi);
+            for fi in 0..vl.fields.count() {
+                let f = vl.field(&cx, fi);
+                if f.size.bytes() == 0 {
+                    continue;
+                }
+                let off = vl.fields.offset(fi).bytes();
+                let mut fl = Vec::new();
+                if !collect(cx, f, off, &mut fl) {
+                    out.truncate(start);
+                    return false;
+                }
+                fl.sort_by_key(|l| l.off);
+                let covered: Vec<Leaf> = mine.iter().copied().filter(|l| l.off >= off && l.off < off + f.size.bytes()).collect();
+                let ok = covered.len() == fl.len()
+                    && covered.iter().zip(&fl).all(|(a, b)| {
+                        a.off == b.off
+                            && a.kind.size() == b.kind.size()
+                            && matches!((a.kind, b.kind), (LeafKind::Int(_) | LeafKind::Bool, LeafKind::Int(_) | LeafKind::Bool)
+                                | (LeafKind::I64 { .. }, LeafKind::I64 { .. })
+                                | (LeafKind::I128 { .. }, LeafKind::I128 { .. })
+                                | (LeafKind::F32, LeafKind::F32)
+                                | (LeafKind::F64, LeafKind::F64))
+                    });
+                if !ok {
+                    out.truncate(start);
+                    return false;
+                }
+            }
+        }
+    }
+    true
+}
+
+fn scalar_layout_inner<'tcx>(cx: LCx<'tcx>, layout: TyAndLayout<'tcx>, base: u64, out: &mut Vec<Leaf>) -> bool {
     match layout.backend_repr {
         BackendRepr::Scalar(s) => match scalar_kind(cx, s) {
             Some(k) => {

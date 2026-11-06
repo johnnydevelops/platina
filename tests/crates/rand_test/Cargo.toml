@@ -1,0 +1,8 @@
+[package]
+name = "rand_test"
+version = "0.0.0"
+edition = "2024"
+
+[dependencies]
+rand = { version = "0.9", default-features = false, features = ["alloc"] }
+rand_chacha = { version = "0.9", default-features = false }

@@ -522,6 +522,23 @@ impl<'a, 'tcx> FnLower<'a, 'tcx> {
 
     // ---------------------------------------------------------------- places
 
+    /// Values returned in registers (the return place may live in memory if its address is taken).
+    fn return_values(&mut self) -> Vec<Operand> {
+        if self.ret_leaves.is_none() {
+            return vec![];
+        }
+        match &self.locals[mir::RETURN_PLACE.as_usize()] {
+            LocalRep::Regs { vars, .. } => vars.iter().map(|v| Operand::Var(*v)).collect(),
+            LocalRep::Mem { .. } => {
+                let pv = self.place(Place::return_place());
+                match self.read_place(&pv) {
+                    Val::Regs(v) => v,
+                    Val::Mem(_) => unreachable!(),
+                }
+            }
+        }
+    }
+
     fn local_leaves(&self, local: Local) -> (&[VarId], &[Leaf]) {
         match &self.locals[local.as_usize()] {
             LocalRep::Regs { vars, leaves, .. } => (vars, leaves),
@@ -562,7 +579,22 @@ impl<'a, 'tcx> FnLower<'a, 'tcx> {
                             let foff = layout.fields.offset(fi.as_usize()).bytes() as i64;
                             let fl = self.layout(fty);
                             let meta = if fl.is_unsized() { meta } else { None };
-                            PlaceV::Mem { addr, off: off + foff, layout: fl, meta }
+                            // An unsized field whose tail is `dyn Trait` is placed at an offset
+                            // aligned to the *dynamic* alignment (from the vtable).
+                            let tail = self.tcx.struct_tail_for_codegen(fty, typing_env());
+                            if fl.is_unsized() && matches!(tail.kind(), ty::Dynamic(..)) && foff > 0 {
+                                let vt = meta.expect("dyn field without vtable");
+                                let align = self.num(Rv::Load { mem: Mem::U32, addr: vt, off: 8 });
+                                let base = self.add_off(addr, off);
+                                let unaligned = self.bin(Bin::Add, base, Operand::Num(foff as f64));
+                                let am1 = self.bin(Bin::Sub, align, Operand::Num(1.0));
+                                let t = self.bin(Bin::Add, unaligned, am1);
+                                let q = self.bin(Bin::FloorDiv, t, align);
+                                let a = self.bin(Bin::Mul, q, align);
+                                PlaceV::Mem { addr: a, off: 0, layout: fl, meta: Some(vt) }
+                            } else {
+                                PlaceV::Mem { addr, off: off + foff, layout: fl, meta }
+                            }
                         }
                     }
                 }
@@ -1898,12 +1930,7 @@ impl<'a, 'tcx> FnLower<'a, 'tcx> {
                 }
             }
             TerminatorKind::Return => {
-                let ops = if self.ret_leaves.is_some() {
-                    let (vars, _) = self.local_leaves(mir::RETURN_PLACE);
-                    vars.iter().map(|v| Operand::Var(*v)).collect()
-                } else {
-                    vec![]
-                };
+                let ops = self.return_values();
                 self.push(Stmt::SetSp(Operand::Var(self.sp_top)));
                 self.term(Term::Return(ops));
             }
@@ -1985,12 +2012,7 @@ impl<'a, 'tcx> FnLower<'a, 'tcx> {
                 self.call_with_target(func, args, dest, Some(ret_bb), t.source_info);
                 self.bbs = saved;
                 self.cur = ret_bb;
-                let ops = if self.ret_leaves.is_some() {
-                    let (vars, _) = self.local_leaves(mir::RETURN_PLACE);
-                    vars.iter().map(|v| Operand::Var(*v)).collect()
-                } else {
-                    vec![]
-                };
+                let ops = self.return_values();
                 self.push(Stmt::SetSp(Operand::Var(self.sp_top)));
                 self.term(Term::Return(ops));
             }

@@ -76,8 +76,8 @@ pub fn lower_intrinsic<'tcx>(
                         fx.i_assign(l::Ty::Num, Rv::Load { mem: Mem::U32, addr: p[1], off })
                     }
                     _ => {
-                        // struct with unsized tail: size = static prefix + tail (approximate: no padding)
-                        fx.i_fatal(format!("size_of_val of {t} not supported"))
+                        let (size, align) = dst_size_align(fx, t, p[1]);
+                        if n == "size_of_val" { size } else { align }
                     }
                 }
             };
@@ -132,6 +132,12 @@ pub fn lower_intrinsic<'tcx>(
                 .unwrap_or_else(|_| fx.i_fatal("const eval of intrinsic failed"));
             let v = fx.i_const_value(c, dest.layout_pub());
             fx.i_write_val(dest, v);
+        }
+        "bswap" if matches!(leaf_of(tyarg(0)), Some(LeafKind::I64 { .. } | LeafKind::I128 { .. })) => {
+            // reverse the limbs and byte-swap each one
+            let v = arg!(0);
+            let r: Vec<Operand> = v.iter().rev().map(|x| fx.i_un(Un::BSwap, *x)).collect();
+            fx.i_write(dest, r);
         }
         "ctpop" | "ctlz" | "ctlz_nonzero" | "cttz" | "cttz_nonzero" | "bswap" | "bitreverse" => {
             let v = arg!(0);
@@ -510,3 +516,39 @@ pub fn lower_import<'tcx>(fx: &mut FnLower<'_, 'tcx>, name: &str, args: Args<'_,
 
 #[allow(dead_code)]
 fn unused(_: Bin, _: IntKind) {}
+
+/// (size, align) of a dynamically sized value of type `t` with pointer metadata `meta`.
+fn dst_size_align<'tcx>(fx: &mut FnLower<'_, 'tcx>, t: ty::Ty<'tcx>, meta: Operand) -> (Operand, Operand) {
+    let lay = fx.i_layout(t);
+    match t.kind() {
+        ty::Slice(e) | ty::Array(e, _) => {
+            let el = fx.i_layout(*e);
+            (fx.i_bin(Bin::Mul, meta, Operand::Num(el.size.bytes() as f64)), Operand::Num(el.align.bytes() as f64))
+        }
+        ty::Str => (meta, Operand::Num(1.0)),
+        ty::Dynamic(..) => (
+            fx.i_assign(l::Ty::Num, Rv::Load { mem: Mem::U32, addr: meta, off: 4 }),
+            fx.i_assign(l::Ty::Num, Rv::Load { mem: Mem::U32, addr: meta, off: 8 }),
+        ),
+        ty::Adt(..) | ty::Tuple(..) => {
+            // struct with an unsized last field
+            let last = lay.fields.count() - 1;
+            let tail_off = lay.fields.offset(last).bytes() as f64;
+            let tail_ty = lay.field(&fx.i_lcx(), last).ty;
+            let (tsize, talign) = dst_size_align(fx, tail_ty, meta);
+            let salign = Operand::Num(lay.align.bytes() as f64);
+            let align = fx.i_bin(Bin::Max, salign, talign);
+            // offset of the tail is aligned to the tail's alignment (which may be dynamic)
+            let a1 = fx.i_bin(Bin::Sub, talign, Operand::Num(1.0));
+            let o = fx.i_bin(Bin::Add, Operand::Num(tail_off), a1);
+            let o = fx.i_bin(Bin::FloorDiv, o, talign);
+            let o = fx.i_bin(Bin::Mul, o, talign);
+            let unpadded = fx.i_bin(Bin::Add, o, tsize);
+            let a2 = fx.i_bin(Bin::Sub, align, Operand::Num(1.0));
+            let s = fx.i_bin(Bin::Add, unpadded, a2);
+            let s = fx.i_bin(Bin::FloorDiv, s, align);
+            (fx.i_bin(Bin::Mul, s, align), align)
+        }
+        _ => fx.i_fatal(format!("size_of_val of {t} not supported")),
+    }
+}

@@ -105,6 +105,23 @@ fn dead_frames(f: &mut Function) -> bool {
             }
         }
     }
+    // a frame is identified by its sp snapshot: `fp = sp0 - k` and accesses rebased onto sp0
+    // (by address folding) belong to the same frame
+    let mut root_of: Vec<Option<VarId>> = vec![None; n];
+    for b in &f.blocks {
+        for s in &b.stmts {
+            if let Stmt::Assign(v, Rv::Bin(Bin::Sub, Operand::Var(s0), Operand::Num(_)) | Rv::Use(Operand::Var(s0))) = s {
+                if frame[*v as usize] {
+                    root_of[*v as usize] = Some(*s0);
+                }
+            }
+        }
+    }
+    for v in 0..n {
+        if sp_vars[v] {
+            root_of[v] = Some(v as VarId);
+        }
+    }
     // classify uses of frame vars
     let mut escapes = vec![false; n];
     let mut loaded = vec![false; n];
@@ -147,13 +164,28 @@ fn dead_frames(f: &mut Function) -> bool {
         }
     }
     let mut changed = false;
+    // aggregate load/escape facts per frame root (fp vars and their sp snapshot together)
+    let mut root_loaded = vec![false; n];
+    let mut root_escapes = vec![false; n];
+    for v in 0..n {
+        if let Some(r) = root_of[v] {
+            root_loaded[r as usize] |= loaded[v];
+            root_escapes[r as usize] |= escapes[v];
+        }
+    }
     // dead stores into never-loaded, non-escaping frames
     for b in &mut f.blocks {
         let before = b.stmts.len();
         b.stmts.retain(|s| match s {
             Stmt::Store { addr: Operand::Var(base), .. } => {
                 let bi = *base as usize;
-                !(frame[bi] && !escapes[bi] && !loaded[bi])
+                match root_of[bi] {
+                    Some(r) if frame[bi] => {
+                        let ri = r as usize;
+                        !(!root_escapes[ri] && !root_loaded[ri] && !escapes[bi] && !loaded[bi])
+                    }
+                    _ => true,
+                }
             }
             _ => true,
         });

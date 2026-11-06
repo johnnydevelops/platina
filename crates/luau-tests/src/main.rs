@@ -186,10 +186,55 @@ fn compare(name: &str, expected: Result<String, String>, got: Result<String, Str
     }
 }
 
+/// Crate compatibility tests: `tests/crates/<name>/` is a package exposing `pub fn run()`.
+fn crate_test(root: &Path, dir: &Path, name: &str) -> (Result<String, String>, Result<String, String>) {
+    let dep = format!("{name} = {{ path = {:?} }}", dir);
+    // native
+    let nat = root.join("target/luau-tests/crates-native").join(name);
+    std::fs::create_dir_all(nat.join("src")).unwrap();
+    std::fs::write(
+        nat.join("Cargo.toml"),
+        format!("[package]\nname = \"{name}_native\"\nversion = \"0.0.0\"\nedition = \"2024\"\n\n[dependencies]\n{dep}\n\n[workspace]\n"),
+    )
+    .unwrap();
+    std::fs::write(nat.join("src/main.rs"), format!("fn main() {{ {name}::run(); }}\n")).unwrap();
+    let native = sh(Command::new("cargo")
+        .args(["run", "--release", "-q"])
+        .current_dir(&nat)
+        .env("CARGO_TARGET_DIR", root.join("target/luau-tests/crates-native-target")));
+    // luau, built with cargo-roblox
+    let lu = root.join("target/luau-tests/crates-luau").join(name);
+    std::fs::create_dir_all(lu.join("src")).unwrap();
+    std::fs::write(
+        lu.join("Cargo.toml"),
+        format!("[package]\nname = \"{name}_luau\"\nversion = \"0.0.0\"\nedition = \"2024\"\n\n[dependencies]\n{dep}\n\n[workspace]\n"),
+    )
+    .unwrap();
+    std::fs::write(lu.join("src/lib.rs"), format!("#[unsafe(no_mangle)]\npub extern \"C\" fn main() {{ {name}::run(); }}\n")).unwrap();
+    let module = lu.join("out.luau");
+    let built = sh(Command::new(root.join("target/debug/cargo-roblox"))
+        .args(["build", "--release", "-o"])
+        .arg(&module)
+        .current_dir(&lu)
+        .env("CARGO_TARGET_DIR", root.join("target/luau-tests/crates-luau-target")));
+    let luau = built.and_then(|_| {
+        let out = Command::new("timeout")
+            .args(["120", "lune", "run"])
+            .arg(root.join("tests/runner.luau"))
+            .arg(&module)
+            .current_dir(root)
+            .output()
+            .map_err(|e| e.to_string())?;
+        let s = String::from_utf8_lossy(&out.stdout).to_string();
+        if out.status.success() { Ok(s) } else { Err(s + &String::from_utf8_lossy(&out.stderr)) }
+    });
+    (native, luau)
+}
+
 fn main() {
     let root = root();
     let mut filters: Vec<String> = std::env::args().skip(1).collect();
-    sh(Command::new("cargo").args(["build", "-q", "-p", "rustc_codegen_luau"]).current_dir(&root)).expect("build backend");
+    sh(Command::new("cargo").args(["build", "-q", "-p", "rustc_codegen_luau", "-p", "cargo-roblox"]).current_dir(&root)).expect("build backend");
     if filters.first().is_some_and(|f| f == "--bench") {
         filters.remove(0);
         bench(&root, &filters);
@@ -252,6 +297,18 @@ fn main() {
         let e = std_native(&root, t, &name);
         let g = std_luau(&root, t, &name);
         compare(&format!("std/{name}"), e, g, &mut pass, &mut fail);
+    }
+    let mut crate_dirs: Vec<PathBuf> = std::fs::read_dir(root.join("tests/crates"))
+        .map(|d| d.map(|e| e.unwrap().path()).filter(|p| p.join("Cargo.toml").exists()).collect())
+        .unwrap_or_default();
+    crate_dirs.sort();
+    for d in &crate_dirs {
+        let name = d.file_name().unwrap().to_str().unwrap().to_string();
+        if !filters.is_empty() && !filters.iter().any(|f| name.contains(f.as_str())) {
+            continue;
+        }
+        let (e, g) = crate_test(&root, d, &name);
+        compare(&format!("crates/{name}"), e, g, &mut pass, &mut fail);
     }
     println!("\n{pass} passed, {fail} failed");
     if fail > 0 {
