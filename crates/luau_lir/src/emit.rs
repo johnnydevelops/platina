@@ -125,6 +125,25 @@ impl E {
     }
 }
 
+fn is_simple(e: &E) -> bool {
+    matches!(e, E::Name(_) | E::Num(_))
+}
+
+/// `(if a*b < 2^53 then bit32.bor(a*b, 0) else <16-bit split>)`: the product is exact (and
+/// `bor` reduces it mod 2^32) unless it reaches 2^53; only the taken branch is evaluated.
+fn imul32_inline(a: E, b: E) -> E {
+    let n = E::Num;
+    let prod = bin("*", P_MUL, a.clone(), b.clone());
+    let fast = call("bit32.bor", vec![prod.clone(), n(0.0)]);
+    let lo = bin("*", P_MUL, call("bit32.band", vec![a.clone(), n(65535.0)]), b.clone());
+    let mid = call(
+        "bit32.band",
+        vec![bin("*", P_MUL, call("bit32.rshift", vec![a, n(16.0)]), call("bit32.band", vec![b, n(65535.0)])), n(65535.0)],
+    );
+    let slow = call("bit32.bor", vec![bin("+", P_ADD, lo, bin("*", P_MUL, mid, n(65536.0))), n(0.0)]);
+    E::IfElse(Box::new(bin("<", P_CMP, prod, n(9007199254740992.0))), Box::new(fast), Box::new(slow))
+}
+
 fn bin(op: &'static str, p: u8, a: E, b: E) -> E {
     E::Bin(op, p, Box::new(a), Box::new(b))
 }
@@ -186,6 +205,8 @@ pub struct FnEmitter<'a> {
     /// register color of function-level vars (shared Luau locals)
     color: Vec<Option<u32>>,
     ncolors: Vec<Ty>,
+    /// nesting depth of emitted numeric `for` loops (names their control variables)
+    for_depth: usize,
 }
 
 impl<'a> FnEmitter<'a> {
@@ -200,6 +221,7 @@ impl<'a> FnEmitter<'a> {
             pending: HashMap::new(),
             color: vec![],
             ncolors: vec![],
+            for_depth: 0,
             wrapnear_defs: f
                 .blocks
                 .iter()
@@ -485,7 +507,8 @@ impl<'a> FnEmitter<'a> {
                     Bin::Sar => call("bit32.arshift", vec![a, b]),
                     Bin::Rol => call("bit32.lrotate", vec![a, b]),
                     Bin::Ror => call("bit32.rrotate", vec![a, b]),
-                    Bin::IMul32 => call("imul32", vec![a, b]),
+                    Bin::IMul32 if is_simple(&a) && is_simple(&b) => imul32_inline(a, b),
+                    Bin::IMul32 => call("imul32f", vec![a, b]),
                     Bin::IDivTrunc => call("idivt", vec![a, b]),
                     Bin::Min => call("math.min", vec![a, b]),
                     Bin::Max => call("math.max", vec![a, b]),
@@ -699,6 +722,174 @@ impl<'a> FnEmitter<'a> {
         }
     }
 
+    /// Counted loop -> numeric `for`:
+    /// `while true do [hdr] if not (i < n) then break end; v = i; i = i + 1 [wrap]; body end`
+    /// becomes `for fK = i, n - 1 do v = fK; body end` when `n` is loop-invariant and `i` is
+    /// used nowhere else (it is the loop counter only). `i + 1` cannot wrap under `i < n`.
+    fn try_for(&mut self, body: &[S]) -> bool {
+        if self.ncolors.len() > 150 {
+            return false; // keep clear of Luau's register limit
+        }
+        let ncode = body.iter().take_while(|s| matches!(s, S::Code(_))).count();
+        let (hdr, rest) = body.split_at(ncode);
+        let (Some(S::If(c, a, e)), Some(S::Code(b0))) = (rest.first(), rest.get(1)) else { return false };
+        if !(matches!(a.as_slice(), [S::Break]) && e.is_empty()) {
+            return false;
+        }
+        let b0 = *b0;
+        // b0: v = i; i = i + 1 | t = i + 1; i = t ; optional wrap of i
+        let st = &self.f.blocks[b0 as usize].stmts;
+        let Some(Stmt::Assign(v, Rv::Use(Operand::Var(i)))) = st.first() else { return false };
+        let (v, i) = (*v, *i);
+        if v == i {
+            return false;
+        }
+        let mut k = 1;
+        let mut tmp = None;
+        match st.get(1) {
+            Some(Stmt::Assign(d, Rv::Bin(Bin::Add, Operand::Var(x), Operand::Num(one)))) if *x == i && *one == 1.0 => {
+                if *d == i {
+                    k = 2;
+                } else {
+                    match st.get(2) {
+                        Some(Stmt::Assign(d2, Rv::Use(Operand::Var(y)) | Rv::Un(Un::Wrap(_) | Un::WrapNear(..), Operand::Var(y))))
+                            if *d2 == i && y == d =>
+                        {
+                            tmp = Some(*d);
+                            k = 3;
+                        }
+                        _ => return false,
+                    }
+                }
+            }
+            _ => return false,
+        }
+        if k == 2 {
+            if let Some(Stmt::Assign(d2, Rv::Un(Un::Wrap(_) | Un::WrapNear(..), Operand::Var(y)))) = st.get(2) {
+                if *d2 == i && *y == i {
+                    k = 3;
+                }
+            }
+        }
+        // the loop's blocks
+        fn blocks(ss: &[S], out: &mut Vec<BlockId>) {
+            for s in ss {
+                match s {
+                    S::Code(b) => out.push(*b),
+                    S::If(_, a, b) => {
+                        blocks(a, out);
+                        blocks(b, out);
+                    }
+                    S::Loop { body, .. } => blocks(body, out),
+                    _ => {}
+                }
+            }
+        }
+        let mut lb = vec![];
+        blocks(body, &mut lb);
+        // i: used only by the pattern (and the condition); tmp: only by the pattern
+        let count_uses = |var: VarId| -> usize {
+            let mut n = 0;
+            for b in &self.f.blocks {
+                for s in &b.stmts {
+                    n += s.operands().iter().filter(|o| ***o == Operand::Var(var)).count();
+                }
+                let mut t = b.term.clone();
+                n += t.operands_mut().iter().filter(|o| ***o == Operand::Var(var)).count();
+            }
+            n
+        };
+        // pattern uses of i: s0, the add, and (if k == 3 with in-place wrap) the wrap
+        let pat_uses = 2 + usize::from(k == 3 && tmp.is_none());
+        let mut cond_var_uses = 0;
+        for &b in &lb {
+            if b == b0 {
+                continue;
+            }
+            for s in &self.f.blocks[b as usize].stmts {
+                if s.def().contains(&i) {
+                    return false;
+                }
+                cond_var_uses += s.operands().iter().filter(|o| ***o == Operand::Var(i)).count();
+            }
+        }
+        for s in &self.f.blocks[b0 as usize].stmts[k..] {
+            if s.def().contains(&i) || s.operands().iter().any(|o| **o == Operand::Var(i)) {
+                return false;
+            }
+        }
+        if cond_var_uses != 1 || count_uses(i) != pat_uses + 1 {
+            return false;
+        }
+        if let Some(t) = tmp {
+            if count_uses(t) != 1 {
+                return false;
+            }
+        }
+        // the condition must be exactly `i < n`, with n a constant or a loop-invariant var
+        let mut lim: Option<Operand> = None;
+        for s in hdr {
+            let S::Code(b) = s else { unreachable!() };
+            for st in &self.f.blocks[*b as usize].stmts {
+                if let Stmt::Assign(_, Rv::Bin(Bin::Lt, Operand::Var(x), n)) = st {
+                    if *x == i {
+                        lim = Some(*n);
+                    }
+                }
+            }
+        }
+        let Some(lim) = lim else { return false };
+        if let Operand::Var(nv) = lim {
+            if lb.iter().any(|&b| self.f.blocks[b as usize].stmts.iter().any(|s| s.def().contains(&nv))) {
+                return false;
+            }
+        }
+        // header code must fold entirely into the condition (as in try_while)
+        let saved_out = std::mem::take(&mut self.out);
+        let saved_pending = self.pending.clone();
+        for s in hdr {
+            let S::Code(b) = s else { unreachable!() };
+            for st in &self.f.blocks[*b as usize].stmts {
+                self.flush_pending_before(st);
+                self.stmt(st);
+            }
+        }
+        let header_ok = self.out.is_empty();
+        let cond = if header_ok { Some(negate(self.cond(c))) } else { None };
+        let iname = self.vname(i);
+        let shape_ok = match &cond {
+            Some(E::Bin("<", _, x, n)) => matches!(&**x, E::Name(s) if *s == iname) && matches!(&**n, E::Name(_) | E::Num(_)),
+            _ => false,
+        };
+        if !(header_ok && shape_ok) {
+            self.out = saved_out;
+            self.pending = saved_pending;
+            return false;
+        }
+        self.out = saved_out;
+        let Some(E::Bin(_, _, _, n)) = cond else { unreachable!() };
+        let limit = bin("-", P_ADD, *n, E::Num(1.0)).to_string();
+        let fv = format!("fi{}", self.for_depth);
+        self.line(&format!("for {fv} = {iname}, {limit} do"));
+        self.indent += 1;
+        self.for_depth += 1;
+        // v = fK, then the rest of b0 without the increment
+        self.pending.insert(i, E::Name(fv));
+        let s0 = self.f.blocks[b0 as usize].stmts[0].clone();
+        self.stmt(&s0);
+        self.pending.remove(&i);
+        let blk = &self.f.blocks[b0 as usize];
+        for st in &blk.stmts[k..] {
+            self.flush_pending_before(st);
+            self.stmt(st);
+        }
+        self.seq(&rest[2..]);
+        self.for_depth -= 1;
+        self.indent -= 1;
+        self.line("end");
+        true
+    }
+
     /// `while true do [code] if c then break end ... end` -> `while not c do ... end` when the
     /// header code folds entirely into the condition.
     fn try_while(&mut self, body: &[S]) -> bool {
@@ -819,6 +1010,7 @@ impl<'a> FnEmitter<'a> {
                 }
                 self.line("end");
             }
+            S::Loop { once: false, body } if self.try_for(body) => {}
             S::Loop { once: false, body } if self.try_while(body) => {}
             S::Loop { once, body } => {
                 self.line(if *once { "repeat" } else { "while true do" });

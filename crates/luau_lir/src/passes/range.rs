@@ -415,7 +415,60 @@ pub fn run(f: &mut Function) -> bool {
             }
         }
     }
+    changed |= lower_imul(f, &r, &mixed);
     changed |= sink_wraps(f);
+    changed
+}
+
+/// `IMul32(a, b)` (low 32 bits of a u32 product): if the ranges prove the product exact in a
+/// double, a plain multiply + wrap; if an operand comes from bit mixing (hashes, PRNGs: big
+/// products are the norm), the branch-free 16-bit split; otherwise left for the `imul32f`
+/// helper (multiply, with the split only when the product reaches 2^53).
+fn lower_imul(f: &mut Function, r: &Ranges, mixed: &[bool]) -> bool {
+    let mut changed = false;
+    for bi in 0..f.blocks.len() {
+        let mut i = 0;
+        while i < f.blocks[bi].stmts.len() {
+            let Stmt::Assign(v, Rv::Bin(Bin::IMul32, a, b)) = f.blocks[bi].stmts[i].clone() else {
+                i += 1;
+                continue;
+            };
+            let (ia, ib) = (r.op(&a), r.op(&b));
+            let exact = ia.0 >= 0.0 && ib.0 >= 0.0 && ia.1 * ib.1 < 9007199254740992.0;
+            let mix = [a, b].iter().any(|o| matches!(o, Operand::Var(x) if mixed[*x as usize]));
+            let mut new = |f: &mut Function| {
+                f.vars.push(VarInfo { ty: Ty::Num, name: None, range: None });
+                (f.vars.len() - 1) as VarId
+            };
+            let k = IntKind { bits: 32, signed: false };
+            let stmts: Vec<Stmt> = if exact {
+                let t = new(f);
+                vec![Stmt::Assign(t, Rv::Bin(Bin::Mul, a, b)), Stmt::Assign(v, Rv::Un(Un::Wrap(k), Operand::Var(t)))]
+            } else if mix {
+                let n = Operand::Num;
+                let (a0, a1, b0, p0, p1, p2, p3, t) = (new(f), new(f), new(f), new(f), new(f), new(f), new(f), new(f));
+                let var = Operand::Var;
+                vec![
+                    Stmt::Assign(a0, Rv::Bin(Bin::BAnd, a, n(65535.0))),
+                    Stmt::Assign(a1, Rv::Bin(Bin::Shr, a, n(16.0))),
+                    Stmt::Assign(b0, Rv::Bin(Bin::BAnd, b, n(65535.0))),
+                    Stmt::Assign(p0, Rv::Bin(Bin::Mul, var(a0), b)),
+                    Stmt::Assign(p1, Rv::Bin(Bin::Mul, var(a1), var(b0))),
+                    Stmt::Assign(p2, Rv::Bin(Bin::BAnd, var(p1), n(65535.0))),
+                    Stmt::Assign(p3, Rv::Bin(Bin::Mul, var(p2), n(65536.0))),
+                    Stmt::Assign(t, Rv::Bin(Bin::Add, var(p0), var(p3))),
+                    Stmt::Assign(v, Rv::Un(Un::Wrap(k), var(t))),
+                ]
+            } else {
+                i += 1;
+                continue;
+            };
+            let n = stmts.len();
+            f.blocks[bi].stmts.splice(i..=i, stmts);
+            i += n;
+            changed = true;
+        }
+    }
     changed
 }
 

@@ -109,23 +109,38 @@ fn softmax(x: &mut [f32]) {
     }
 }
 
-/// o[r] = W[r, :] . x
+/// o[r] = W[r, :] . x, four rows per pass: each x chunk is read once into locals and used for
+/// all four rows (rows must be a multiple of 4).
 fn qmatmul(o: &mut [f32], x: &[f32], w: &Q8) {
     let n = x.len();
     let ng = n / GS;
-    for (r, out) in o.iter_mut().enumerate() {
-        let row = &w.q[r * n..r * n + n];
-        let sc = &w.scales[r * ng..r * ng + ng];
-        let mut acc = 0f64;
-        for ((qg, xg), &s) in row.chunks_exact(GS).zip(x.chunks_exact(GS)).zip(sc) {
-            // unrolled by 8 over fixed-size arrays: no bounds checks, 1/8 of the loop overhead
-            let mut g = 0f64;
-            for (q, x) in qg.as_chunks::<16>().0.iter().zip(xg.as_chunks::<16>().0) {
-                g += q[0] as f64 * x[0] as f64 + q[1] as f64 * x[1] as f64 + q[2] as f64 * x[2] as f64 + q[3] as f64 * x[3] as f64 + q[4] as f64 * x[4] as f64 + q[5] as f64 * x[5] as f64 + q[6] as f64 * x[6] as f64 + q[7] as f64 * x[7] as f64 + q[8] as f64 * x[8] as f64 + q[9] as f64 * x[9] as f64 + q[10] as f64 * x[10] as f64 + q[11] as f64 * x[11] as f64 + q[12] as f64 * x[12] as f64 + q[13] as f64 * x[13] as f64 + q[14] as f64 * x[14] as f64 + q[15] as f64 * x[15] as f64;
+    for (r4, out) in o.as_chunks_mut::<4>().0.iter_mut().enumerate() {
+        let r = r4 * 4;
+        let (mut a0, mut a1, mut a2, mut a3) = (0f64, 0f64, 0f64, 0f64);
+        for gi in 0..ng {
+            let lo = gi * GS;
+            let xg: &[[f32; 8]; 8] = x[lo..lo + GS].as_chunks::<8>().0.try_into().unwrap();
+            let p0: &[[i8; 8]; 8] = w.q[r * n + lo..r * n + lo + GS].as_chunks::<8>().0.try_into().unwrap();
+            let p1: &[[i8; 8]; 8] = w.q[(r + 1) * n + lo..(r + 1) * n + lo + GS].as_chunks::<8>().0.try_into().unwrap();
+            let p2: &[[i8; 8]; 8] = w.q[(r + 2) * n + lo..(r + 2) * n + lo + GS].as_chunks::<8>().0.try_into().unwrap();
+            let p3: &[[i8; 8]; 8] = w.q[(r + 3) * n + lo..(r + 3) * n + lo + GS].as_chunks::<8>().0.try_into().unwrap();
+            let (mut g0, mut g1, mut g2, mut g3) = (0f64, 0f64, 0f64, 0f64);
+            for c in 0..8 {
+                let xv = &xg[c];
+                let (v0, v1, v2, v3) = (xv[0] as f64, xv[1] as f64, xv[2] as f64, xv[3] as f64);
+                let (v4, v5, v6, v7) = (xv[4] as f64, xv[5] as f64, xv[6] as f64, xv[7] as f64);
+                let (q0, q1, q2, q3) = (&p0[c], &p1[c], &p2[c], &p3[c]);
+                g0 += q0[0] as f64 * v0 + q0[1] as f64 * v1 + q0[2] as f64 * v2 + q0[3] as f64 * v3 + q0[4] as f64 * v4 + q0[5] as f64 * v5 + q0[6] as f64 * v6 + q0[7] as f64 * v7;
+                g1 += q1[0] as f64 * v0 + q1[1] as f64 * v1 + q1[2] as f64 * v2 + q1[3] as f64 * v3 + q1[4] as f64 * v4 + q1[5] as f64 * v5 + q1[6] as f64 * v6 + q1[7] as f64 * v7;
+                g2 += q2[0] as f64 * v0 + q2[1] as f64 * v1 + q2[2] as f64 * v2 + q2[3] as f64 * v3 + q2[4] as f64 * v4 + q2[5] as f64 * v5 + q2[6] as f64 * v6 + q2[7] as f64 * v7;
+                g3 += q3[0] as f64 * v0 + q3[1] as f64 * v1 + q3[2] as f64 * v2 + q3[3] as f64 * v3 + q3[4] as f64 * v4 + q3[5] as f64 * v5 + q3[6] as f64 * v6 + q3[7] as f64 * v7;
             }
-            acc += g * s as f64;
+            a0 += g0 * w.scales[r * ng + gi] as f64;
+            a1 += g1 * w.scales[(r + 1) * ng + gi] as f64;
+            a2 += g2 * w.scales[(r + 2) * ng + gi] as f64;
+            a3 += g3 * w.scales[(r + 3) * ng + gi] as f64;
         }
-        *out = acc as f32;
+        *out = [a0 as f32, a1 as f32, a2 as f32, a3 as f32];
     }
 }
 
@@ -259,7 +274,7 @@ impl Chat {
         let theta = f32::from_bits(r.i32() as u32) as f64;
         let eps = f32::from_bits(r.i32() as u32) as f64;
         let head = dim / n_heads;
-        assert!(head % 16 == 0 && dim % GS == 0 && hidden % GS == 0, "unsupported model shape");
+        assert!(head % 16 == 0 && dim % GS == 0 && hidden % GS == 0 && kv_dim_of(head, n_kv) % 4 == 0 && vocab % 4 == 0, "unsupported model shape");
         let kv_dim = head * n_kv;
         let embed = r.q8(vocab, dim);
         let mut layers = Vec::with_capacity(nl);
@@ -742,4 +757,8 @@ pub extern "C" fn chat_set_sampling(temperature: f64, top_k: u32) {
 #[unsafe(no_mangle)]
 pub extern "C" fn chat_reset() {
     chat().reset();
+}
+
+const fn kv_dim_of(head: usize, n_kv: usize) -> usize {
+    head * n_kv
 }

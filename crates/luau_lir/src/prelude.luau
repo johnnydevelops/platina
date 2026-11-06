@@ -10,6 +10,11 @@ local function imul32(a: number, b: number): number
 	local bl = b % 65536
 	return (al * bl + ((((a - al) / 65536) * bl + al * ((b - bl) / 65536)) % 65536) * 65536) % 0x100000000
 end
+local function imul32f(a: number, b: number): number
+	local p = a * b
+	if p < 9007199254740992 then return bit32.bor(p, 0) end
+	return bit32.bor(bit32.band(a, 0xFFFF) * b + bit32.band(bit32.rshift(a, 16) * bit32.band(b, 0xFFFF), 0xFFFF) * 0x10000, 0)
+end
 local function trunc(x: number): number
 	if x >= 0 then return math.floor(x) else return math.ceil(x) end
 end

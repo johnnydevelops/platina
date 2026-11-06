@@ -470,6 +470,7 @@ pub fn fold_rv(rv: &Rv) -> Option<Operand> {
                 Bin::BXor if u32ok(a) && u32ok(b) => N(((a as u32) ^ (b as u32)) as f64),
                 Bin::Shl if u32ok(a) && u32ok(b) => N(((a as u32).wrapping_shl(b as u32 & 31)) as f64),
                 Bin::Shr if u32ok(a) && u32ok(b) => N(((a as u32).wrapping_shr(b as u32 & 31)) as f64),
+                Bin::IMul32 if u32ok(a) && u32ok(b) => N(((a as u32).wrapping_mul(b as u32)) as f64),
                 Bin::Min => N(a.min(b)),
                 Bin::Max => N(a.max(b)),
                 _ => return None,

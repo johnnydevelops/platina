@@ -1611,7 +1611,9 @@ impl<'a, 'tcx> FnLower<'a, 'tcx> {
             } else {
                 (a, b)
             };
-            let r = self.imul32_inline(a, b);
+            // decided after range analysis: plain multiply, branch-free 16-bit split, or the
+            // fast-path helper (see luau_lir::passes::range::lower_imul)
+            let r = self.bin(Bin::IMul32, a, b);
             if k.signed { self.un(Un::Wrap(k), r) } else { r }
         }
     }
