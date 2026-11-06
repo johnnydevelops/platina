@@ -21,12 +21,19 @@ for i = 4, #process.args do
 	L.chat_user(put(process.args[i]))
 	local prompt = L.chat_pending()
 	local t0, n = os.clock(), 0
+	local tPrompt = nil
 	while true do
 		local len = L.chat_step()
 		if len < 0 then break end
-		stdio.write(buffer.readstring(L.memory(), L.chat_text(), len))
-		n += 1
+		if not tPrompt and L.chat_pending() == 0 then
+			tPrompt = os.clock() - t0
+		end
+		if len > 0 then
+			stdio.write(buffer.readstring(L.memory(), L.chat_text(), len))
+			n += 1
+		end
 	end
 	local dt = os.clock() - t0
-	print(string.format("\n[%d prompt + %d reply tokens in %.1fs, %.2f tok/s]", prompt, n - prompt, dt, n / dt))
+	print(string.format("\n[prompt: %d tokens in %.1fs (%.1f tok/s); reply: %d tokens in %.1fs (%.2f tok/s)]",
+		prompt, tPrompt, prompt / tPrompt, n, dt - tPrompt, n / (dt - tPrompt)))
 end

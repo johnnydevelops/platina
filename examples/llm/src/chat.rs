@@ -4,7 +4,7 @@
 
 use std::collections::BTreeMap;
 
-const GS: usize = 64;
+const GS: usize = 64; // qmatmul4 assumes 8 chunks of 8
 
 /// Q8 matrix [rows x cols], row-major; scales per group of GS along each row.
 struct Q8 {
@@ -48,6 +48,15 @@ pub struct Chat {
     logits: Vec<f32>,
     kc: Vec<f32>,
     vc: Vec<f32>,
+    // 4-token prompt batch (token-major)
+    bx: Vec<f32>,
+    bxb: Vec<f32>,
+    bxb2: Vec<f32>,
+    bq: Vec<f32>,
+    bk: Vec<f32>,
+    bv: Vec<f32>,
+    bhb: Vec<f32>,
+    bhb2: Vec<f32>,
     // tokenizer
     pieces: Vec<Vec<u8>>,
     byte_tok: [i32; 256],
@@ -62,6 +71,8 @@ pub struct Chat {
     pub top_k: usize,
     started: bool,
     carry: bool,
+    /// disable 4-token prompt batching (testing)
+    pub no_batch: bool,
     pub text: Vec<u8>,
 }
 
@@ -115,6 +126,101 @@ fn qmatmul(o: &mut [f32], x: &[f32], w: &Q8) {
             acc += g * s as f64;
         }
         *out = acc as f32;
+    }
+}
+
+fn silu_mul(g: &mut [f32], u: &[f32]) {
+    for (g, &u) in g.iter_mut().zip(u) {
+        let v = *g as f64;
+        *g = (v / (1.0 + (-v).exp()) * u as f64) as f32;
+    }
+}
+
+/// Causal attention of one query (all heads) at `pos` over the layer's KV cache.
+#[allow(clippy::too_many_arguments)]
+fn attend(kc: &[f32], vc: &[f32], att: &mut [f32], q: &[f32], out: &mut [f32], loff: usize, pos: usize, kv_dim: usize, head: usize, kv_mul: usize) {
+    let scale = 1.0 / (head as f64).sqrt();
+    for (h, (q, xb)) in q.chunks_exact(head).zip(out.chunks_exact_mut(head)).enumerate() {
+        let ko = (h / kv_mul) * head;
+        let att = &mut att[..pos + 1];
+        for (t, a) in att.iter_mut().enumerate() {
+            let k = &kc[loff + t * kv_dim + ko..loff + t * kv_dim + ko + head];
+            let mut s = 0f64;
+            for (x, y) in q.as_chunks::<16>().0.iter().zip(k.as_chunks::<16>().0) {
+                s += x[0] as f64 * y[0] as f64 + x[1] as f64 * y[1] as f64 + x[2] as f64 * y[2] as f64 + x[3] as f64 * y[3] as f64 + x[4] as f64 * y[4] as f64 + x[5] as f64 * y[5] as f64 + x[6] as f64 * y[6] as f64 + x[7] as f64 * y[7] as f64 + x[8] as f64 * y[8] as f64 + x[9] as f64 * y[9] as f64 + x[10] as f64 * y[10] as f64 + x[11] as f64 * y[11] as f64 + x[12] as f64 * y[12] as f64 + x[13] as f64 * y[13] as f64 + x[14] as f64 * y[14] as f64 + x[15] as f64 * y[15] as f64;
+            }
+            *a = (s * scale) as f32;
+        }
+        softmax(att);
+        let mut acc = vec![0f64; head];
+        for (t, &a) in att.iter().enumerate() {
+            let vrow = &vc[loff + t * kv_dim + ko..loff + t * kv_dim + ko + head];
+            let a = a as f64;
+            for (o, v) in acc.as_chunks_mut::<16>().0.iter_mut().zip(vrow.as_chunks::<16>().0) {
+                o[0] += a * v[0] as f64;
+                o[1] += a * v[1] as f64;
+                o[2] += a * v[2] as f64;
+                o[3] += a * v[3] as f64;
+                o[4] += a * v[4] as f64;
+                o[5] += a * v[5] as f64;
+                o[6] += a * v[6] as f64;
+                o[7] += a * v[7] as f64;
+                o[8] += a * v[8] as f64;
+                o[9] += a * v[9] as f64;
+                o[10] += a * v[10] as f64;
+                o[11] += a * v[11] as f64;
+                o[12] += a * v[12] as f64;
+                o[13] += a * v[13] as f64;
+                o[14] += a * v[14] as f64;
+                o[15] += a * v[15] as f64;
+            }
+        }
+        for (o, a) in xb.iter_mut().zip(acc) {
+            *o = a as f32;
+        }
+    }
+}
+
+/// Four tokens at once: o[t*rows + r] = W[r, :] . x[t*n..(t+1)*n] for t in 0..4.
+fn qmatmul4(o: &mut [f32], x: &[f32], w: &Q8) {
+    let n = x.len() / 4;
+    let rows = o.len() / 4;
+    let ng = n / GS;
+    let (x0, rest) = x.split_at(n);
+    let (x1, rest) = rest.split_at(n);
+    let (x2, x3) = rest.split_at(n);
+    for r in 0..rows {
+        let row = &w.q[r * n..r * n + n];
+        let sc = &w.scales[r * ng..r * ng + ng];
+        let (mut a0, mut a1, mut a2, mut a3) = (0f64, 0f64, 0f64, 0f64);
+        for (gi, &s) in sc.iter().enumerate() {
+            let lo = gi * GS;
+            let (mut g0, mut g1, mut g2, mut g3) = (0f64, 0f64, 0f64, 0f64);
+            let qg: &[[i8; 8]; 8] = row[lo..lo + GS].as_chunks::<8>().0.try_into().unwrap();
+            let y0: &[[f32; 8]; 8] = x0[lo..lo + GS].as_chunks::<8>().0.try_into().unwrap();
+            let y1: &[[f32; 8]; 8] = x1[lo..lo + GS].as_chunks::<8>().0.try_into().unwrap();
+            let y2: &[[f32; 8]; 8] = x2[lo..lo + GS].as_chunks::<8>().0.try_into().unwrap();
+            let y3: &[[f32; 8]; 8] = x3[lo..lo + GS].as_chunks::<8>().0.try_into().unwrap();
+            for c in 0..8 {
+                let q = &qg[c];
+                let (z0, z1, z2, z3) = (&y0[c], &y1[c], &y2[c], &y3[c]);
+                let (c0, c1, c2, c3) = (q[0] as f64, q[1] as f64, q[2] as f64, q[3] as f64);
+                let (c4, c5, c6, c7) = (q[4] as f64, q[5] as f64, q[6] as f64, q[7] as f64);
+                g0 += c0 * z0[0] as f64 + c1 * z0[1] as f64 + c2 * z0[2] as f64 + c3 * z0[3] as f64 + c4 * z0[4] as f64 + c5 * z0[5] as f64 + c6 * z0[6] as f64 + c7 * z0[7] as f64;
+                g1 += c0 * z1[0] as f64 + c1 * z1[1] as f64 + c2 * z1[2] as f64 + c3 * z1[3] as f64 + c4 * z1[4] as f64 + c5 * z1[5] as f64 + c6 * z1[6] as f64 + c7 * z1[7] as f64;
+                g2 += c0 * z2[0] as f64 + c1 * z2[1] as f64 + c2 * z2[2] as f64 + c3 * z2[3] as f64 + c4 * z2[4] as f64 + c5 * z2[5] as f64 + c6 * z2[6] as f64 + c7 * z2[7] as f64;
+                g3 += c0 * z3[0] as f64 + c1 * z3[1] as f64 + c2 * z3[2] as f64 + c3 * z3[3] as f64 + c4 * z3[4] as f64 + c5 * z3[5] as f64 + c6 * z3[6] as f64 + c7 * z3[7] as f64;
+            }
+            let s = s as f64;
+            a0 += g0 * s;
+            a1 += g1 * s;
+            a2 += g2 * s;
+            a3 += g3 * s;
+        }
+        o[r] = a0 as f32;
+        o[rows + r] = a1 as f32;
+        o[2 * rows + r] = a2 as f32;
+        o[3 * rows + r] = a3 as f32;
     }
 }
 
@@ -218,6 +324,14 @@ impl Chat {
             logits: vec![0.0; vocab],
             kc: vec![0.0; nl * seq_len * kv_dim],
             vc: vec![0.0; nl * seq_len * kv_dim],
+            bx: vec![0.0; 4 * dim],
+            bxb: vec![0.0; 4 * dim],
+            bxb2: vec![0.0; 4 * dim],
+            bq: vec![0.0; 4 * dim],
+            bk: vec![0.0; 4 * kv_dim],
+            bv: vec![0.0; 4 * kv_dim],
+            bhb: vec![0.0; 4 * hidden],
+            bhb2: vec![0.0; 4 * hidden],
             pieces,
             byte_tok,
             merges,
@@ -230,6 +344,7 @@ impl Chat {
             top_k: 40,
             started: false,
             carry: false,
+            no_batch: false,
             text: vec![],
         }
     }
@@ -246,20 +361,25 @@ impl Chat {
         }
     }
 
-    fn forward(&mut self, token: u32, pos: usize) {
-        let (d, head) = (self.dim, self.head);
-        let kv_dim = head * self.n_kv;
-        let kv_mul = self.n_heads / self.n_kv;
-        // embedding row (dequantized)
+    fn embed_into(&self, token: u32, x: &mut [f32]) {
+        let d = self.dim;
         let ng = d / GS;
         let t = token as usize;
         for g in 0..ng {
             let s = self.embed.scales[t * ng + g];
             for j in 0..GS {
-                self.x[g * GS + j] = self.embed.q[t * d + g * GS + j] as f32 * s;
+                x[g * GS + j] = self.embed.q[t * d + g * GS + j] as f32 * s;
             }
         }
-        let scale = 1.0 / (head as f64).sqrt();
+    }
+
+    /// Single-token forward pass; `logits` only when the next token will be sampled.
+    fn forward(&mut self, token: u32, pos: usize, logits: bool) {
+        let head = self.head;
+        let kv_dim = head * self.n_kv;
+        let mut x = core::mem::take(&mut self.x);
+        self.embed_into(token, &mut x);
+        self.x = x;
         for (l, ly) in self.layers.iter().enumerate() {
             rmsnorm(&mut self.xb, &self.x, ly.attn_norm, self.eps);
             let loff = l * self.seq_len * kv_dim;
@@ -269,51 +389,7 @@ impl Chat {
             qmatmul(&mut self.vc[kc0..kc0 + kv_dim], &self.xb, &ly.wv);
             Self::rope(&mut self.q, &self.inv_freq, pos, head);
             Self::rope(&mut self.kc[kc0..kc0 + kv_dim], &self.inv_freq, pos, head);
-            for h in 0..self.n_heads {
-                let q = &self.q[h * head..(h + 1) * head];
-                let ko = (h / kv_mul) * head;
-                let att = &mut self.att[..pos + 1];
-                for (t, a) in att.iter_mut().enumerate() {
-                    let k = &self.kc[loff + t * kv_dim + ko..loff + t * kv_dim + ko + head];
-                    let mut s = 0f64;
-                    for (x, y) in q.as_chunks::<16>().0.iter().zip(k.as_chunks::<16>().0) {
-                        s += x[0] as f64 * y[0] as f64 + x[1] as f64 * y[1] as f64 + x[2] as f64 * y[2] as f64 + x[3] as f64 * y[3] as f64 + x[4] as f64 * y[4] as f64 + x[5] as f64 * y[5] as f64 + x[6] as f64 * y[6] as f64 + x[7] as f64 * y[7] as f64 + x[8] as f64 * y[8] as f64 + x[9] as f64 * y[9] as f64 + x[10] as f64 * y[10] as f64 + x[11] as f64 * y[11] as f64 + x[12] as f64 * y[12] as f64 + x[13] as f64 * y[13] as f64 + x[14] as f64 * y[14] as f64 + x[15] as f64 * y[15] as f64;
-                    }
-                    *a = (s * scale) as f32;
-                }
-                softmax(att);
-                let xb = &mut self.xb[h * head..(h + 1) * head];
-                for v in xb.iter_mut() {
-                    *v = 0.0;
-                }
-                let mut acc = vec![0f64; 0];
-                acc.resize(head, 0.0);
-                for (t, &a) in att.iter().enumerate() {
-                    let vrow = &self.vc[loff + t * kv_dim + ko..loff + t * kv_dim + ko + head];
-                    let a = a as f64;
-                    for (o, v) in acc.as_chunks_mut::<16>().0.iter_mut().zip(vrow.as_chunks::<16>().0) {
-                        o[0] += a * v[0] as f64;
-                        o[1] += a * v[1] as f64;
-                        o[2] += a * v[2] as f64;
-                        o[3] += a * v[3] as f64;
-                        o[4] += a * v[4] as f64;
-                        o[5] += a * v[5] as f64;
-                        o[6] += a * v[6] as f64;
-                        o[7] += a * v[7] as f64;
-                        o[8] += a * v[8] as f64;
-                        o[9] += a * v[9] as f64;
-                        o[10] += a * v[10] as f64;
-                        o[11] += a * v[11] as f64;
-                        o[12] += a * v[12] as f64;
-                        o[13] += a * v[13] as f64;
-                        o[14] += a * v[14] as f64;
-                        o[15] += a * v[15] as f64;
-                    }
-                }
-                for (o, a) in xb.iter_mut().zip(acc) {
-                    *o = a as f32;
-                }
-            }
+            attend(&self.kc, &self.vc, &mut self.att, &self.q, &mut self.xb, loff, pos, kv_dim, head, self.n_heads / self.n_kv);
             qmatmul(&mut self.xb2, &self.xb, &ly.wo);
             for (x, &y) in self.x.iter_mut().zip(&self.xb2) {
                 *x += y;
@@ -321,19 +397,65 @@ impl Chat {
             rmsnorm(&mut self.xb, &self.x, ly.ffn_norm, self.eps);
             qmatmul(&mut self.hb, &self.xb, &ly.w_gate);
             qmatmul(&mut self.hb2, &self.xb, &ly.w_up);
-            for (g, &u) in self.hb.iter_mut().zip(&self.hb2) {
-                let v = *g as f64;
-                *g = (v / (1.0 + (-v).exp()) * u as f64) as f32;
-            }
+            silu_mul(&mut self.hb, &self.hb2);
             qmatmul(&mut self.xb, &self.hb, &ly.w_down);
             for (x, &y) in self.x.iter_mut().zip(&self.xb) {
                 *x += y;
             }
         }
-        let x = self.x.clone();
-        rmsnorm(&mut self.x, &x, self.final_norm, self.eps);
-        let _ = self.hidden;
-        qmatmul(&mut self.logits, &self.x, &self.embed);
+        if logits {
+            let x = self.x.clone();
+            rmsnorm(&mut self.x, &x, self.final_norm, self.eps);
+            qmatmul(&mut self.logits, &self.x, &self.embed);
+        }
+    }
+
+    /// Forward 4 prompt tokens at positions `pos..pos+4` (no logits): every weight is read
+    /// once for all four.
+    fn forward4(&mut self, tokens: [u32; 4], pos: usize) {
+        let (d, head, hd) = (self.dim, self.head, self.hidden);
+        let kv_dim = head * self.n_kv;
+        let mut bx = core::mem::take(&mut self.bx);
+        for t in 0..4 {
+            self.embed_into(tokens[t], &mut bx[t * d..(t + 1) * d]);
+        }
+        self.bx = bx;
+        for (l, ly) in self.layers.iter().enumerate() {
+            for t in 0..4 {
+                rmsnorm(&mut self.bxb[t * d..(t + 1) * d], &self.bx[t * d..(t + 1) * d], ly.attn_norm, self.eps);
+            }
+            qmatmul4(&mut self.bq, &self.bxb, &ly.wq);
+            qmatmul4(&mut self.bk, &self.bxb, &ly.wk);
+            qmatmul4(&mut self.bv, &self.bxb, &ly.wv);
+            let loff = l * self.seq_len * kv_dim;
+            for t in 0..4 {
+                let p = pos + t;
+                Self::rope(&mut self.bq[t * d..(t + 1) * d], &self.inv_freq, p, head);
+                Self::rope(&mut self.bk[t * kv_dim..(t + 1) * kv_dim], &self.inv_freq, p, head);
+                let c = loff + p * kv_dim;
+                self.kc[c..c + kv_dim].copy_from_slice(&self.bk[t * kv_dim..(t + 1) * kv_dim]);
+                self.vc[c..c + kv_dim].copy_from_slice(&self.bv[t * kv_dim..(t + 1) * kv_dim]);
+            }
+            for t in 0..4 {
+                attend(&self.kc, &self.vc, &mut self.att, &self.bq[t * d..(t + 1) * d], &mut self.bxb[t * d..(t + 1) * d],
+                    loff, pos + t, kv_dim, head, self.n_heads / self.n_kv);
+            }
+            qmatmul4(&mut self.bxb2, &self.bxb, &ly.wo);
+            for (x, &y) in self.bx.iter_mut().zip(&self.bxb2) {
+                *x += y;
+            }
+            for t in 0..4 {
+                rmsnorm(&mut self.bxb[t * d..(t + 1) * d], &self.bx[t * d..(t + 1) * d], ly.ffn_norm, self.eps);
+            }
+            qmatmul4(&mut self.bhb, &self.bxb, &ly.w_gate);
+            qmatmul4(&mut self.bhb2, &self.bxb, &ly.w_up);
+            silu_mul(&mut self.bhb, &self.bhb2);
+            qmatmul4(&mut self.bxb, &self.bhb, &ly.w_down);
+            for (x, &y) in self.bx.iter_mut().zip(&self.bxb) {
+                *x += y;
+            }
+        }
+        let _ = hd;
     }
 
     fn random(&mut self) -> f64 {
@@ -511,8 +633,21 @@ impl Chat {
         if self.pos >= self.seq_len {
             return None;
         }
+        // prompt: 4 tokens per pass while more than 4 remain (the last prompt token always
+        // takes the single-token path, which produces the logits for the first reply token)
+        if self.pending.len() > 4 && self.pos + 4 <= self.seq_len && !self.no_batch {
+            let mut ts = [0u32; 4];
+            for t in ts.iter_mut() {
+                *t = self.pending.pop().unwrap();
+            }
+            self.forward4(ts, self.pos);
+            self.pos += 4;
+            self.last = ts[3];
+            return Some(0);
+        }
         if let Some(t) = self.pending.pop() {
-            self.forward(t, self.pos);
+            let last = self.pending.is_empty();
+            self.forward(t, self.pos, last);
             self.pos += 1;
             self.last = t;
             if self.pending.is_empty() {
@@ -521,7 +656,7 @@ impl Chat {
             }
             return Some(0);
         }
-        self.forward(self.last, self.pos);
+        self.forward(self.last, self.pos, true);
         self.pos += 1;
         self.emit()
     }

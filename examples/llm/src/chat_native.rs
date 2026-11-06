@@ -18,6 +18,7 @@ fn main() {
         return;
     }
     c.temperature = a[3].parse().unwrap();
+    c.no_batch = std::env::var("NO_BATCH").is_ok();
     for msg in &a[4..] {
         println!("> {msg}");
         c.user(msg);
