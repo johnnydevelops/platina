@@ -2,11 +2,17 @@
 
 use crate::ir::*;
 
+mod inline;
+
 pub fn optimize(p: &mut Program) {
     for f in &mut p.funcs {
         simplify(f);
     }
     program_dce(p);
+    if std::env::var("LUAU_NO_INLINE").is_err() {
+        inline::inline_program(p);
+        program_dce(p);
+    }
 }
 
 pub fn simplify(f: &mut Function) {

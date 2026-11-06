@@ -407,7 +407,10 @@ impl<'a> FnEmitter<'a> {
                 let a = self.addr(addr, *off);
                 let mut v = self.operand(val);
                 if *mem == Mem::Bool {
-                    v = E::IfElse(Box::new(v), Box::new(E::Num(1.0)), Box::new(E::Num(0.0)));
+                    v = match v {
+                        E::Bool(b) => E::Num(if b { 1.0 } else { 0.0 }),
+                        v => E::IfElse(Box::new(v), Box::new(E::Num(1.0)), Box::new(E::Num(0.0))),
+                    };
                 }
                 let e = call(&format!("buffer.write{}", mem_suffix(*mem)), vec![E::Name("MEM".into()), a, v]);
                 self.line(&e.to_string());

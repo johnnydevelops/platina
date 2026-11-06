@@ -91,7 +91,9 @@ impl<'tcx> Visitor<'tcx> for AddrTaken {
             PlaceContext::NonMutatingUse(NonMutatingUseContext::SharedBorrow | NonMutatingUseContext::FakeBorrow | NonMutatingUseContext::RawBorrow)
                 | PlaceContext::MutatingUse(MutatingUseContext::Borrow | MutatingUseContext::RawBorrow)
         );
-        if borrow {
+        // Borrowing through a deref (`&(*p).f`) reads `p`; only a borrow of the local's own
+        // storage takes its address.
+        if borrow && !place.projection.iter().any(|e| matches!(e, PlaceElem::Deref)) {
             self.mem[place.local.as_usize()] = true;
         }
         for elem in place.projection.iter() {
@@ -110,6 +112,13 @@ impl<'a, 'tcx> FnLower<'a, 'tcx> {
     pub fn lower(cx: &'a mut Cx<'tcx>, instance: Instance<'tcx>, name: String) -> l::Function {
         let tcx = cx.tcx;
         let mir = tcx.instance_mir(instance.def);
+        if let Ok(filter) = std::env::var("LUAU_DUMP_MIR") {
+            if name.contains(&filter) {
+                let mut out = Vec::new();
+                let _ = rustc_middle::mir::pretty::MirWriter::new(tcx).write_mir_fn(mir, &mut out);
+                eprintln!("{}", String::from_utf8_lossy(&out));
+            }
+        }
         let mut f = l::Function::new(name);
         let entry = f.new_block();
         f.entry = entry;
@@ -383,6 +392,15 @@ impl<'a, 'tcx> FnLower<'a, 'tcx> {
 
         // entry block: frame setup + param stores
         self.cur = self.f.entry;
+        let fp = self.fp;
+        let fp_used = self.f.blocks.iter().any(|b| {
+            b.stmts.iter().any(|s| s.operands().iter().any(|o| **o == Operand::Var(fp)))
+                || b.term.clone().operands_mut().iter().any(|o| **o == Operand::Var(fp))
+        });
+        if fp_used && self.frame_size == 0 {
+            // only zero-sized locals: any address will do
+            self.push(Stmt::GetSp(self.fp));
+        }
         let uses_frame = self.frame_size > 0;
         if uses_frame {
             let size = (self.frame_size + self.frame_align - 1) / self.frame_align * self.frame_align;
