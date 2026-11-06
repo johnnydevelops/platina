@@ -24,6 +24,73 @@ fn enabled(name: &str) -> bool {
 }
 
 pub fn simplify(f: &mut Function) {
+    simplify_inner(f);
+    compact_vars(f);
+}
+
+/// Renumber variables so that only referenced ones remain.
+pub fn compact_vars(f: &mut Function) {
+    let n = f.vars.len();
+    let mut used = vec![false; n];
+    for p in &f.params {
+        used[*p as usize] = true;
+    }
+    for b in &f.blocks {
+        for s in &b.stmts {
+            for d in s.def() {
+                used[d as usize] = true;
+            }
+            for o in s.operands() {
+                if let Operand::Var(v) = o {
+                    used[*v as usize] = true;
+                }
+            }
+        }
+        let mut t = b.term.clone();
+        for o in t.operands_mut() {
+            if let Operand::Var(v) = o {
+                used[*v as usize] = true;
+            }
+        }
+    }
+    let mut map = vec![u32::MAX; n];
+    let mut vars = Vec::new();
+    for v in 0..n {
+        if used[v] {
+            map[v] = vars.len() as u32;
+            vars.push(f.vars[v].clone());
+        }
+    }
+    if vars.len() == n {
+        return;
+    }
+    f.vars = vars;
+    let m = |v: &mut VarId| *v = map[*v as usize];
+    for p in &mut f.params {
+        m(p);
+    }
+    for b in &mut f.blocks {
+        for s in &mut b.stmts {
+            match s {
+                Stmt::Assign(v, _) | Stmt::GetSp(v) => m(v),
+                Stmt::Call { dests, .. } => dests.iter_mut().for_each(m),
+                _ => {}
+            }
+            for o in s.operands_mut() {
+                if let Operand::Var(v) = o {
+                    m(v);
+                }
+            }
+        }
+        for o in b.term.operands_mut() {
+            if let Operand::Var(v) = o {
+                m(v);
+            }
+        }
+    }
+}
+
+fn simplify_inner(f: &mut Function) {
     for _ in 0..8 {
         let mut changed = false;
         changed |= cfg_simplify(f);

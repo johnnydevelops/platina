@@ -21,17 +21,25 @@ fn forward(f: &mut Function) -> bool {
         for s in &mut b.stmts {
             match s {
                 Stmt::Assign(v, rv) => {
+                    let mut load_fact = None;
                     if let Rv::Load { mem, addr: Operand::Var(base), off } = rv {
-                        if let Some((m, val)) = known.get(&(*base, *off)) {
-                            if m == mem && *mem != Mem::Bool {
+                        match known.get(&(*base, *off)) {
+                            Some((m, val)) if m == mem && *val != Operand::Var(*v) => {
                                 *rv = Rv::Use(*val);
                                 changed = true;
                             }
+                            _ => load_fact = Some(((*base, *off), *mem)),
                         }
                     }
                     // redefining a var invalidates facts mentioning it
                     let v = *v;
                     known.retain(|(base, _), (_, val)| *base != v && *val != Operand::Var(v));
+                    // later loads of the same location can reuse this one
+                    if let Some((key, mem)) = load_fact {
+                        if key.0 != v {
+                            known.insert(key, (mem, Operand::Var(v)));
+                        }
+                    }
                 }
                 Stmt::Store { mem, addr: Operand::Var(base), off, val } => {
                     let (base, off, mem, val) = (*base, *off, *mem, *val);
@@ -44,7 +52,6 @@ fn forward(f: &mut Function) -> bool {
                         known.insert((base, off), (mem, val));
                     }
                 }
-                Stmt::Assign(..) => {}
                 Stmt::GetSp(v) => {
                     let v = *v;
                     known.retain(|(base, _), (_, val)| *base != v && *val != Operand::Var(v));

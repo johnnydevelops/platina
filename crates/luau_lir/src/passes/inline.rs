@@ -69,6 +69,9 @@ pub fn inline_program(p: &mut Program) {
         let mut changed = false;
         loop {
             if f.vars.len() > MAX_VARS || cost(&f) > MAX_COST {
+                if std::env::var("LUAU_DEBUG_INLINE").is_ok() {
+                    eprintln!("inline: stop in {} vars={} cost={}", f.name, f.vars.len(), cost(&f));
+                }
                 break;
             }
             // find one inlinable call site

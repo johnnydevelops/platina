@@ -1444,8 +1444,25 @@ impl<'a, 'tcx> FnLower<'a, 'tcx> {
         let s = if signed { "i" } else { "u" };
         let ab = [a[0], a[1], b[0], b.get(1).copied().unwrap_or(Operand::Num(0.0))];
         match op {
-            BinOp::Add | BinOp::AddUnchecked => self.call_helper("add64", &ab, 2),
-            BinOp::Sub | BinOp::SubUnchecked => self.call_helper("sub64", &ab, 2),
+            BinOp::Add | BinOp::AddUnchecked => {
+                let t = self.bin(Bin::Add, a[0], ab[2]);
+                let lo = self.un(Un::Wrap(IntKind::U32), t);
+                // carry = (t - lo) / 2^32, exact and branchless
+                let d = self.bin(Bin::Sub, t, lo);
+                let cn = self.bin(Bin::Mul, d, Operand::Num(1.0 / 4294967296.0));
+                let h = self.bin(Bin::Add, a[1], ab[3]);
+                let h = self.bin(Bin::Add, h, cn);
+                vec![lo, self.un(Un::Wrap(IntKind::U32), h)]
+            }
+            BinOp::Sub | BinOp::SubUnchecked => {
+                let t = self.bin(Bin::Sub, a[0], ab[2]);
+                let lo = self.un(Un::Wrap(IntKind::U32), t);
+                let d = self.bin(Bin::Sub, lo, t);
+                let bn = self.bin(Bin::Mul, d, Operand::Num(1.0 / 4294967296.0));
+                let h = self.bin(Bin::Sub, a[1], ab[3]);
+                let h = self.bin(Bin::Sub, h, bn);
+                vec![lo, self.un(Un::Wrap(IntKind::U32), h)]
+            }
             BinOp::Mul | BinOp::MulUnchecked => self.call_helper("mul64", &ab, 2),
             BinOp::Div => self.call_helper(&format!("{s}div64"), &ab, 2),
             BinOp::Rem => self.call_helper(&format!("{s}rem64"), &ab, 2),
@@ -1454,10 +1471,16 @@ impl<'a, 'tcx> FnLower<'a, 'tcx> {
             BinOp::BitXor => vec![self.bin(Bin::BXor, a[0], b[0]), self.bin(Bin::BXor, a[1], b[1])],
             BinOp::Shl | BinOp::ShlUnchecked => {
                 let amt = self.shift_amount(b, bl, 64, true);
+                if let Operand::Num(n) = amt {
+                    return self.shift64_const(a, n as u32, 0, signed);
+                }
                 self.call_helper("shl64", &[a[0], a[1], amt], 2)
             }
             BinOp::Shr | BinOp::ShrUnchecked => {
                 let amt = self.shift_amount(b, bl, 64, true);
+                if let Operand::Num(n) = amt {
+                    return self.shift64_const(a, n as u32, if signed { 2 } else { 1 }, signed);
+                }
                 self.call_helper(if signed { "sar64" } else { "shr64" }, &[a[0], a[1], amt], 2)
             }
             BinOp::AddWithOverflow | BinOp::SubWithOverflow | BinOp::MulWithOverflow => {
@@ -1496,6 +1519,33 @@ impl<'a, 'tcx> FnLower<'a, 'tcx> {
                 vec![self.assign(ty, Rv::Select(heq, cl, ch))]
             }
             BinOp::Offset => unreachable!(),
+        }
+    }
+
+    /// 64-bit shift by a constant: kind 0 = shl, 1 = logical shr, 2 = arithmetic shr.
+    fn shift64_const(&mut self, a: &[Operand], n: u32, kind: u8, _signed: bool) -> Vec<Operand> {
+        let (lo, hi) = (a[0], a[1]);
+        let num = |x: u32| Operand::Num(x as f64);
+        if n == 0 {
+            return vec![lo, hi];
+        }
+        match kind {
+            0 if n < 32 => {
+                let l = self.bin(Bin::Shl, lo, num(n));
+                let h1 = self.bin(Bin::Shl, hi, num(n));
+                let h2 = self.bin(Bin::Shr, lo, num(32 - n));
+                vec![l, self.bin(Bin::BOr, h1, h2)]
+            }
+            0 => vec![Operand::Num(0.0), self.bin(Bin::Shl, lo, num(n - 32))],
+            _ if n < 32 => {
+                let l1 = self.bin(Bin::Shr, lo, num(n));
+                let l2 = self.bin(Bin::Shl, hi, num(32 - n));
+                let l = self.bin(Bin::BOr, l1, l2);
+                let h = self.bin(if kind == 2 { Bin::Sar } else { Bin::Shr }, hi, num(n));
+                vec![l, h]
+            }
+            1 => vec![self.bin(Bin::Shr, hi, num(n - 32)), Operand::Num(0.0)],
+            _ => vec![self.bin(Bin::Sar, hi, num(n - 32)), self.bin(Bin::Sar, hi, num(31))],
         }
     }
 

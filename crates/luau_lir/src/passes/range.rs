@@ -264,10 +264,45 @@ fn analyze_flow(f: &Function, facts: &[Vec<(VarId, Iv)>]) -> Ranges {
     r
 }
 
+/// Vars whose values come from bit mixing (xor/shift/rotate/multiply): overflow of arithmetic
+/// on them is data-dependent, so wraps should be branchless.
+fn mixed_vars(f: &Function) -> Vec<bool> {
+    let n = f.vars.len();
+    let mut mixed = vec![false; n];
+    for _ in 0..4 {
+        let mut changed = false;
+        for b in &f.blocks {
+            for s in &b.stmts {
+                if let Stmt::Assign(v, rv) = s {
+                    if mixed[*v as usize] {
+                        continue;
+                    }
+                    let m = match rv {
+                        Rv::Bin(Bin::BXor | Bin::BOr | Bin::BAnd | Bin::Shl | Bin::Shr | Bin::Sar | Bin::Rol | Bin::Ror, _, _) => true,
+                        Rv::Un(Un::BNot | Un::BSwap, _) => true,
+                        Rv::Bin(Bin::Add | Bin::Sub, a, b2) => [a, b2].iter().any(|o| matches!(o, Operand::Var(x) if mixed[*x as usize])),
+                        Rv::Use(Operand::Var(x)) | Rv::Un(Un::Wrap(_) | Un::WrapNear(..), Operand::Var(x)) => mixed[*x as usize],
+                        _ => false,
+                    };
+                    if m {
+                        mixed[*v as usize] = true;
+                        changed = true;
+                    }
+                }
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    mixed
+}
+
 pub fn run(f: &mut Function) -> bool {
     let mut changed = false;
     // 1. redundant wraps
     let r = analyze(f);
+    let mixed = mixed_vars(f);
     for b in &mut f.blocks {
         for s in &mut b.stmts {
             if let Stmt::Assign(_, rv) = s {
@@ -279,6 +314,9 @@ pub fn run(f: &mut Function) -> bool {
                         changed = true;
                     } else if matches!(rv, Rv::Un(Un::Wrap(_), _))
                         && iv.within(k.min() - k.modulus(), k.max() + k.modulus())
+                        // only when overflow is rare (counters, indices): a data-dependent,
+                        // unpredictable branch is slower than a branchless wrap
+                        && !matches!(x, Operand::Var(xv) if mixed[xv as usize])
                     {
                         *rv = Rv::Un(Un::WrapNear(k, iv.1 > k.max(), iv.0 < k.min()), x);
                         changed = true;

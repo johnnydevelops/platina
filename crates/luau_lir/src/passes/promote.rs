@@ -58,6 +58,37 @@ pub fn addr_fold(f: &mut Function) -> bool {
         if moved && off.abs() < (1 << 30) { Some((Operand::Var(v), off as i32)) } else { None }
     };
     let mut changed = false;
+    // load through `t = select(c, p, q)` -> select(c, load p, load q)
+    for bi in 0..f.blocks.len() {
+        let mut i = 0;
+        while i < f.blocks[bi].stmts.len() {
+            if let Stmt::Assign(v, Rv::Load { mem, addr: Operand::Var(t), off }) = f.blocks[bi].stmts[i].clone() {
+                if defs[t as usize] == 1 {
+                    if let Some(Rv::Select(c, p @ Operand::Var(_), q @ Operand::Var(_))) = &def_rv[t as usize] {
+                        let (c, p, q) = (*c, *p, *q);
+                        let ty = f.vars[v as usize].ty;
+                        let r = f.vars[v as usize].range;
+                        f.vars.push(VarInfo { ty, name: None, range: r });
+                        let x1 = (f.vars.len() - 1) as VarId;
+                        f.vars.push(VarInfo { ty, name: None, range: r });
+                        let x2 = (f.vars.len() - 1) as VarId;
+                        f.blocks[bi].stmts.splice(
+                            i..=i,
+                            [
+                                Stmt::Assign(x1, Rv::Load { mem, addr: p, off }),
+                                Stmt::Assign(x2, Rv::Load { mem, addr: q, off }),
+                                Stmt::Assign(v, Rv::Select(c, Operand::Var(x1), Operand::Var(x2))),
+                            ],
+                        );
+                        changed = true;
+                        i += 3;
+                        continue;
+                    }
+                }
+            }
+            i += 1;
+        }
+    }
     for b in &mut f.blocks {
         for s in &mut b.stmts {
             match s {
