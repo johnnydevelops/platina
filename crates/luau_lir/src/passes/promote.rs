@@ -331,7 +331,11 @@ pub fn promote(f: &mut Function) -> bool {
                         if let Some((vr, vc)) = root_of[*x as usize] {
                             // storing a frame pointer: fine only into a slot of the same frame
                             // (and only while that slot itself does not escape; checked below)
-                            if addr_root.map(|(r, _)| r) != Some(vr) || *mem != Mem::U32 {
+                            let consistent = addr_root
+                                .map(|(r, c)| matches!(slot_ptr.get(&(r, (c + *off as i64) as i32)), Some(Some(_))))
+                                .unwrap_or(false);
+                            if addr_root.map(|(r, _)| r) != Some(vr) || *mem != Mem::U32 || !consistent {
+                                // loads from that slot can't be traced back to this frame
                                 why!(vr, Some(vc), s);
                             } else if let Some((r, c)) = addr_root {
                                 ptr_stores.push(((r, (c + *off as i64) as i32), (vr, vc)));

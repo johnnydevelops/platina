@@ -68,6 +68,21 @@ pub fn emit_program(p: &Program) -> Result<String, String> {
     }
     writeln!(out, "local FN = table.create({})", p.table.len()).unwrap();
     for (i, f) in p.funcs.iter().enumerate() {
+        if let Ok(filt) = std::env::var("LUAU_DUMP_LIR") {
+            if f.name.contains(&filt) {
+                eprintln!("=== LIR {}", f.name);
+                for (bi, b) in f.blocks.iter().enumerate() {
+                    if b.stmts.is_empty() && b.term == Term::Unreachable {
+                        continue;
+                    }
+                    eprintln!("b{bi}:");
+                    for s in &b.stmts {
+                        eprintln!("    {s:?}");
+                    }
+                    eprintln!("    -> {:?}", b.term);
+                }
+            }
+        }
         let st = structure::structure(f).map_err(|_| format!("irreducible control flow in {}", f.name))?;
         writeln!(out, "\n-- {}", f.name.replace('\n', " ")).unwrap();
         let e = emit::FnEmitter::new(f, &names_cb);

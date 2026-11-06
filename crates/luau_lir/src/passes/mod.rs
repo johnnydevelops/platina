@@ -4,6 +4,7 @@ use crate::ir::*;
 
 mod cond;
 mod inline;
+mod loops;
 mod mem;
 mod promote;
 mod range;
@@ -99,8 +100,12 @@ fn simplify_inner(f: &mut Function) {
         let mut changed = false;
         changed |= cfg_simplify(f);
         changed |= copy_prop(f);
+        changed |= local_copy_prop(f);
         changed |= fold_consts(f);
         changed |= dce(f);
+        if enabled("loops") {
+            changed |= loops::remove_dead_loops(f);
+        }
         if enabled("cond") {
             changed |= cond::run(f);
         }
@@ -215,6 +220,41 @@ fn copy_prop(f: &mut Function) -> bool {
             changed = true;
         }
     });
+    changed
+}
+
+/// Within a block: uses of `t` after `t = s` read `s` directly while neither is redefined.
+fn local_copy_prop(f: &mut Function) -> bool {
+    let mut changed = false;
+    for b in &mut f.blocks {
+        let mut map: Vec<(VarId, Operand)> = vec![];
+        for s in &mut b.stmts {
+            for o in s.operands_mut() {
+                if let Operand::Var(v) = o {
+                    if let Some((_, src)) = map.iter().find(|(t, _)| t == v) {
+                        *o = *src;
+                        changed = true;
+                    }
+                }
+            }
+            for d in s.def() {
+                map.retain(|(t, src)| *t != d && *src != Operand::Var(d));
+            }
+            if let Stmt::Assign(t, Rv::Use(src)) = s {
+                if Operand::Var(*t) != *src {
+                    map.push((*t, *src));
+                }
+            }
+        }
+        for o in b.term.operands_mut() {
+            if let Operand::Var(v) = o {
+                if let Some((_, src)) = map.iter().find(|(t, _)| t == v) {
+                    *o = *src;
+                    changed = true;
+                }
+            }
+        }
+    }
     changed
 }
 
