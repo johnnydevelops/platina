@@ -391,6 +391,70 @@ local function rt_panic_msg(mp: number, ml: number, loc: number, fo: number, lo:
 	end
 	table.insert(RECENT_ERR, "panicked" .. where_ .. ":\n" .. msg)
 end
+-- Luau values referenced from Rust: handle ids (0 = nil)
+local rt_H: { any } = {}
+local rt_Hfree: { number } = {}
+local rt_Hn = 0
+local function rt_href(v: any): number
+	if v == nil then return 0 end
+	local n = #rt_Hfree
+	local id
+	if n > 0 then
+		id = rt_Hfree[n]
+		rt_Hfree[n] = nil
+	else
+		rt_Hn += 1
+		id = rt_Hn
+	end
+	rt_H[id] = v
+	return id
+end
+local function rt_hget(id: number): any
+	return rt_H[id]
+end
+local function rt_hdrop(id: number)
+	if id ~= 0 then
+		rt_H[id] = nil
+		table.insert(rt_Hfree, id)
+	end
+end
+-- EnumItem of an enum by value (cached per enum)
+local rt_enum_cache: { [any]: { [number]: any } } = {}
+local function rt_enum(e: any, v: number): any
+	local m = rt_enum_cache[e]
+	if not m then
+		m = {}
+		for _, it in e:GetEnumItems() do
+			m[it.Value] = it
+		end
+		rt_enum_cache[e] = m
+	end
+	return m[v]
+end
+local function rt_str(p: number, n: number): string
+	return buffer.readstring(MEM, p, n)
+end
+-- a Luau string as a Rust-heap allocation (ptr, len) for String::from_raw_parts
+local function rt_str_out(s: string): (number, number)
+	local n = #s
+	if n == 0 then return 1, 0 end
+	local p = rt_alloc(n, 1)
+	buffer.writestring(MEM, p, s)
+	return p, n
+end
+-- call a function that may yield (task.wait, :Wait(), ...) from Rust: while this coroutine is
+-- suspended, Rust code entered from elsewhere runs on a separate shadow-stack segment
+local function rt_yield(f: (...any) -> ...any, ...: any): ...any
+	local sp = SP
+	local seg = rt_alloc(65536, 16)
+	SP = seg + 65536
+	local r = table.pack(f(...))
+	if SP == seg + 65536 then
+		rt_dealloc(seg, 65536, 16)
+	end
+	SP = sp
+	return table.unpack(r, 1, r.n)
+end
 local function rt_print(p: number, n: number)
 	print(buffer.readstring(MEM, p, n))
 end

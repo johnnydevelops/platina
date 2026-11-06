@@ -602,9 +602,20 @@ fn atomic<'tcx>(fx: &mut FnLower<'_, 'tcx>, n: &str, inst: Instance<'tcx>, args:
     true
 }
 
-/// `extern "C" { fn __luau_NAME(...) }` imports map to prelude `rt_NAME` functions.
+/// Imports:
+/// - `extern "C" { fn __luau_NAME(...) }` maps to the prelude's `rt_NAME`;
+/// - an import whose link name is `luau::<expression>` calls that Luau expression (normally a
+///   `function(...) ... end`), the glue mechanism crates use to call Luau/Roblox APIs. Scalar
+///   leaves of the arguments become the Luau parameters, and the Luau results fill the
+///   return value's leaves.
 pub fn lower_import<'tcx>(fx: &mut FnLower<'_, 'tcx>, name: &str, args: Args<'_, 'tcx>, dest: Place<'tcx>) -> bool {
-    let Some(rt) = name.strip_prefix("__luau_") else { return false };
+    let callee = if name.starts_with("luau::") {
+        name.to_string()
+    } else if let Some(rt) = name.strip_prefix("__luau_") {
+        format!("rt_{rt}")
+    } else {
+        return false;
+    };
     let mut flat = vec![];
     for a in args {
         let (v, _) = fx.i_operand(&a.node);
@@ -613,7 +624,7 @@ pub fn lower_import<'tcx>(fx: &mut FnLower<'_, 'tcx>, name: &str, args: Args<'_,
     let dpv = fx.i_place(dest);
     let dl = dpv.layout_pub();
     let rets = abi::leaves(fx.i_lcx(), dl).map(|l| abi::ltys(&l)).unwrap_or_default();
-    let r = fx.i_helper(&format!("rt_{rt}"), &flat, rets.len());
+    let r = fx.i_helper(&callee, &flat, rets.len());
     if !r.is_empty() {
         fx.i_write(&dpv, r);
     }

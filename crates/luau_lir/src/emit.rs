@@ -181,6 +181,10 @@ pub fn wrap_expr(k: IntKind, a: E) -> E {
 /// Callback for naming functions.
 pub trait Names {
     fn func(&self, id: u32) -> String;
+    /// Expression naming a `luau::` glue function (by its code).
+    fn glue(&self, code: &str) -> String {
+        format!("({code})")
+    }
 }
 
 struct VarUse {
@@ -573,7 +577,10 @@ impl<'a> FnEmitter<'a> {
     fn callee(&mut self, c: &Callee) -> String {
         match c {
             Callee::Func(i) => self.names.func(*i),
-            Callee::Extern(s) => s.clone(),
+            Callee::Extern(s) => match s.strip_prefix("luau::") {
+                Some(code) => self.names.glue(code),
+                None => s.clone(),
+            },
             Callee::Indirect(o) => {
                 let e = self.operand(o);
                 format!("FN[{}]", e.to_string())

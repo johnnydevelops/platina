@@ -1,0 +1,9 @@
+[package]
+name = "roblox_test"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+roblox = { path = "../../crates/roblox" }
+
+[workspace]

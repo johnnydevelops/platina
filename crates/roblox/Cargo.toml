@@ -1,0 +1,10 @@
+[package]
+name = "roblox"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+description = "Roblox engine API bindings for Rust compiled to Luau with Platina"
+repository = "https://github.com/johnnydevelops/platina"
+
+[lib]
+path = "src/lib.rs"

@@ -18,11 +18,35 @@ const MAX_LOCAL_FUNCS: usize = 120;
 
 struct ProgNames {
     local: Vec<bool>,
+    glue: std::collections::HashMap<String, usize>,
 }
 impl emit::Names for ProgNames {
     fn func(&self, id: u32) -> String {
         if self.local[id as usize] { format!("F{id}") } else { format!("FT[{id}]") }
     }
+    fn glue(&self, code: &str) -> String {
+        format!("GL[{}]", self.glue[code])
+    }
+}
+
+/// Distinct `luau::` glue snippets called by the program, in first-use order.
+fn glue_snippets(p: &Program) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    let mut out = vec![];
+    for f in &p.funcs {
+        for b in &f.blocks {
+            for s in &b.stmts {
+                if let Stmt::Call { callee: Callee::Extern(n), .. } = s {
+                    if let Some(code) = n.strip_prefix("luau::") {
+                        if seen.insert(code.to_string()) {
+                            out.push(code.to_string());
+                        }
+                    }
+                }
+            }
+        }
+    }
+    out
 }
 
 fn call_counts(p: &Program) -> Vec<usize> {
@@ -77,7 +101,8 @@ pub fn emit_program(p: &Program) -> Result<String, String> {
     for i in order.into_iter().take(budget) {
         local[i] = true;
     }
-    let names_cb = ProgNames { local: local.clone() };
+    let glue = glue_snippets(p);
+    let names_cb = ProgNames { local: local.clone(), glue: glue.iter().enumerate().map(|(i, c)| (c.clone(), i + 1)).collect() };
     let names: Vec<String> = (0..p.funcs.len()).filter(|i| local[*i]).map(|i| format!("F{i}")).collect();
     for chunk in names.chunks(32) {
         writeln!(out, "local {}", chunk.join(", ")).unwrap();
@@ -86,6 +111,13 @@ pub fn emit_program(p: &Program) -> Result<String, String> {
         writeln!(out, "local FT = table.create({})", p.funcs.len()).unwrap();
     }
     writeln!(out, "local FN = table.create({})", p.table.len()).unwrap();
+    // glue: Luau functions that Rust imports call (see rustc_codegen_luau::intrinsics::lower_import)
+    if !glue.is_empty() {
+        writeln!(out, "local GL = table.create({})", glue.len()).unwrap();
+        for (i, code) in glue.iter().enumerate() {
+            writeln!(out, "GL[{}] = {code}", i + 1).unwrap();
+        }
+    }
     for (i, f) in p.funcs.iter().enumerate() {
         if let Ok(filt) = std::env::var("LUAU_DUMP_LIR") {
             if f.name.contains(&filt) {
