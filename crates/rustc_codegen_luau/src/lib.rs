@@ -126,9 +126,10 @@ fn codegen_program<'tcx>(tcx: TyCtxt<'tcx>) {
             cx.funcs[id as usize] = Some(f);
         }
         cx.flush_allocs();
-        if cx.queue.is_empty() {
+        if cx.queue.is_empty() && !cx.retry_deferred() {
             break;
         }
+        cx.flush_allocs();
     }
 
     let mut program = cx.into_program(exports, stack_top);

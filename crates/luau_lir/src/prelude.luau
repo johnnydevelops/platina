@@ -361,6 +361,10 @@ local function rt_write(fd: number, p: number, n: number)
 	end
 	LINEBUF[fd] = s
 end
+local function rt_write_owned(fd: number, p: number, n: number, cap: number)
+	rt_write(fd, p, n)
+	if cap > 0 then rt_dealloc(p, cap, 1) end
+end
 local function rt_abort()
 	if LINEBUF[2] ~= "" then
 		table.insert(RECENT_ERR, LINEBUF[2])

@@ -33,6 +33,18 @@ pub fn lower_override<'tcx>(
     let name = name.as_str();
     let path = rustc_middle::ty::print::with_no_trimmed_paths!(tcx.def_path_str(def_id));
 
+    // println!/eprintln!: format to a String and hand it to the runtime, skipping std's
+    // stdout machinery (locks, LineWriter, output capture, io::Error reporting)
+    if (name == "_print" || name == "_eprint") && path.contains("io") {
+        let fd = if name == "_print" { 1.0 } else { 2.0 };
+        let (v, args_layout) = fx.i_operand_val(&args[0].node);
+        let slot = fx.i_temp_slot(args_layout);
+        fx.i_store(slot, args_layout, v);
+        let (sp, sl, sc) = to_string_parts(fx, args_layout.ty, slot);
+        fx.i_helper("rt_write_owned", &[Operand::Num(fd), sp, sl, sc], 0);
+        return true;
+    }
+
     // System allocator (std::sys::alloc::wasm)
     if path.contains("sys::alloc::wasm") && path.contains("GlobalAlloc") {
         // args: &System, [ptr], Layout, [new_size]
@@ -212,23 +224,7 @@ pub fn override_body<'tcx>(fx: &mut FnLower<'_, 'tcx>) {
     // &PanicMessage for ToString::to_string
     let slot = fx.i_temp_slot(msg_layout);
     fx.i_store(slot, msg_layout, crate::lower::Value::Regs(msg));
-    let to_string_def = tcx.get_diagnostic_item(rustc_span::Symbol::intern("to_string_method")).expect("ToString::to_string");
-    let to_string = Instance::expect_resolve(
-        tcx,
-        ty::TypingEnv::fully_monomorphized(),
-        to_string_def,
-        tcx.mk_args(&[msg_ty.into()]),
-        rustc_span::DUMMY_SP,
-    );
-    let string_ty = out_ty(to_string_def);
-    let string_layout = fx.i_layout(string_ty);
-    let s = fx.i_call_fn(to_string, vec![slot], fx.i_leaf_tys(string_layout));
-    // String { vec: Vec<u8> { buf: RawVec { inner: RawVecInner { ptr, .. } }, len } }
-    let leaves = abi::leaves(fx.i_lcx(), string_layout).expect("String leaves");
-    let ptr_off = field_path_offset(fx, string_layout, &["vec", "buf", "inner", "ptr"]);
-    let len_off = field_path_offset(fx, string_layout, &["vec", "len"]);
-    let at = |off: u64| leaves.iter().position(|l| l.off == off).expect("String leaf");
-    let (sp, sl) = (s[at(ptr_off)], s[at(len_off)]);
+    let (sp, sl, _) = to_string_parts(fx, msg_ty, slot);
     // location
     let location = method("location");
     let loc = fx.i_call_fn(location, vec![info[0]], vec![luau_lir::ir::Ty::Num]);
@@ -256,4 +252,27 @@ fn field_path_offset<'tcx>(fx: &FnLower<'_, 'tcx>, mut lay: TyAndLayout<'tcx>, p
         lay = lay.field(&fx.i_lcx(), i);
     }
     off
+}
+
+/// Call `<T as ToString>::to_string(&*ptr)` and return the String's (ptr, len, cap).
+fn to_string_parts<'tcx>(fx: &mut FnLower<'_, 'tcx>, t: ty::Ty<'tcx>, ptr: Operand) -> (Operand, Operand, Operand) {
+    let tcx = fx.i_tcx();
+    let to_string_def = tcx.get_diagnostic_item(rustc_span::Symbol::intern("to_string_method")).expect("ToString::to_string");
+    let to_string = Instance::expect_resolve(
+        tcx,
+        ty::TypingEnv::fully_monomorphized(),
+        to_string_def,
+        tcx.mk_args(&[t.into()]),
+        rustc_span::DUMMY_SP,
+    );
+    let sig = tcx.fn_sig(to_string_def).instantiate_identity().skip_normalization();
+    let string_ty = tcx.instantiate_bound_regions_with_erased(sig).output();
+    let string_layout = fx.i_layout(string_ty);
+    let s = fx.i_call_fn(to_string, vec![ptr], fx.i_leaf_tys(string_layout));
+    let leaves = abi::leaves(fx.i_lcx(), string_layout).expect("String leaves");
+    let at = |off: u64| leaves.iter().position(|l| l.off == off).expect("String leaf");
+    let p = field_path_offset(fx, string_layout, &["vec", "buf", "inner", "ptr"]);
+    let l = field_path_offset(fx, string_layout, &["vec", "len"]);
+    let c = field_path_offset(fx, string_layout, &["vec", "buf", "inner", "cap"]);
+    (s[at(p)], s[at(l)], s[at(c)])
 }

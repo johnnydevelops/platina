@@ -1,9 +1,9 @@
 //! Whole-program codegen context: function ids, the static data image, the function table
 //! and cross-crate symbol resolution.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 
-use rustc_hir::def_id::{CrateNum, LOCAL_CRATE};
+use rustc_hir::def_id::{CrateNum, DefId, LOCAL_CRATE};
 use rustc_middle::middle::exported_symbols::ExportedSymbol;
 use rustc_middle::mir::interpret::{AllocId, GlobalAlloc};
 use rustc_middle::ty::{self, Instance, TyCtxt};
@@ -27,6 +27,14 @@ pub struct Cx<'tcx> {
     pub alloc_addr: HashMap<AllocId, u32>,
     pending_allocs: Vec<(AllocId, u32)>,
     symbols: Option<HashMap<String, Instance<'tcx>>>,
+    /// vtable memory allocations -> principal trait (None = no principal)
+    pub vtables: HashMap<AllocId, Option<DefId>>,
+    /// (principal trait, slot) pairs invoked by virtual calls; `None` principal = unknown
+    pub used_slots: HashSet<(Option<DefId>, usize)>,
+    pub any_slot: HashSet<usize>,
+    /// vtable method entries left as 0 until some virtual call uses their slot:
+    /// (address in data, target alloc, addend, principal, slot)
+    deferred: Vec<(u32, AllocId, u32, Option<DefId>, usize)>,
 }
 
 impl<'tcx> Cx<'tcx> {
@@ -44,6 +52,10 @@ impl<'tcx> Cx<'tcx> {
             alloc_addr: HashMap::new(),
             pending_allocs: vec![],
             symbols: None,
+            vtables: HashMap::new(),
+            used_slots: HashSet::new(),
+            any_slot: HashSet::new(),
+            deferred: vec![],
         }
     }
 
@@ -91,6 +103,7 @@ impl<'tcx> Cx<'tcx> {
                     ty,
                     dyn_ty.principal().map(|p| tcx.instantiate_bound_regions_with_erased(p)),
                 ));
+                self.vtables.insert(vt, dyn_ty.principal_def_id());
                 let a = self.alloc_value(vt);
                 self.alloc_addr.insert(id, a);
                 a
@@ -144,14 +157,49 @@ impl<'tcx> Cx<'tcx> {
             let bytes = a.inspect_with_uninit_and_ptr_outside_interpreter(0..len).to_vec();
             let base = (addr - self.data_base) as usize;
             self.data[base..base + len].copy_from_slice(&bytes);
+            let vtable_of = self.vtables.get(&id).copied();
             for (off, prov) in a.provenance().ptrs().iter() {
                 let off = off.bytes() as usize;
                 let addend = u32::from_le_bytes(bytes[off..off + 4].try_into().unwrap());
+                // vtable method slots nobody calls stay null (slot 0 = drop, 1-2 = size/align)
+                if let Some(principal) = vtable_of {
+                    let slot = off / 4;
+                    if slot >= 3
+                        && matches!(tcx.global_alloc(prov.alloc_id()), GlobalAlloc::Function { .. })
+                        && !self.slot_used(principal, slot)
+                    {
+                        self.deferred.push((addr + off as u32, prov.alloc_id(), addend, principal, slot));
+                        self.data[base + off..base + off + 4].copy_from_slice(&0u32.to_le_bytes());
+                        continue;
+                    }
+                }
                 let target = self.alloc_value(prov.alloc_id());
                 let v = target.wrapping_add(addend);
                 self.data[base + off..base + off + 4].copy_from_slice(&v.to_le_bytes());
             }
         }
+    }
+
+    fn slot_used(&self, principal: Option<DefId>, slot: usize) -> bool {
+        self.any_slot.contains(&slot) || self.used_slots.contains(&(principal, slot))
+    }
+
+    /// Fill deferred vtable slots that became used. Returns true if anything changed.
+    pub fn retry_deferred(&mut self) -> bool {
+        let mut changed = false;
+        let pending = std::mem::take(&mut self.deferred);
+        for d in pending {
+            let (addr, target, addend, principal, slot) = d;
+            if self.slot_used(principal, slot) {
+                let v = self.alloc_value(target).wrapping_add(addend);
+                let at = (addr - self.data_base) as usize;
+                self.data[at..at + 4].copy_from_slice(&v.to_le_bytes());
+                changed = true;
+            } else {
+                self.deferred.push(d);
+            }
+        }
+        changed
     }
 
     /// Resolve a symbol name to a defining instance anywhere in the crate graph.

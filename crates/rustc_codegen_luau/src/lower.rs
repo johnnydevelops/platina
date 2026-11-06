@@ -1858,6 +1858,7 @@ impl<'a, 'tcx> FnLower<'a, 'tcx> {
             (_, ty::Dynamic(data, _)) => {
                 let tr = data.principal().map(|p| self.tcx.instantiate_bound_regions_with_erased(p));
                 let id = self.tcx.vtable_allocation((source, tr));
+                self.cx.vtables.insert(id, data.principal_def_id());
                 self.alloc_addr(id)
             }
             _ => self.fatal(format!("unsized_info {source} -> {target}")),
@@ -2246,6 +2247,14 @@ impl<'a, 'tcx> FnLower<'a, 'tcx> {
         let mut callee = None;
         let mut skip_first = false;
         if let Some(Instance { def: InstanceKind::Virtual(_, idx), .. }) = callee_inst {
+            match find_dyn(tcx, vals[0].1.ty) {
+                Some(p) => {
+                    self.cx.used_slots.insert((p, idx));
+                }
+                None => {
+                    self.cx.any_slot.insert(idx);
+                }
+            }
             let (v, _, _) = &vals[0];
             let Val::Regs(ops) = v else { self.fatal("virtual call on memory receiver") };
             let (data, vt) = (ops[0], ops[ops.len() - 1]);
@@ -2528,3 +2537,26 @@ impl TyOf for l::Function {
     }
 }
 
+
+/// The principal trait of the `dyn Trait` a receiver type points to (through references,
+/// raw pointers and wrapper structs like `Box`/`Pin`/`Rc`).
+fn find_dyn<'tcx>(tcx: TyCtxt<'tcx>, t: Ty<'tcx>) -> Option<Option<rustc_hir::def_id::DefId>> {
+    let mut t = t;
+    for _ in 0..8 {
+        match t.kind() {
+            ty::Dynamic(data, _) => return Some(data.principal_def_id()),
+            ty::Ref(_, p, _) | ty::RawPtr(p, _) => t = *p,
+            ty::Adt(def, args) if def.is_struct() => {
+                // follow the first field that can hold the pointer
+                let f = def.non_enum_variant().fields.iter().find_map(|f| {
+                    let ft = tcx.normalize_erasing_regions(ty::TypingEnv::fully_monomorphized(), f.ty(tcx, args));
+                    if ft.is_phantom_data() { None } else { Some(ft) }
+                })?;
+                t = f;
+            }
+            ty::Pat(b, _) => t = *b,
+            _ => return None,
+        }
+    }
+    None
+}

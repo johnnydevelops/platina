@@ -5,7 +5,7 @@ use rustc_middle::ty::{self, Instance};
 use rustc_span::Spanned;
 use rustc_span::sym;
 
-use luau_lir::ir::{self as l, Bin, IntKind, Mem, Operand, Rv, Stmt, TrapPart, Un};
+use luau_lir::ir::{self as l, Bin, IntKind, Mem, Operand, Rv, Stmt, Un};
 
 use crate::abi::{self, LeafKind};
 use crate::lower::{FnLower, PlaceVal, Value, leaf_of};

@@ -29,13 +29,16 @@ Use `--no-minify` for readable output, or `--tiny` to also drop panic-message fo
 
 | crate | readable | minified (default) | `--tiny` |
 | --- | --- | --- | --- |
-| hello (HashMap + println) | 264 KB | 135 KB | 89 KB |
-| serde_json | | 475 KB | |
-| regex | | 2.3 MB | 2.0 MB |
+| hello (HashMap + println) | 218 KB | 111 KB | 71 KB |
+| serde_json | | 454 KB | |
+| regex | | 2.2 MB | |
 
 Beyond formatting, the backend avoids emitting code it doesn't need: the runtime prelude is
 tree-shaken, branches into `unreachable` are pruned (UB in Rust), identical match arms and
-identical functions are merged.
+identical functions are merged. Only code reachable from your exports is emitted, and two
+std-specific reductions apply on top: `println!`/`eprintln!` format straight to the runtime
+(no stdout locks, `LineWriter` or `io::Error` reporting), and vtable slots that no virtual call
+ever uses are left empty so their methods (and everything only they reach) are dropped.
 
 Every `#[unsafe(no_mangle)] pub extern "C" fn` becomes a field of the returned module table:
 
