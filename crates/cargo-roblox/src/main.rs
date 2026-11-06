@@ -295,7 +295,8 @@ fn build(args: &[String]) -> Result<(), String> {
     };
     std::fs::write(&out, src).map_err(|e| format!("write {}: {e}", out.display()))?;
     let size = std::fs::metadata(&out).map(|m| m.len()).unwrap_or(0);
-    eprintln!("    Finished {} ({} KiB)", out.display(), size / 1024);
+    let size = if size < 1024 { format!("{size} B") } else { format!("{} KiB", size / 1024) };
+    eprintln!("    Finished {} ({size})", out.display());
     Ok(())
 }
 
