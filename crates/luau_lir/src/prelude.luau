@@ -292,3 +292,232 @@ end
 local function rt_heap_base(): number
 	return HEAP_BASE
 end
+
+-- 128-bit integers as four u32 limbs (least significant first)
+local function add128(a0: number, a1: number, a2: number, a3: number, b0: number, b1: number, b2: number, b3: number): (number, number, number, number)
+	local r0 = a0 + b0
+	local c = if r0 >= 0x100000000 then 1 else 0
+	r0 -= c * 0x100000000
+	local r1 = a1 + b1 + c
+	c = if r1 >= 0x100000000 then 1 else 0
+	r1 -= c * 0x100000000
+	local r2 = a2 + b2 + c
+	c = if r2 >= 0x100000000 then 1 else 0
+	r2 -= c * 0x100000000
+	return r0, r1, r2, (a3 + b3 + c) % 0x100000000
+end
+local function sub128(a0: number, a1: number, a2: number, a3: number, b0: number, b1: number, b2: number, b3: number): (number, number, number, number)
+	local r0 = a0 - b0
+	local c = if r0 < 0 then 1 else 0
+	r0 += c * 0x100000000
+	local r1 = a1 - b1 - c
+	c = if r1 < 0 then 1 else 0
+	r1 += c * 0x100000000
+	local r2 = a2 - b2 - c
+	c = if r2 < 0 then 1 else 0
+	r2 += c * 0x100000000
+	return r0, r1, r2, (a3 - b3 - c) % 0x100000000
+end
+local function neg128(a0: number, a1: number, a2: number, a3: number): (number, number, number, number)
+	return sub128(0, 0, 0, 0, a0, a1, a2, a3)
+end
+-- full product limbs (n result limbs)
+local function mulwide(a: { number }, b: { number }, n: number): { number }
+	local r = table.create(n, 0)
+	for i = 1, 4 do
+		if a[i] ~= 0 then
+			for j = 1, 4 do
+				local k = i + j - 1
+				if k > n then break end
+				local lo, hi = mulu32(a[i], b[j])
+				local add = lo
+				local kk = k
+				while add ~= 0 and kk <= n do
+					local t = r[kk] + add
+					r[kk] = t % 0x100000000
+					add = (t - r[kk]) / 0x100000000
+					kk += 1
+				end
+				add = hi
+				kk = k + 1
+				while add ~= 0 and kk <= n do
+					local t = r[kk] + add
+					r[kk] = t % 0x100000000
+					add = (t - r[kk]) / 0x100000000
+					kk += 1
+				end
+			end
+		end
+	end
+	return r
+end
+local function mul128(a0: number, a1: number, a2: number, a3: number, b0: number, b1: number, b2: number, b3: number): (number, number, number, number)
+	if a1 == 0 and a2 == 0 and a3 == 0 and b1 == 0 and b2 == 0 and b3 == 0 then
+		local lo, hi = mulu32(a0, b0)
+		return lo, hi, 0, 0
+	end
+	local r = mulwide({ a0, a1, a2, a3 }, { b0, b1, b2, b3 }, 4)
+	return r[1], r[2], r[3], r[4]
+end
+local function cmpu128(a0: number, a1: number, a2: number, a3: number, b0: number, b1: number, b2: number, b3: number): number
+	if a3 ~= b3 then return if a3 < b3 then -1 else 1 end
+	if a2 ~= b2 then return if a2 < b2 then -1 else 1 end
+	if a1 ~= b1 then return if a1 < b1 then -1 else 1 end
+	if a0 ~= b0 then return if a0 < b0 then -1 else 1 end
+	return 0
+end
+local function cmp128(a0: number, a1: number, a2: number, a3: number, b0: number, b1: number, b2: number, b3: number, signed: boolean): number
+	if signed then
+		local na, nb = a3 >= 0x80000000, b3 >= 0x80000000
+		if na ~= nb then return if na then -1 else 1 end
+	end
+	return cmpu128(a0, a1, a2, a3, b0, b1, b2, b3)
+end
+local function shl128(a0: number, a1: number, a2: number, a3: number, n: number): (number, number, number, number)
+	local a = { a0, a1, a2, a3 }
+	local w = n // 32
+	local s = n % 32
+	local r = { 0, 0, 0, 0 }
+	for i = 4, 1, -1 do
+		local src = i - w
+		if src >= 1 then
+			local v = bit32.lshift(a[src], s)
+			if s > 0 and src - 1 >= 1 then v = bit32.bor(v, bit32.rshift(a[src - 1], 32 - s)) end
+			r[i] = v
+		end
+	end
+	return r[1], r[2], r[3], r[4]
+end
+local function shr128x(a0: number, a1: number, a2: number, a3: number, n: number, fill: number): (number, number, number, number)
+	local a = { a0, a1, a2, a3 }
+	local w = n // 32
+	local s = n % 32
+	local r = { fill, fill, fill, fill }
+	for i = 1, 4 do
+		local src = i + w
+		if src <= 4 then
+			local hiword = if src + 1 <= 4 then a[src + 1] else fill
+			local v = bit32.rshift(a[src], s)
+			if s > 0 then v = bit32.bor(v, bit32.lshift(hiword, 32 - s)) end
+			r[i] = v
+		end
+	end
+	return r[1], r[2], r[3], r[4]
+end
+local function shr128(a0: number, a1: number, a2: number, a3: number, n: number): (number, number, number, number)
+	return shr128x(a0, a1, a2, a3, n, 0)
+end
+local function sar128(a0: number, a1: number, a2: number, a3: number, n: number): (number, number, number, number)
+	return shr128x(a0, a1, a2, a3, n, if a3 >= 0x80000000 then 0xFFFFFFFF else 0)
+end
+local function udivmod128(a0: number, a1: number, a2: number, a3: number, b0: number, b1: number, b2: number, b3: number): (number, number, number, number, number, number, number, number)
+	if a2 == 0 and a3 == 0 and b2 == 0 and b3 == 0 then
+		local ql, qh, rl, rh = udivmod64(a0, a1, b0, b1)
+		return ql, qh, 0, 0, rl, rh, 0, 0
+	end
+	local q = { 0, 0, 0, 0 }
+	local r0, r1, r2, r3 = 0, 0, 0, 0
+	local a = { a0, a1, a2, a3 }
+	for i = 127, 0, -1 do
+		r0, r1, r2, r3 = shl128(r0, r1, r2, r3, 1)
+		r0 = bit32.bor(r0, bit32.extract(a[i // 32 + 1], i % 32))
+		if cmpu128(r0, r1, r2, r3, b0, b1, b2, b3) >= 0 then
+			r0, r1, r2, r3 = sub128(r0, r1, r2, r3, b0, b1, b2, b3)
+			q[i // 32 + 1] = bit32.replace(q[i // 32 + 1], 1, i % 32)
+		end
+	end
+	return q[1], q[2], q[3], q[4], r0, r1, r2, r3
+end
+local function udiv128(a0: number, a1: number, a2: number, a3: number, b0: number, b1: number, b2: number, b3: number): (number, number, number, number)
+	local q0, q1, q2, q3 = udivmod128(a0, a1, a2, a3, b0, b1, b2, b3)
+	return q0, q1, q2, q3
+end
+local function urem128(a0: number, a1: number, a2: number, a3: number, b0: number, b1: number, b2: number, b3: number): (number, number, number, number)
+	local _, _, _, _, r0, r1, r2, r3 = udivmod128(a0, a1, a2, a3, b0, b1, b2, b3)
+	return r0, r1, r2, r3
+end
+local function idiv128(a0: number, a1: number, a2: number, a3: number, b0: number, b1: number, b2: number, b3: number): (number, number, number, number)
+	local na, nb = a3 >= 0x80000000, b3 >= 0x80000000
+	if na then a0, a1, a2, a3 = neg128(a0, a1, a2, a3) end
+	if nb then b0, b1, b2, b3 = neg128(b0, b1, b2, b3) end
+	local q0, q1, q2, q3 = udivmod128(a0, a1, a2, a3, b0, b1, b2, b3)
+	if na ~= nb then return neg128(q0, q1, q2, q3) end
+	return q0, q1, q2, q3
+end
+local function irem128(a0: number, a1: number, a2: number, a3: number, b0: number, b1: number, b2: number, b3: number): (number, number, number, number)
+	local na = a3 >= 0x80000000
+	if na then a0, a1, a2, a3 = neg128(a0, a1, a2, a3) end
+	if b3 >= 0x80000000 then b0, b1, b2, b3 = neg128(b0, b1, b2, b3) end
+	local _, _, _, _, r0, r1, r2, r3 = udivmod128(a0, a1, a2, a3, b0, b1, b2, b3)
+	if na then return neg128(r0, r1, r2, r3) end
+	return r0, r1, r2, r3
+end
+local function addo128(a0: number, a1: number, a2: number, a3: number, b0: number, b1: number, b2: number, b3: number, signed: boolean): (number, number, number, number, number)
+	local r0, r1, r2, r3 = add128(a0, a1, a2, a3, b0, b1, b2, b3)
+	local o
+	if signed then
+		local sa, sb, sr = a3 >= 0x80000000, b3 >= 0x80000000, r3 >= 0x80000000
+		o = sa == sb and sr ~= sa
+	else
+		o = cmpu128(r0, r1, r2, r3, a0, a1, a2, a3) < 0
+	end
+	return r0, r1, r2, r3, if o then 1 else 0
+end
+local function subo128(a0: number, a1: number, a2: number, a3: number, b0: number, b1: number, b2: number, b3: number, signed: boolean): (number, number, number, number, number)
+	local r0, r1, r2, r3 = sub128(a0, a1, a2, a3, b0, b1, b2, b3)
+	local o
+	if signed then
+		local sa, sb, sr = a3 >= 0x80000000, b3 >= 0x80000000, r3 >= 0x80000000
+		o = sa ~= sb and sr ~= sa
+	else
+		o = cmpu128(a0, a1, a2, a3, b0, b1, b2, b3) < 0
+	end
+	return r0, r1, r2, r3, if o then 1 else 0
+end
+local function mulo128(a0: number, a1: number, a2: number, a3: number, b0: number, b1: number, b2: number, b3: number, signed: boolean): (number, number, number, number, number)
+	local na, nb = false, false
+	if signed then
+		na, nb = a3 >= 0x80000000, b3 >= 0x80000000
+		if na then a0, a1, a2, a3 = neg128(a0, a1, a2, a3) end
+		if nb then b0, b1, b2, b3 = neg128(b0, b1, b2, b3) end
+	end
+	local r = mulwide({ a0, a1, a2, a3 }, { b0, b1, b2, b3 }, 8)
+	local o = r[5] ~= 0 or r[6] ~= 0 or r[7] ~= 0 or r[8] ~= 0
+	local r0, r1, r2, r3 = r[1], r[2], r[3], r[4]
+	if signed then
+		if na ~= nb then
+			o = o or r3 > 0x80000000 or (r3 == 0x80000000 and (r0 ~= 0 or r1 ~= 0 or r2 ~= 0))
+			r0, r1, r2, r3 = neg128(r0, r1, r2, r3)
+		else
+			o = o or r3 >= 0x80000000
+		end
+	end
+	return r0, r1, r2, r3, if o then 1 else 0
+end
+local function i128tof(a0: number, a1: number, a2: number, a3: number, signed: boolean): number
+	local neg = signed and a3 >= 0x80000000
+	if neg then a0, a1, a2, a3 = neg128(a0, a1, a2, a3) end
+	local v = ((a3 * 0x100000000 + a2) * 0x100000000 + a1) * 0x100000000 + a0
+	return if neg then -v else v
+end
+local function ftoi128(x: number, signed: boolean): (number, number, number, number)
+	if x ~= x then return 0, 0, 0, 0 end
+	x = trunc(x)
+	local neg = x < 0
+	if neg and not signed then return 0, 0, 0, 0 end
+	local m = math.abs(x)
+	local limit = if signed then 2 ^ 127 else 2 ^ 128
+	if m >= limit then
+		if not signed then return 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF end
+		if neg then return 0, 0, 0, 0x80000000 end
+		return 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0x7FFFFFFF
+	end
+	local r = {}
+	for i = 1, 4 do
+		local q = math.floor(m / 0x100000000)
+		r[i] = m - q * 0x100000000
+		m = q
+	end
+	if neg then return neg128(r[1], r[2], r[3], r[4]) end
+	return r[1], r[2], r[3], r[4]
+end

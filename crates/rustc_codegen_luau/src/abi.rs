@@ -56,6 +56,8 @@ pub enum LeafKind {
     Int(IntKind),
     /// 64-bit integer as (lo, hi) u32 pair.
     I64 { signed: bool },
+    /// 128-bit integer as four u32 limbs, least significant first.
+    I128 { signed: bool },
     F32,
     F64,
 }
@@ -64,6 +66,7 @@ impl LeafKind {
     pub fn nvars(self) -> usize {
         match self {
             LeafKind::I64 { .. } => 2,
+            LeafKind::I128 { .. } => 4,
             _ => 1,
         }
     }
@@ -78,6 +81,7 @@ impl LeafKind {
             LeafKind::Bool => 1,
             LeafKind::Int(k) => k.bits as u64 / 8,
             LeafKind::I64 { .. } => 8,
+            LeafKind::I128 { .. } => 16,
             LeafKind::F32 => 4,
             LeafKind::F64 => 8,
         }
@@ -88,6 +92,7 @@ impl LeafKind {
             LeafKind::Bool => vec![(Mem::Bool, 0)],
             LeafKind::Int(k) => vec![(Mem::for_int(k), 0)],
             LeafKind::I64 { .. } => vec![(Mem::U32, 0), (Mem::U32, 4)],
+            LeafKind::I128 { .. } => vec![(Mem::U32, 0), (Mem::U32, 4), (Mem::U32, 8), (Mem::U32, 12)],
             LeafKind::F32 => vec![(Mem::F32, 0)],
             LeafKind::F64 => vec![(Mem::F64, 0)],
         }
@@ -110,6 +115,7 @@ pub fn int_kind(bits: u64, signed: bool) -> Option<LeafKind> {
     Some(match bits {
         8 | 16 | 32 => LeafKind::Int(IntKind { bits: bits as u8, signed }),
         64 => LeafKind::I64 { signed },
+        128 => LeafKind::I128 { signed },
         _ => return None,
     })
 }
@@ -140,14 +146,14 @@ pub fn prim_kind<'tcx>(ty: Ty<'tcx>) -> Option<LeafKind> {
             IntTy::I16 => LeafKind::Int(IntKind::I16),
             IntTy::I32 | IntTy::Isize => LeafKind::Int(IntKind::I32),
             IntTy::I64 => LeafKind::I64 { signed: true },
-            IntTy::I128 => return None,
+            IntTy::I128 => LeafKind::I128 { signed: true },
         },
         ty::Uint(u) => match u {
             UintTy::U8 => LeafKind::Int(IntKind::U8),
             UintTy::U16 => LeafKind::Int(IntKind::U16),
             UintTy::U32 | UintTy::Usize => LeafKind::Int(IntKind::U32),
             UintTy::U64 => LeafKind::I64 { signed: false },
-            UintTy::U128 => return None,
+            UintTy::U128 => LeafKind::I128 { signed: false },
         },
         ty::Float(f) => match f {
             FloatTy::F32 => LeafKind::F32,

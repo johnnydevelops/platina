@@ -11,11 +11,31 @@ use ir::*;
 
 pub const PRELUDE: &str = include_str!("prelude.luau");
 
-struct ProgNames;
+/// Max functions kept as module-level locals (Luau allows 200 locals per function scope,
+/// and the prelude uses some). The rest live in the `FT` table.
+const MAX_LOCAL_FUNCS: usize = 120;
+
+struct ProgNames {
+    local: Vec<bool>,
+}
 impl emit::Names for ProgNames {
     fn func(&self, id: u32) -> String {
-        format!("F{id}")
+        if self.local[id as usize] { format!("F{id}") } else { format!("FT[{id}]") }
     }
+}
+
+fn call_counts(p: &Program) -> Vec<usize> {
+    let mut c = vec![0usize; p.funcs.len()];
+    for f in &p.funcs {
+        for b in &f.blocks {
+            for s in &b.stmts {
+                if let Stmt::Call { callee: Callee::Func(i), .. } = s {
+                    c[*i as usize] += 1;
+                }
+            }
+        }
+    }
+    c
 }
 
 /// Emit a whole program as a single Luau ModuleScript.
@@ -30,26 +50,38 @@ pub fn emit_program(p: &Program) -> Result<String, String> {
     if !p.data.is_empty() {
         writeln!(out, "buffer.writestring(MEM, {}, {})", p.data_base, emit::lua_string(&p.data)).unwrap();
     }
-    // forward declarations
-    let names: Vec<String> = (0..p.funcs.len()).map(|i| format!("F{i}")).collect();
+    // hottest functions become locals, the rest go through the FT table
+    let counts = call_counts(p);
+    let mut order: Vec<usize> = (0..p.funcs.len()).collect();
+    order.sort_by_key(|i| std::cmp::Reverse(counts[*i]));
+    let mut local = vec![false; p.funcs.len()];
+    for i in order.into_iter().take(MAX_LOCAL_FUNCS) {
+        local[i] = true;
+    }
+    let names_cb = ProgNames { local: local.clone() };
+    let names: Vec<String> = (0..p.funcs.len()).filter(|i| local[*i]).map(|i| format!("F{i}")).collect();
     for chunk in names.chunks(32) {
         writeln!(out, "local {}", chunk.join(", ")).unwrap();
+    }
+    if local.iter().any(|l| !l) {
+        writeln!(out, "local FT = table.create({})", p.funcs.len()).unwrap();
     }
     writeln!(out, "local FN = table.create({})", p.table.len()).unwrap();
     for (i, f) in p.funcs.iter().enumerate() {
         let st = structure::structure(f).map_err(|_| format!("irreducible control flow in {}", f.name))?;
         writeln!(out, "\n-- {}", f.name.replace('\n', " ")).unwrap();
-        let e = emit::FnEmitter::new(f, &ProgNames);
-        out.push_str(&e.emit(&st, &format!("function F{i}")));
+        let e = emit::FnEmitter::new(f, &names_cb);
+        let header = if local[i] { format!("function F{i}") } else { format!("FT[{i}] = function") };
+        out.push_str(&e.emit(&st, &header));
     }
     for (slot, fid) in p.table.iter().enumerate() {
         if slot > 0 {
-            writeln!(out, "FN[{slot}] = F{fid}").unwrap();
+            writeln!(out, "FN[{slot}] = {}", emit::Names::func(&names_cb, *fid)).unwrap();
         }
     }
     out.push_str("\nreturn {\n");
     for (name, fid) in &p.exports {
-        writeln!(out, "\t{name} = F{fid},").unwrap();
+        writeln!(out, "\t{name} = {},", emit::Names::func(&names_cb, *fid)).unwrap();
     }
     out.push_str("\tmemory = function(): buffer return MEM end,\n");
     out.push_str("}\n");

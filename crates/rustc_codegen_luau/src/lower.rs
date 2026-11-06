@@ -1,6 +1,5 @@
 //! MIR -> LIR lowering for one function instance.
 
-use std::ops::Range;
 
 use rustc_abi::{FieldIdx, Size, TagEncoding, VariantIdx, Variants};
 use rustc_middle::mir::interpret::{AllocId, Scalar, alloc_range};
@@ -13,7 +12,7 @@ use rustc_middle::ty::adjustment::PointerCoercion;
 use rustc_middle::ty::layout::{FnAbiOf, LayoutOf, TyAndLayout};
 use rustc_middle::ty::{self, Instance, InstanceKind, ShimKind, Ty, TyCtxt};
 use rustc_span::Spanned;
-use rustc_span::{Span, sym};
+use rustc_span::Span;
 use rustc_target::callconv::FnAbi;
 
 use luau_lir::ir::{self as l, Bin, BlockId, Callee, IntKind, Mem, Operand, Rv, Stmt, Term, TrapPart, Un, VarId};
@@ -538,11 +537,8 @@ impl<'a, 'tcx> FnLower<'a, 'tcx> {
                     }
                 },
                 PlaceElem::Index(idx_local) => {
-                    let idx = self.read_place(&PlaceV::Reg {
-                        local: idx_local,
-                        off: 0,
-                        layout: self.layout(self.tcx.types.usize),
-                    });
+                    let ip = self.place(Place::from(idx_local));
+                    let idx = self.read_place(&ip);
                     let Val::Regs(i) = idx else { unreachable!() };
                     self.index_place(pv, i[0], next_pt.ty)
                 }
@@ -677,7 +673,7 @@ impl<'a, 'tcx> FnLower<'a, 'tcx> {
             (LeafKind::Int(_), LeafKind::Bool) => vec![self.un(Un::NumToBool, src[0])],
             (LeafKind::Bool, LeafKind::Int(_)) => vec![self.un(Un::BoolToNum, src[0])],
             (LeafKind::Int(a), LeafKind::Int(b)) if a.bits == b.bits => vec![self.un(Un::Wrap(b), src[0])],
-            (LeafKind::I64 { .. }, LeafKind::I64 { .. }) => src.to_vec(),
+            (LeafKind::I64 { .. }, LeafKind::I64 { .. }) | (LeafKind::I128 { .. }, LeafKind::I128 { .. }) => src.to_vec(),
             _ => self.fatal(format!("cannot convert leaf {from:?} to {to:?}")),
         }
     }
@@ -969,11 +965,8 @@ impl<'a, 'tcx> FnLower<'a, 'tcx> {
                                 vec![self.bin(Bin::Sub, Operand::Num(k.max()), a[0])]
                             }
                         }
-                        Some(LeafKind::I64 { .. }) => {
-                            vec![
-                                self.bin(Bin::Sub, Operand::Num(4294967295.0), a[0]),
-                                self.bin(Bin::Sub, Operand::Num(4294967295.0), a[1]),
-                            ]
+                        Some(LeafKind::I64 { .. } | LeafKind::I128 { .. }) => {
+                            a.iter().map(|x| self.bin(Bin::Sub, Operand::Num(4294967295.0), *x)).collect()
                         }
                         _ => self.fatal("bad Not"),
                     },
@@ -984,6 +977,7 @@ impl<'a, 'tcx> FnLower<'a, 'tcx> {
                         }
                         Some(LeafKind::F32 | LeafKind::F64) => vec![self.un(Un::Neg, a[0])],
                         Some(LeafKind::I64 { .. }) => self.call_helper("neg64", &a, 2),
+                        Some(LeafKind::I128 { .. }) => self.call_helper("neg128", &a, 4),
                         _ => self.fatal("bad Neg"),
                     },
                     UnOp::PtrMetadata => {
@@ -1178,8 +1172,10 @@ impl<'a, 'tcx> FnLower<'a, 'tcx> {
     fn int_cast(&mut self, v: &[Operand], from: LeafKind, to: LeafKind) -> Vec<Operand> {
         match (from, to) {
             (a, b) if a == b => v.to_vec(),
-            (LeafKind::Bool, LeafKind::Int(_)) => vec![self.un(Un::BoolToNum, v[0])],
-            (LeafKind::Bool, LeafKind::I64 { .. }) => vec![self.un(Un::BoolToNum, v[0]), Operand::Num(0.0)],
+            (LeafKind::Bool, _) => {
+                let n = self.un(Un::BoolToNum, v[0]);
+                self.int_cast(&[n], LeafKind::Int(IntKind::U8), to)
+            }
             (LeafKind::Int(a), LeafKind::Int(b)) => {
                 if a.min() >= b.min() && a.max() <= b.max() {
                     v.to_vec()
@@ -1187,26 +1183,51 @@ impl<'a, 'tcx> FnLower<'a, 'tcx> {
                     vec![self.un(Un::Wrap(b), v[0])]
                 }
             }
-            (LeafKind::Int(a), LeafKind::I64 { .. }) => {
-                if a.signed {
-                    // sign-extend
-                    let lo = self.un(Un::Wrap(IntKind::U32), v[0]);
+            // narrow or widen through u32 limbs
+            _ => {
+                let limbs = self.to_limbs(v, from);
+                self.from_limbs(&limbs, to)
+            }
+        }
+    }
+
+    /// Value as little-endian u32 limbs plus a sign-extension limb.
+    fn to_limbs(&mut self, v: &[Operand], k: LeafKind) -> (Vec<Operand>, Operand) {
+        match k {
+            LeafKind::Int(ik) => {
+                let lo = if ik.signed { self.un(Un::Wrap(IntKind::U32), v[0]) } else { v[0] };
+                let ext = if ik.signed {
                     let neg = self.bin(Bin::Lt, v[0], Operand::Num(0.0));
-                    let hi = self.num(Rv::Select(neg, Operand::Num(4294967295.0), Operand::Num(0.0)));
-                    vec![lo, hi]
+                    self.num(Rv::Select(neg, Operand::Num(4294967295.0), Operand::Num(0.0)))
                 } else {
-                    vec![v[0], Operand::Num(0.0)]
-                }
+                    Operand::Num(0.0)
+                };
+                (vec![lo], ext)
             }
-            (LeafKind::I64 { .. }, LeafKind::Int(b)) => {
-                if b.bits == 32 && !b.signed {
-                    vec![v[0]]
+            LeafKind::I64 { signed } | LeafKind::I128 { signed } => {
+                let top = *v.last().unwrap();
+                let ext = if signed {
+                    let neg = self.bin(Bin::Le, Operand::Num(2147483648.0), top);
+                    self.num(Rv::Select(neg, Operand::Num(4294967295.0), Operand::Num(0.0)))
                 } else {
-                    vec![self.un(Un::Wrap(b), v[0])]
-                }
+                    Operand::Num(0.0)
+                };
+                (v.to_vec(), ext)
             }
-            (LeafKind::I64 { .. }, LeafKind::I64 { .. }) => v.to_vec(),
-            _ => self.fatal(format!("bad int cast {from:?} -> {to:?}")),
+            _ => self.fatal(format!("bad int cast from {k:?}")),
+        }
+    }
+
+    fn from_limbs(&mut self, (limbs, ext): &(Vec<Operand>, Operand), k: LeafKind) -> Vec<Operand> {
+        let get = |i: usize| limbs.get(i).copied().unwrap_or(*ext);
+        match k {
+            LeafKind::Int(ik) => {
+                let lo = get(0);
+                if ik.bits == 32 && !ik.signed { vec![lo] } else { vec![self.un(Un::Wrap(ik), lo)] }
+            }
+            LeafKind::I64 { .. } => vec![get(0), get(1)],
+            LeafKind::I128 { .. } => vec![get(0), get(1), get(2), get(3)],
+            _ => self.fatal(format!("bad int cast to {k:?}")),
         }
     }
 
@@ -1229,7 +1250,7 @@ impl<'a, 'tcx> FnLower<'a, 'tcx> {
             return vec![self.bin(Bin::Add, a[0], scaled)];
         }
         // fat pointer comparisons: compare (ptr, meta) lexicographically
-        if a.len() == 2 && !matches!(ka, LeafKind::I64 { .. }) {
+        if a.len() == 2 && !matches!(ka, LeafKind::I64 { .. } | LeafKind::I128 { .. }) {
             return self.fat_cmp(op, a, b);
         }
         match ka {
@@ -1262,6 +1283,7 @@ impl<'a, 'tcx> FnLower<'a, 'tcx> {
             }
             LeafKind::Int(k) => self.int_binop(op, k, a[0], b, bl, dl),
             LeafKind::I64 { signed } => self.i64_binop(op, signed, a, b, bl),
+            LeafKind::I128 { signed } => self.i128_binop(op, signed, a, b),
         }
     }
 
@@ -1455,6 +1477,60 @@ impl<'a, 'tcx> FnLower<'a, 'tcx> {
         }
     }
 
+    fn i128_binop(&mut self, op: BinOp, signed: bool, a: &[Operand], b: &[Operand]) -> Vec<Operand> {
+        let s = if signed { "i" } else { "u" };
+        let mut ab: Vec<Operand> = a.to_vec();
+        match op {
+            BinOp::Shl | BinOp::ShlUnchecked | BinOp::Shr | BinOp::ShrUnchecked => {
+                let amt = self.bin(Bin::BAnd, b[0], Operand::Num(127.0));
+                ab.push(amt);
+                let name = match op {
+                    BinOp::Shl | BinOp::ShlUnchecked => "shl128",
+                    _ if signed => "sar128",
+                    _ => "shr128",
+                };
+                return self.call_helper(name, &ab, 4);
+            }
+            _ => {}
+        }
+        ab.extend_from_slice(b);
+        match op {
+            BinOp::Add | BinOp::AddUnchecked => self.call_helper("add128", &ab, 4),
+            BinOp::Sub | BinOp::SubUnchecked => self.call_helper("sub128", &ab, 4),
+            BinOp::Mul | BinOp::MulUnchecked => self.call_helper("mul128", &ab, 4),
+            BinOp::Div => self.call_helper(&format!("{s}div128"), &ab, 4),
+            BinOp::Rem => self.call_helper(&format!("{s}rem128"), &ab, 4),
+            BinOp::BitAnd | BinOp::BitOr | BinOp::BitXor => {
+                let bop = match op {
+                    BinOp::BitAnd => Bin::BAnd,
+                    BinOp::BitOr => Bin::BOr,
+                    _ => Bin::BXor,
+                };
+                (0..4).map(|i| self.bin(bop, a[i], b[i])).collect()
+            }
+            BinOp::AddWithOverflow | BinOp::SubWithOverflow | BinOp::MulWithOverflow => {
+                let name = match op {
+                    BinOp::AddWithOverflow => "addo128",
+                    BinOp::SubWithOverflow => "subo128",
+                    _ => "mulo128",
+                };
+                ab.push(Operand::Bool(signed));
+                let r = self.call_helper(name, &ab, 5);
+                let ov = self.un(Un::NumToBool, r[4]);
+                vec![r[0], r[1], r[2], r[3], ov]
+            }
+            BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge | BinOp::Cmp => {
+                ab.push(Operand::Bool(signed));
+                let c = self.call_helper("cmp128", &ab, 1)[0];
+                vec![match op {
+                    BinOp::Cmp => c,
+                    _ => self.cmp_num(op, c, Operand::Num(0.0))[0],
+                }]
+            }
+            BinOp::Offset | BinOp::Shl | BinOp::ShlUnchecked | BinOp::Shr | BinOp::ShrUnchecked => unreachable!(),
+        }
+    }
+
     // ---------------------------------------------------------------- casts
 
     fn cast(&mut self, kind: CastKind, op: &MOp<'tcx>, to: Ty<'tcx>) -> Val {
@@ -1493,8 +1569,11 @@ impl<'a, 'tcx> FnLower<'a, 'tcx> {
             CastKind::Subtype => self.operand(op).0,
             CastKind::IntToInt => {
                 let (v, fl) = self.operand_regs(op);
-                let fk = leaf_of(fl.ty).or_else(|| self.natural_leaves(fl).map(|l| l[0].kind)).unwrap();
-                let tk = leaf_of(tl.ty).unwrap();
+                let fk = leaf_of(fl.ty).or_else(|| self.natural_leaves(fl).map(|l| l[0].kind));
+                let tk = leaf_of(tl.ty);
+                let (Some(fk), Some(tk)) = (fk, tk) else {
+                    self.fatal(format!("unsupported int cast {} -> {} in {}", fl.ty, tl.ty, self.instance))
+                };
                 Val::Regs(self.int_cast(&v, fk, tk))
             }
             CastKind::IntToFloat => {
@@ -1503,6 +1582,11 @@ impl<'a, 'tcx> FnLower<'a, 'tcx> {
                 let x = match fk {
                     LeafKind::I64 { signed } => {
                         self.call_helper(if signed { "i64tof" } else { "u64tof" }, &v, 1)[0]
+                    }
+                    LeafKind::I128 { signed } => {
+                        let mut args = v.clone();
+                        args.push(Operand::Bool(signed));
+                        self.call_helper("i128tof", &args, 1)[0]
                     }
                     LeafKind::Bool => self.un(Un::BoolToNum, v[0]),
                     _ => v[0],
@@ -1515,6 +1599,7 @@ impl<'a, 'tcx> FnLower<'a, 'tcx> {
                 match leaf_of(to).unwrap() {
                     LeafKind::Int(k) => Val::Regs(vec![self.un(Un::FToI(k), v[0])]),
                     LeafKind::I64 { signed } => Val::Regs(self.call_helper(if signed { "ftoi64" } else { "ftou64" }, &v, 2)),
+                    LeafKind::I128 { signed } => Val::Regs(self.call_helper("ftoi128", &[v[0], Operand::Bool(signed)], 4)),
                     _ => self.fatal("bad float to int"),
                 }
             }
@@ -1536,7 +1621,7 @@ impl<'a, 'tcx> FnLower<'a, 'tcx> {
         match (&v, fls, tls) {
             (Val::Regs(ops), Some(a), Some(b)) => {
                 let same_shape = a.len() == b.len() && a.iter().zip(&b).all(|(x, y)| x.off == y.off && x.kind.size() == y.kind.size());
-                let simple = |k: LeafKind| matches!(k, LeafKind::Int(_) | LeafKind::Bool | LeafKind::I64 { .. });
+                let simple = |k: LeafKind| matches!(k, LeafKind::Int(_) | LeafKind::Bool | LeafKind::I64 { .. } | LeafKind::I128 { .. });
                 if same_shape && a.iter().zip(&b).all(|(x, y)| simple(x.kind) && simple(y.kind)) {
                     let mut out = vec![];
                     let mut i = 0;
@@ -1566,7 +1651,7 @@ impl<'a, 'tcx> FnLower<'a, 'tcx> {
             (LeafKind::Int(_), LeafKind::Int(b)) => vec![self.un(Un::Wrap(b), src[0])],
             (LeafKind::Int(_), LeafKind::Bool) => vec![self.un(Un::NumToBool, src[0])],
             (LeafKind::Bool, LeafKind::Int(_)) => vec![self.un(Un::BoolToNum, src[0])],
-            (LeafKind::I64 { .. }, LeafKind::I64 { .. }) => src.to_vec(),
+            (LeafKind::I64 { .. }, LeafKind::I64 { .. }) | (LeafKind::I128 { .. }, LeafKind::I128 { .. }) => src.to_vec(),
             _ => self.fatal(format!("bad transmute {from:?} -> {to:?}")),
         }
     }
@@ -1659,11 +1744,14 @@ impl<'a, 'tcx> FnLower<'a, 'tcx> {
                 } else {
                     let kind = leaf_of(dl.ty).or_else(|| self.natural_leaves(dl).map(|l| l[0].kind)).unwrap();
                     let x = match kind {
-                        LeafKind::I64 { .. } => {
-                            // switch on 64-bit: only support values < 2^32 with hi == 0 check
-                            let hi0 = self.bin(Bin::Eq, d[1], Operand::Num(0.0));
-                            let lo = self.num(Rv::Select(hi0, d[0], Operand::Num(-1.0)));
-                            lo
+                        LeafKind::I64 { .. } | LeafKind::I128 { .. } => {
+                            // switch on wide ints: values >= 2^32 never match (we use -2 for them)
+                            let mut hi0 = Operand::Bool(true);
+                            for limb in &d[1..] {
+                                let z = self.bin(Bin::Eq, *limb, Operand::Num(0.0));
+                                hi0 = self.bin(Bin::And, hi0, z);
+                            }
+                            self.num(Rv::Select(hi0, d[0], Operand::Num(-1.0)))
                         }
                         LeafKind::Bool => self.un(Un::BoolToNum, d[0]),
                         _ => d[0],
@@ -1673,7 +1761,7 @@ impl<'a, 'tcx> FnLower<'a, 'tcx> {
                         .map(|(v, b)| {
                             let val = match kind {
                                 LeafKind::Int(k) => const_bits(v, LeafKind::Int(k))[0].as_num().unwrap(),
-                                LeafKind::I64 { .. } => {
+                                LeafKind::I64 { .. } | LeafKind::I128 { .. } => {
                                     if v > u32::MAX as u128 {
                                         -2.0
                                     } else {
@@ -2181,6 +2269,7 @@ pub fn const_bits(bits: u128, kind: LeafKind) -> Vec<Operand> {
             vec![Operand::Num(v)]
         }
         LeafKind::I64 { .. } => vec![Operand::Num((bits & 0xFFFF_FFFF) as f64), Operand::Num(((bits >> 32) & 0xFFFF_FFFF) as f64)],
+        LeafKind::I128 { .. } => (0..4).map(|i| Operand::Num(((bits >> (32 * i)) & 0xFFFF_FFFF) as f64)).collect(),
         LeafKind::F32 => vec![Operand::Num(f32::from_bits(bits as u32) as f64)],
         LeafKind::F64 => vec![Operand::Num(f64::from_bits(bits as u64))],
     }
