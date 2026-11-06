@@ -174,6 +174,8 @@ pub fn promote(f: &mut Function) -> bool {
     // derived pointers: single-def `v = d + c`, `v = d`, or loads of slots whose stores all
     // store the same derived pointer (fixpoint)
     let mut slot_ptr: HashMap<(VarId, i32), Option<(VarId, i64)>> = HashMap::new();
+    // slots through which frame pointers were derived by loading
+    let mut via: Vec<(VarId, i32)> = vec![];
     for _ in 0..8 {
         let mut changed = false;
         // slot stores of derived pointers
@@ -195,29 +197,61 @@ pub fn promote(f: &mut Function) -> bool {
                 }
             }
         }
+        // every definition of a var must agree on the same (root, offset)
+        let mut cand: Vec<Option<Option<(VarId, i64)>>> = vec![None; n];
         for b in &f.blocks {
             for s in &b.stmts {
-                if let Stmt::Assign(v, rv) = s {
-                    if defs[*v as usize] != 1 || root_of[*v as usize].is_some() {
-                        continue;
-                    }
-                    let d = match rv {
-                        Rv::Use(Operand::Var(x)) => root_of[*x as usize],
-                        Rv::Bin(Bin::Add, Operand::Var(x), Operand::Num(c)) | Rv::Bin(Bin::Add, Operand::Num(c), Operand::Var(x)) if c.fract() == 0.0 => {
-                            root_of[*x as usize].map(|(r, o)| (r, o + *c as i64))
+                match s {
+                    Stmt::Assign(v, rv) => {
+                        if sp_vars[*v as usize] {
+                            continue;
                         }
-                        Rv::Bin(Bin::Sub, Operand::Var(x), Operand::Num(c)) if c.fract() == 0.0 => {
-                            root_of[*x as usize].map(|(r, o)| (r, o - *c as i64))
-                        }
-                        Rv::Load { mem: Mem::U32, addr: Operand::Var(a), off } => root_of[*a as usize].and_then(|(r, c)| {
-                            sp.get(&(r, (c + *off as i64) as i32)).copied().flatten()
-                        }),
-                        _ => None,
-                    };
-                    if d.is_some() {
-                        root_of[*v as usize] = d;
-                        changed = true;
+                        let d = match rv {
+                            Rv::Use(Operand::Var(x)) => root_of[*x as usize],
+                            Rv::Bin(Bin::Add, Operand::Var(x), Operand::Num(c)) | Rv::Bin(Bin::Add, Operand::Num(c), Operand::Var(x))
+                                if c.fract() == 0.0 =>
+                            {
+                                root_of[*x as usize].map(|(r, o)| (r, o + *c as i64))
+                            }
+                            Rv::Bin(Bin::Sub, Operand::Var(x), Operand::Num(c)) if c.fract() == 0.0 => {
+                                root_of[*x as usize].map(|(r, o)| (r, o - *c as i64))
+                            }
+                            Rv::Load { mem: Mem::U32, addr: Operand::Var(a), off } => root_of[*a as usize].and_then(|(r, c)| {
+                                let key = (r, (c + *off as i64) as i32);
+                                let d = sp.get(&key).copied().flatten();
+                                if d.is_some() {
+                                    via.push(key);
+                                }
+                                d
+                            }),
+                            _ => None,
+                        };
+                        let e = &mut cand[*v as usize];
+                        *e = match *e {
+                            None => Some(d),
+                            Some(prev) if prev == d => Some(d),
+                            Some(_) => Some(None),
+                        };
                     }
+                    other => {
+                        for d in other.def() {
+                            cand[d as usize] = Some(None);
+                        }
+                    }
+                }
+            }
+        }
+        for p in &f.params {
+            cand[*p as usize] = Some(None);
+        }
+        for v in 0..n {
+            if sp_vars[v] {
+                continue;
+            }
+            if let Some(Some(d)) = cand[v] {
+                if root_of[v] != Some(d) {
+                    root_of[v] = Some(d);
+                    changed = true;
                 }
             }
         }
@@ -231,9 +265,22 @@ pub fn promote(f: &mut Function) -> bool {
     let roots: Vec<VarId> = (0..n as u32).filter(|v| root_of[*v as usize] == Some((*v, 0))).collect();
     let mut escaped: HashMap<VarId, bool> = roots.iter().map(|r| (*r, false)).collect();
     let mut slots: HashMap<VarId, HashMap<i32, Mem>> = HashMap::new();
+    let dbg = std::env::var("LUAU_DEBUG_PROMOTE").map(|v| f.name.contains(&v)).unwrap_or(false);
     let mut bad = |r: VarId, escaped: &mut HashMap<VarId, bool>| {
         escaped.insert(r, true);
     };
+    // escaped objects per root: offsets that escaped (None = whole frame)
+    let mut esc_at: HashMap<VarId, Vec<Option<i64>>> = HashMap::new();
+    macro_rules! why {
+        ($r:expr, $off:expr, $s:expr) => {
+            if dbg {
+                eprintln!("promote: root v{} escapes (off {:?}) at {:?}", $r, $off, $s);
+            }
+            esc_at.entry($r).or_default().push($off);
+        };
+    }
+    let _ = &mut bad;
+    let mut ptr_stores: Vec<((VarId, i32), (VarId, i64))> = vec![];
     for b in &f.blocks {
         for s in &b.stmts {
             match s {
@@ -245,7 +292,7 @@ pub fn promote(f: &mut Function) -> bool {
                             let o = (c + *off as i64) as i32;
                             let e = slots.entry(r).or_default();
                             match e.get(&o) {
-                                Some(m) if m != mem => bad(r, &mut escaped),
+                                Some(m) if m != mem => { why!(r, Some(o as i64), s); }
                                 _ => {
                                     e.insert(o, *mem);
                                 }
@@ -255,9 +302,9 @@ pub fn promote(f: &mut Function) -> bool {
                             // derived pointers may only flow into other derived defs
                             for o in rv.operands() {
                                 if let Operand::Var(x) = o {
-                                    if let Some((r, _)) = root_of[*x as usize] {
+                                    if let Some((r, c)) = root_of[*x as usize] {
                                         if !derived_def {
-                                            bad(r, &mut escaped);
+                                            why!(r, Some(c), s);
                                         }
                                     }
                                 }
@@ -274,17 +321,20 @@ pub fn promote(f: &mut Function) -> bool {
                         let o = (c + *off as i64) as i32;
                         let e = slots.entry(r).or_default();
                         match e.get(&o) {
-                            Some(m) if m != mem => bad(r, &mut escaped),
+                            Some(m) if m != mem => { why!(r, Some(o as i64), s); }
                             _ => {
                                 e.insert(o, *mem);
                             }
                         }
                     }
                     if let Operand::Var(x) = val {
-                        if let Some((vr, _)) = root_of[*x as usize] {
+                        if let Some((vr, vc)) = root_of[*x as usize] {
                             // storing a frame pointer: fine only into a slot of the same frame
+                            // (and only while that slot itself does not escape; checked below)
                             if addr_root.map(|(r, _)| r) != Some(vr) || *mem != Mem::U32 {
-                                bad(vr, &mut escaped);
+                                why!(vr, Some(vc), s);
+                            } else if let Some((r, c)) = addr_root {
+                                ptr_stores.push(((r, (c + *off as i64) as i32), (vr, vc)));
                             }
                         }
                     }
@@ -293,8 +343,8 @@ pub fn promote(f: &mut Function) -> bool {
                 _ => {
                     for o in s.operands() {
                         if let Operand::Var(x) = o {
-                            if let Some((r, _)) = root_of[*x as usize] {
-                                bad(r, &mut escaped);
+                            if let Some((r, c)) = root_of[*x as usize] {
+                                why!(r, Some(c), s);
                             }
                         }
                     }
@@ -304,8 +354,8 @@ pub fn promote(f: &mut Function) -> bool {
         let mut t = b.term.clone();
         for o in t.operands_mut() {
             if let Operand::Var(x) = o {
-                if let Some((r, _)) = root_of[*x as usize] {
-                    bad(r, &mut escaped);
+                if let Some((r, c)) = root_of[*x as usize] {
+                    why!(r, Some(c), &b.term);
                 }
             }
         }
@@ -316,11 +366,70 @@ pub fn promote(f: &mut Function) -> bool {
         v.sort_by_key(|x| x.0);
         for w in v.windows(2) {
             if w[0].0 + w[0].1.size() as i32 > w[1].0 {
-                escaped.insert(*r, true);
+                if dbg {
+                    eprintln!("promote: root v{r} overlapping slots {:?} {:?}", w[0], w[1]);
+                }
+                esc_at.entry(*r).or_default().push(Some(w[0].0 as i64));
+                esc_at.entry(*r).or_default().push(Some(w[1].0 as i64));
             }
         }
     }
-    let promotable: Vec<VarId> = roots.iter().copied().filter(|r| !escaped[r] && slots.contains_key(r)).collect();
+    // object of a frame offset
+    let object_of = |r: VarId, o: i64| -> Option<(i64, i64)> {
+        f.frame_objects.iter().find(|(v, a, b)| *v == r && o >= *a && o < *b).map(|(_, a, b)| (*a, *b))
+    };
+    // slots that may be accessed through escaped pointers; pointers stored in escaped slots
+    // escape too (fixpoint)
+    let mut slot_ok: HashMap<(VarId, i32), bool> = HashMap::new();
+    for _round in 0..16 {
+    slot_ok.clear();
+    for r in &roots {
+        let Some(sl) = slots.get(r) else { continue };
+        let esc = esc_at.get(r).cloned().unwrap_or_default();
+        for (o, m) in sl {
+            let o64 = *o as i64;
+            let end = o64 + m.size() as i64;
+            let tainted = escaped[r]
+                || esc.iter().any(|e| match e {
+                    None => true,
+                    Some(eo) => match (object_of(*r, *eo), object_of(*r, o64)) {
+                        // provenance: an escaped pointer reaches its whole object only
+                        (Some(ea), Some(sa)) => ea == sa,
+                        // unknown object layout: assume it reaches everything
+                        _ => true,
+                    },
+                })
+                || (object_of(*r, o64).is_none() && !esc.is_empty())
+                || object_of(*r, o64).is_some_and(|(_, b)| end > b);
+            slot_ok.insert((*r, *o), !tainted);
+        }
+    }
+    let mut grew = false;
+    for (slot, (vr, vc)) in &ptr_stores {
+        if !slot_ok.get(slot).copied().unwrap_or(false) {
+            let e = esc_at.entry(*vr).or_default();
+            if !e.contains(&Some(*vc)) {
+                e.push(Some(*vc));
+                grew = true;
+            }
+        }
+    }
+    if !grew {
+        break;
+    }
+    }
+    // a derivation through a slot that unknown stores may modify is unsound: give up on that root
+    let mut poisoned: Vec<VarId> = vec![];
+    for (r, o) in &via {
+        if !slot_ok.get(&(*r, *o)).copied().unwrap_or(false) {
+            poisoned.push(*r);
+        }
+    }
+    let promotable: Vec<VarId> = roots
+        .iter()
+        .copied()
+        .filter(|r| !poisoned.contains(r) && slot_ok.iter().any(|((rr, _), ok)| rr == r && *ok))
+        .collect();
     if promotable.is_empty() {
         return false;
     }
@@ -329,6 +438,9 @@ pub fn promote(f: &mut Function) -> bool {
     let mut inits = vec![];
     for r in &promotable {
         for (o, m) in &slots[r] {
+            if !slot_ok[&(*r, *o)] {
+                continue;
+            }
             let (ty, range) = match m {
                 Mem::Bool => (Ty::Bool, None),
                 Mem::F32 | Mem::F64 => (Ty::Num, None),
@@ -351,17 +463,15 @@ pub fn promote(f: &mut Function) -> bool {
             match s {
                 Stmt::Assign(v, Rv::Load { addr: Operand::Var(a), off, .. }) => {
                     if let Some((r, c)) = root_of[*a as usize] {
-                        if is_prom(r) {
-                            let pv = var_of[&(r, (c + *off as i64) as i32)];
-                            *s = Stmt::Assign(*v, Rv::Use(Operand::Var(pv)));
+                        if let Some(pv) = var_of.get(&(r, (c + *off as i64) as i32)).filter(|_| is_prom(r)) {
+                            *s = Stmt::Assign(*v, Rv::Use(Operand::Var(*pv)));
                         }
                     }
                 }
                 Stmt::Store { addr: Operand::Var(a), off, val, .. } => {
                     if let Some((r, c)) = root_of[*a as usize] {
-                        if is_prom(r) {
-                            let pv = var_of[&(r, (c + *off as i64) as i32)];
-                            *s = Stmt::Assign(pv, Rv::Use(*val));
+                        if let Some(pv) = var_of.get(&(r, (c + *off as i64) as i32)).filter(|_| is_prom(r)) {
+                            *s = Stmt::Assign(*pv, Rv::Use(*val));
                         }
                     }
                 }

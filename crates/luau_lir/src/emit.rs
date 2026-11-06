@@ -183,6 +183,9 @@ pub struct FnEmitter<'a> {
     foldable: Vec<bool>,
     pending: HashMap<VarId, E>,
     wrapnear_defs: std::collections::HashSet<VarId>,
+    /// register color of function-level vars (shared Luau locals)
+    color: Vec<Option<u32>>,
+    ncolors: Vec<Ty>,
 }
 
 impl<'a> FnEmitter<'a> {
@@ -195,6 +198,8 @@ impl<'a> FnEmitter<'a> {
             top_decl: vec![],
             foldable: vec![],
             pending: HashMap::new(),
+            color: vec![],
+            ncolors: vec![],
             wrapnear_defs: f
                 .blocks
                 .iter()
@@ -208,6 +213,9 @@ impl<'a> FnEmitter<'a> {
     }
 
     fn vname(&self, v: VarId) -> String {
+        if let Some(Some(c)) = self.color.get(v as usize) {
+            return format!("r{c}");
+        }
         match &self.f.vars[v as usize].name {
             Some(n) => format!("{n}_{v}"),
             None => format!("v{v}"),
@@ -286,6 +294,129 @@ impl<'a> FnEmitter<'a> {
                 }
             }
         }
+    }
+
+    /// Liveness-based coloring of function-level vars so that vars with disjoint lifetimes
+    /// share one Luau local (Luau allows at most 200 active locals).
+    fn color_vars(&mut self) {
+        let f = self.f;
+        let n = f.vars.len();
+        let tracked: Vec<bool> = (0..n).map(|v| self.top_decl[v]).collect();
+        let nb = f.blocks.len();
+        let uses_of = |b: &Block| -> (Vec<VarId>, Vec<VarId>) {
+            // (upward-exposed uses, defs)
+            let mut ue = vec![];
+            let mut defs: Vec<VarId> = vec![];
+            for s in &b.stmts {
+                for o in s.operands() {
+                    if let Operand::Var(v) = o {
+                        if tracked[*v as usize] && !defs.contains(v) && !ue.contains(v) {
+                            ue.push(*v);
+                        }
+                    }
+                }
+                for d in s.def() {
+                    if tracked[d as usize] {
+                        defs.push(d);
+                    }
+                }
+            }
+            let mut t = b.term.clone();
+            for o in t.operands_mut() {
+                if let Operand::Var(v) = o {
+                    if tracked[*v as usize] && !defs.contains(v) && !ue.contains(v) {
+                        ue.push(*v);
+                    }
+                }
+            }
+            (ue, defs)
+        };
+        let info: Vec<(Vec<VarId>, Vec<VarId>)> = f.blocks.iter().map(uses_of).collect();
+        let mut live_in: Vec<std::collections::BTreeSet<VarId>> = vec![Default::default(); nb];
+        let mut live_out: Vec<std::collections::BTreeSet<VarId>> = vec![Default::default(); nb];
+        let mut changed = true;
+        while changed {
+            changed = false;
+            for b in (0..nb).rev() {
+                let mut out = std::collections::BTreeSet::new();
+                for s in f.blocks[b].term.successors() {
+                    out.extend(live_in[s as usize].iter().copied());
+                }
+                let mut inn: std::collections::BTreeSet<VarId> = out.clone();
+                for d in &info[b].1 {
+                    inn.remove(d);
+                }
+                inn.extend(info[b].0.iter().copied());
+                if inn != live_in[b] || out != live_out[b] {
+                    live_in[b] = inn;
+                    live_out[b] = out;
+                    changed = true;
+                }
+            }
+        }
+        // interference
+        let mut adj: Vec<std::collections::BTreeSet<VarId>> = vec![Default::default(); n];
+        let mut add = |a: VarId, b: VarId, adj: &mut Vec<std::collections::BTreeSet<VarId>>| {
+            if a != b {
+                adj[a as usize].insert(b);
+                adj[b as usize].insert(a);
+            }
+        };
+        for b in 0..nb {
+            let mut live = live_out[b].clone();
+            let mut t = f.blocks[b].term.clone();
+            for o in t.operands_mut() {
+                if let Operand::Var(v) = o {
+                    if tracked[*v as usize] {
+                        live.insert(*v);
+                    }
+                }
+            }
+            for s in f.blocks[b].stmts.iter().rev() {
+                let defs: Vec<VarId> = s.def().into_iter().filter(|d| tracked[*d as usize]).collect();
+                for d in &defs {
+                    for l in &live {
+                        add(*d, *l, &mut adj);
+                    }
+                    for d2 in &defs {
+                        add(*d, *d2, &mut adj);
+                    }
+                }
+                for d in &defs {
+                    live.remove(d);
+                }
+                for o in s.operands() {
+                    if let Operand::Var(v) = o {
+                        if tracked[*v as usize] {
+                            live.insert(*v);
+                        }
+                    }
+                }
+            }
+            // everything live at block entry interferes pairwise (conservative)
+            let l: Vec<VarId> = live.iter().copied().collect();
+            for i in 0..l.len() {
+                for j in i + 1..l.len() {
+                    add(l[i], l[j], &mut adj);
+                }
+            }
+        }
+        // greedy coloring, most-constrained first
+        let mut order: Vec<VarId> = (0..n as u32).filter(|v| tracked[*v as usize]).collect();
+        order.sort_by_key(|v| std::cmp::Reverse(adj[*v as usize].len()));
+        let mut color: Vec<Option<u32>> = vec![None; n];
+        let mut ctys: Vec<Ty> = vec![];
+        for v in order {
+            let ty = f.vars[v as usize].ty;
+            let taken: std::collections::HashSet<u32> = adj[v as usize].iter().filter_map(|u| color[*u as usize]).collect();
+            let c = (0..ctys.len() as u32).find(|c| ctys[*c as usize] == ty && !taken.contains(c)).unwrap_or_else(|| {
+                ctys.push(ty);
+                (ctys.len() - 1) as u32
+            });
+            color[v as usize] = Some(c);
+        }
+        self.color = color;
+        self.ncolors = ctys;
     }
 
     fn operand(&mut self, o: &Operand) -> E {
@@ -680,10 +811,8 @@ impl<'a> FnEmitter<'a> {
             .map(|p| format!("{}: {}", self.vname(*p), ty_name(self.f.ty(*p))))
             .collect();
         let mut out = format!("{header}({})\n", params.join(", "));
-        let decls: Vec<String> = (0..self.f.vars.len())
-            .filter(|v| self.top_decl[*v])
-            .map(|v| format!("{}: {}", self.vname(v as VarId), ty_name(self.f.vars[v].ty)))
-            .collect();
+        self.color_vars();
+        let decls: Vec<String> = self.ncolors.iter().enumerate().map(|(c, t)| format!("r{c}: {}", ty_name(*t))).collect();
         for chunk in decls.chunks(16) {
             self.line(&format!("local {}", chunk.join(", ")));
         }

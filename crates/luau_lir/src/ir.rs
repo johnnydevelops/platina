@@ -264,11 +264,15 @@ pub struct Function {
     pub vars: Vec<VarInfo>,
     pub blocks: Vec<Block>,
     pub entry: BlockId,
+    /// Shadow-stack objects (one per stack-allocated Rust local/temporary):
+    /// `(sp snapshot var, start, end)` as byte offsets relative to that snapshot. Pointers
+    /// derived from one object can only access that object (Rust provenance).
+    pub frame_objects: Vec<(VarId, i64, i64)>,
 }
 
 impl Function {
     pub fn new(name: impl Into<String>) -> Self {
-        Function { name: name.into(), params: vec![], rets: vec![], vars: vec![], blocks: vec![], entry: 0 }
+        Function { name: name.into(), params: vec![], rets: vec![], vars: vec![], blocks: vec![], entry: 0, frame_objects: vec![] }
     }
     pub fn new_var(&mut self, ty: Ty) -> VarId {
         self.vars.push(VarInfo { ty, name: None, range: None });

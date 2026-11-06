@@ -4,10 +4,13 @@ use crate::ir::*;
 
 /// Cost of a function body (statements + blocks).
 fn cost(f: &Function) -> usize {
-    f.blocks.iter().map(|b| b.stmts.len() + 1).sum()
+    f.blocks
+        .iter()
+        .map(|b| b.stmts.iter().filter(|s| !matches!(s, Stmt::Assign(_, Rv::Use(_)))).count() + 1)
+        .sum()
 }
 
-const SMALL: usize = 40;
+const SMALL: usize = 64;
 const SINGLE_CALLER: usize = 120;
 const MAX_VARS: usize = 900;
 const MAX_COST: usize = 3000;
@@ -144,6 +147,9 @@ fn splice(f: &mut Function, bi: usize, si: usize, callee: &Function) {
             *t = mb(*t);
         }
         f.blocks.push(nb);
+    }
+    for (v, a, b) in &callee.frame_objects {
+        f.frame_objects.push((mv(*v), *a, *b));
     }
     let cont = f.new_block();
     f.blocks[cont as usize].stmts = rest;

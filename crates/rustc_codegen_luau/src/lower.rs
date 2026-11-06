@@ -68,6 +68,7 @@ pub struct FnLower<'a, 'tcx> {
     bbs: Vec<BlockId>,
     locals: Vec<LocalRep<'tcx>>,
     frame_size: u64,
+    frame_objs: Vec<(u64, u64)>,
     frame_align: u64,
     fp: VarId,
     sp_top: VarId,
@@ -136,6 +137,7 @@ impl<'a, 'tcx> FnLower<'a, 'tcx> {
             bbs: vec![],
             locals: vec![],
             frame_size: 0,
+            frame_objs: vec![],
             frame_align: 8,
             fp,
             sp_top,
@@ -221,6 +223,7 @@ impl<'a, 'tcx> FnLower<'a, 'tcx> {
         self.frame_align = self.frame_align.max(align);
         let off = (self.frame_size + align - 1) / align * align;
         self.frame_size = off + size;
+        self.frame_objs.push((off, off + size));
         off
     }
     /// Temporary memory slot; returns its address operand.
@@ -420,6 +423,12 @@ impl<'a, 'tcx> FnLower<'a, 'tcx> {
             };
             self.push(Stmt::Assign(self.fp, fp_rv));
             self.push(Stmt::SetSp(Operand::Var(self.fp)));
+            if self.frame_align <= 8 {
+                // fp = sp - size, so object offsets relative to the sp snapshot are known
+                for (a, b) in &self.frame_objs {
+                    self.f.frame_objects.push((self.sp_top, *a as i64 - size as i64, *b as i64 - size as i64));
+                }
+            }
         }
         for s in prologue {
             match s {
@@ -613,9 +622,14 @@ impl<'a, 'tcx> FnLower<'a, 'tcx> {
         let PlaceV::Mem { addr, off, .. } = pv else { self.fatal("index of register place") };
         let el = self.layout(elem_ty);
         let stride = el.size.bytes();
+        if let Operand::Num(i) = idx {
+            return PlaceV::Mem { addr, off: off + (i as i64) * stride as i64, layout: el, meta: None };
+        }
+        // base + offset first: the dynamic pointer must point into its own object (provenance)
+        let base = self.add_off(addr, off);
         let scaled = if stride == 1 { idx } else { self.bin(Bin::Mul, idx, Operand::Num(stride as f64)) };
-        let a = self.bin(Bin::Add, addr, scaled);
-        PlaceV::Mem { addr: a, off, layout: el, meta: None }
+        let a = self.bin(Bin::Add, base, scaled);
+        PlaceV::Mem { addr: a, off: 0, layout: el, meta: None }
     }
 
     /// Address of a memory place (for references).

@@ -65,6 +65,10 @@ pub fn compact_vars(f: &mut Function) {
         return;
     }
     f.vars = vars;
+    f.frame_objects.retain(|o| map[o.0 as usize] != u32::MAX);
+    for o in &mut f.frame_objects {
+        o.0 = map[o.0 as usize];
+    }
     let m = |v: &mut VarId| *v = map[*v as usize];
     for p in &mut f.params {
         m(p);
