@@ -559,6 +559,11 @@ fn negate_cond(c: Cond) -> Cond {
     }
 }
 
+/// Whether the CFG is reducible (structurable without node splitting).
+pub fn is_reducible(f: &Function) -> bool {
+    Ramsey::new(f).is_ok()
+}
+
 pub struct Structured {
     pub body: Vec<S>,
     pub uses_label_var: bool,

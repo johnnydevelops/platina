@@ -1,5 +1,7 @@
 //! Optimization passes over LIR.
 
+use std::collections::HashMap;
+
 use crate::ir::*;
 
 mod cond;
@@ -9,6 +11,165 @@ mod mem;
 mod promote;
 mod range;
 
+/// Merge functions with identical bodies (common across generic instantiations).
+pub fn dedup_functions(p: &mut Program) -> bool {
+    let n = p.funcs.len();
+    let mut seen: HashMap<String, u32> = HashMap::new();
+    let mut repl: Vec<u32> = (0..n as u32).collect();
+    for (i, f) in p.funcs.iter().enumerate() {
+        let key = format!(
+            "{:?}|{:?}|{:?}|{:?}|{}|{:?}",
+            f.params,
+            f.rets,
+            f.vars.iter().map(|v| (v.ty, v.range)).collect::<Vec<_>>(),
+            f.blocks.iter().map(|b| (&b.stmts, &b.term)).collect::<Vec<_>>(),
+            f.entry,
+            f.frame_objects
+        );
+        match seen.get(&key) {
+            Some(j) => repl[i] = *j,
+            None => {
+                seen.insert(key, i as u32);
+            }
+        }
+    }
+    if repl.iter().enumerate().all(|(i, r)| *r == i as u32) {
+        return false;
+    }
+    for f in &mut p.funcs {
+        for b in &mut f.blocks {
+            for s in &mut b.stmts {
+                if let Stmt::Call { callee: Callee::Func(c), .. } = s {
+                    *c = repl[*c as usize];
+                }
+            }
+        }
+    }
+    for t in p.table.iter_mut().skip(1) {
+        *t = repl[*t as usize];
+    }
+    for e in &mut p.exports {
+        e.1 = repl[e.1 as usize];
+    }
+    true
+}
+
+/// Merge blocks that are identical up to renaming of their block-local temporaries (e.g. the
+/// arms of a match whose bodies compile to the same code).
+fn merge_blocks(f: &mut Function) -> bool {
+    let n = f.vars.len();
+    // which block each var is defined/used in; usize::MAX = several
+    let mut home: Vec<Option<usize>> = vec![None; n];
+    let mut multi = vec![false; n];
+    let note = |v: VarId, b: usize, home: &mut Vec<Option<usize>>, multi: &mut Vec<bool>| match home[v as usize] {
+        None => home[v as usize] = Some(b),
+        Some(h) if h != b => multi[v as usize] = true,
+        _ => {}
+    };
+    for p in &f.params {
+        multi[*p as usize] = true;
+    }
+    for (bi, b) in f.blocks.iter().enumerate() {
+        for s in &b.stmts {
+            for d in s.def() {
+                note(d, bi, &mut home, &mut multi);
+            }
+            for o in s.operands() {
+                if let Operand::Var(v) = o {
+                    note(*v, bi, &mut home, &mut multi);
+                }
+            }
+        }
+        let mut t = b.term.clone();
+        for o in t.operands_mut() {
+            if let Operand::Var(v) = o {
+                note(*v, bi, &mut home, &mut multi);
+            }
+        }
+    }
+    let local = |v: VarId| !multi[v as usize];
+    let mut key_of: HashMap<String, BlockId> = HashMap::new();
+    let mut redirect: Vec<BlockId> = (0..f.blocks.len() as u32).collect();
+    let mut any = false;
+    for (bi, b) in f.blocks.iter().enumerate() {
+        if (bi as u32) == f.entry || (b.stmts.is_empty() && b.term == Term::Unreachable) {
+            continue;
+        }
+        // canonical text with local vars numbered by first appearance
+        let mut map: HashMap<VarId, u32> = HashMap::new();
+        let canon = |v: VarId, map: &mut HashMap<VarId, u32>| -> VarId {
+            if local(v) {
+                let k = map.len() as u32;
+                u32::MAX - *map.entry(v).or_insert(k)
+            } else {
+                v
+            }
+        };
+        let mut nb = b.clone();
+        for s in &mut nb.stmts {
+            // operands first (evaluation order), then defs
+            for o in s.operands_mut() {
+                if let Operand::Var(v) = o {
+                    *v = canon(*v, &mut map);
+                }
+            }
+            match s {
+                Stmt::Assign(v, _) | Stmt::GetSp(v) => *v = canon(*v, &mut map),
+                Stmt::Call { dests, .. } => {
+                    for d in dests.iter_mut() {
+                        *d = canon(*d, &mut map);
+                    }
+                }
+                _ => {}
+            }
+        }
+        for o in nb.term.operands_mut() {
+            if let Operand::Var(v) = o {
+                *v = canon(*v, &mut map);
+            }
+        }
+        // locals must keep their types
+        let tys: Vec<(u32, Ty)> = {
+            let mut v: Vec<(u32, Ty)> = map.iter().map(|(var, k)| (*k, f.vars[*var as usize].ty)).collect();
+            v.sort_by_key(|x| x.0);
+            v
+        };
+        let key = format!("{:?}|{:?}|{:?}", nb.stmts, nb.term, tys);
+        match key_of.get(&key) {
+            Some(first) => {
+                redirect[bi] = *first;
+                any = true;
+            }
+            None => {
+                key_of.insert(key, bi as u32);
+            }
+        }
+    }
+    if !any {
+        return false;
+    }
+    // apply merges one at a time, keeping those that leave the CFG reducible
+    let mut applied = false;
+    for (from, to) in redirect.iter().enumerate().filter(|(i, t)| **t != *i as u32).map(|(i, t)| (i as u32, *t)) {
+        let saved: Vec<Term> = f.blocks.iter().map(|b| b.term.clone()).collect();
+        for b in &mut f.blocks {
+            for t in b.term.successors_mut() {
+                if *t == from {
+                    *t = to;
+                }
+            }
+        }
+        if crate::structure::is_reducible(f) {
+            applied = true;
+        } else {
+            for (b, t) in f.blocks.iter_mut().zip(saved) {
+                b.term = t;
+            }
+        }
+    }
+    applied
+}
+
 pub fn optimize(p: &mut Program) {
     for f in &mut p.funcs {
         simplify(f);
@@ -16,6 +177,9 @@ pub fn optimize(p: &mut Program) {
     program_dce(p);
     if std::env::var("LUAU_NO_INLINE").is_err() {
         inline::inline_program(p);
+        program_dce(p);
+    }
+    while dedup_functions(p) {
         program_dce(p);
     }
 }
@@ -103,6 +267,9 @@ fn simplify_inner(f: &mut Function) {
         changed |= local_copy_prop(f);
         changed |= fold_consts(f);
         changed |= dce(f);
+        if enabled("merge") {
+            changed |= merge_blocks(f);
+        }
         if enabled("loops") {
             changed |= loops::remove_dead_loops(f);
         }

@@ -47,7 +47,7 @@ pub fn emit_program(p: &Program) -> Result<String, String> {
     writeln!(out, "local MEM: buffer = buffer.create({})", p.initial_mem).unwrap();
     writeln!(out, "local SP: number = {}", p.stack_top).unwrap();
     writeln!(out, "local HEAP_BASE: number = {}", p.heap_base).unwrap();
-    out.push_str(PRELUDE);
+    let prelude_at = out.len();
     if !p.data.is_empty() {
         let escaped = emit::lua_string(&p.data);
         let b64 = emit::base64(&p.data);
@@ -119,5 +119,71 @@ pub fn emit_program(p: &Program) -> Result<String, String> {
     }
     out.push_str("\tmemory = function(): buffer return MEM end,\n");
     out.push_str("}\n");
+    let used = idents(&out);
+    out.insert_str(prelude_at, &shaken_prelude(&used));
     Ok(out)
+}
+
+fn idents(s: &str) -> std::collections::HashSet<String> {
+    let mut out = std::collections::HashSet::new();
+    let b = s.as_bytes();
+    let mut i = 0;
+    while i < b.len() {
+        if b[i].is_ascii_alphabetic() || b[i] == b'_' {
+            let st = i;
+            while i < b.len() && (b[i].is_ascii_alphanumeric() || b[i] == b'_') {
+                i += 1;
+            }
+            out.insert(s[st..i].to_string());
+        } else {
+            i += 1;
+        }
+    }
+    out
+}
+
+/// The prelude reduced to the items (top-level `local` definitions) that the generated code
+/// references, directly or through other items.
+fn shaken_prelude(used: &std::collections::HashSet<String>) -> String {
+    // split into items: each starts at a top-level `local`
+    let mut items: Vec<(Vec<String>, String)> = vec![];
+    for line in PRELUDE.lines() {
+        if line.starts_with("local ") {
+            let decl = line.trim_start_matches("local function ").trim_start_matches("local ");
+            let names = decl.split(['=', '(']).next().unwrap_or("");
+            let defs: Vec<String> = names
+                .split(',')
+                .map(|n| n.split(':').next().unwrap_or("").trim().to_string())
+                .filter(|n| !n.is_empty())
+                .collect();
+            items.push((defs, String::new()));
+        } else if line.starts_with("--") || items.is_empty() {
+            continue;
+        }
+        let it = items.last_mut().unwrap();
+        it.1.push_str(line);
+        it.1.push('\n');
+    }
+    let mut need: std::collections::HashSet<String> = used.clone();
+    let mut keep = vec![false; items.len()];
+    loop {
+        let mut changed = false;
+        for (k, (defs, text)) in items.iter().enumerate() {
+            if !keep[k] && defs.iter().any(|d| need.contains(d)) {
+                keep[k] = true;
+                changed = true;
+                need.extend(idents(text));
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    let mut out = String::new();
+    for (k, (_, text)) in items.iter().enumerate() {
+        if keep[k] {
+            out.push_str(text);
+        }
+    }
+    out
 }
