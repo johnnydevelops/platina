@@ -222,6 +222,8 @@ Inside the repository, `target/debug/cargo-roblox` uses the freshly built backen
 Debugging aids:
 - `LUAU_DUMP_LIR=<fn name>` prints a function's final LIR;
 - `LUAU_DUMP_MIR=<fn name>` prints its MIR;
+- `LUAU_TRACE_LOWER=1` prints every function as it's lowered, and every call it makes. It's
+  for finding the call path that drags in code that can't be lowered.
 - `LUAU_NO_INLINE=1` turns off inlining;
 - `LUAU_DISABLE=range,mem,...` turns off individual passes.
 

@@ -113,6 +113,9 @@ impl<'a, 'tcx> FnLower<'a, 'tcx> {
     pub fn lower(cx: &'a mut Cx<'tcx>, instance: Instance<'tcx>, name: String) -> l::Function {
         let tcx = cx.tcx;
         let mir = tcx.instance_mir(instance.def);
+        if std::env::var_os("LUAU_TRACE_LOWER").is_some() {
+            eprintln!("lowering {instance}");
+        }
         if let Ok(filter) = std::env::var("LUAU_DUMP_MIR") {
             if name.contains(&filter) {
                 let mut out = Vec::new();
@@ -2237,6 +2240,9 @@ impl<'a, 'tcx> FnLower<'a, 'tcx> {
                     finish(self);
                     return;
                 }
+            }
+            if std::env::var_os("LUAU_TRACE_LOWER").is_some() {
+                eprintln!("  call {inst}");
             }
             match inst.def {
                 InstanceKind::Intrinsic(_) => {
