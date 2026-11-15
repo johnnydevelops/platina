@@ -79,6 +79,13 @@ local function memcmp(a: number, b: number, n: number): number
 	end
 	return 0
 end
+local function rt_strlen(p: number): number
+	local n = 0
+	while buffer.readu8(MEM, p + n) ~= 0 do
+		n += 1
+	end
+	return n
+end
 
 -- 64-bit integers as (lo, hi) pairs of u32
 local function add64(al: number, ah: number, bl: number, bh: number): (number, number)

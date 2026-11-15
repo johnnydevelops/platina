@@ -2275,6 +2275,10 @@ impl<'a, 'tcx> FnLower<'a, 'tcx> {
                             "__rust_alloc_zeroed" => Some(("rt_alloc_zeroed", 1)),
                             "__rust_dealloc" => Some(("rt_dealloc", 0)),
                             "__rust_realloc" => Some(("rt_realloc", 1)),
+                            // C library functions crates reach through FFI declarations
+                            // (`CStr::from_ptr`, zlib-rs, ...)
+                            "strlen" => Some(("rt_strlen", 1)),
+                            "memcmp" | "bcmp" => Some(("memcmp", 1)),
                             _ => None,
                         };
                         if let Some((h, nret)) = rt {
