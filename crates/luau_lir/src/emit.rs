@@ -684,8 +684,24 @@ impl<'a> FnEmitter<'a> {
         }
     }
 
+    /// A numeric literal used as a condition. (Only literals: a `Ty::Num` variable may hold a
+    /// Luau boolean, e.g. the result of a glue function returning `bool`.)
+    fn is_num(&self, o: &Operand) -> bool {
+        matches!(o, Operand::Num(_))
+    }
+
     fn cond(&mut self, c: &Cond) -> E {
         match c {
+            // a numeric literal as a condition is a Rust bool held as 0/1: compare it (in Luau, 0
+            // is truthy)
+            Cond::Truthy(o) if self.is_num(o) => {
+                let e = self.operand(o);
+                bin("~=", P_CMP, e, E::Num(0.0))
+            }
+            Cond::Falsy(o) if self.is_num(o) => {
+                let e = self.operand(o);
+                bin("==", P_CMP, e, E::Num(0.0))
+            }
             Cond::Truthy(o) => self.operand(o),
             Cond::Falsy(o) => {
                 let e = self.operand(o);

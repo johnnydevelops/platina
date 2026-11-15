@@ -525,6 +525,8 @@ fn fold_consts(f: &mut Function) -> bool {
         // constant branches
         let new = match &b.term {
             Term::Br(Operand::Bool(c), t, e) => Some(Term::Goto(if *c { *t } else { *e })),
+            // a numeric condition is a Rust bool held as 0/1
+            Term::Br(Operand::Num(n), t, e) => Some(Term::Goto(if *n != 0.0 { *t } else { *e })),
             Term::Br(_, t, e) if t == e => Some(Term::Goto(*t)),
             Term::Switch(Operand::Num(x), cases, d) => {
                 Some(Term::Goto(cases.iter().find(|c| c.0 == *x).map(|c| c.1).unwrap_or(*d)))
