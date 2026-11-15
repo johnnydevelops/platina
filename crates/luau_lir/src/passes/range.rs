@@ -210,8 +210,12 @@ fn analyze_flow(f: &Function, facts: &[Vec<(VarId, Iv)>]) -> Ranges {
             }
         }
     }
-    // fixpoint with widening
-    for round in 0..6 {
+    // fixpoint with widening. It must actually converge: a result that is still changing is
+    // not a post-fixpoint, so neither it nor the narrowing built on it would be sound. Widening
+    // from round 4 sends every still-growing var to its declared range (or FULL), after which
+    // values only stop changing; the cap is a safety net.
+    let mut converged = false;
+    for round in 0..64 {
         let mut changed = false;
         for (bi, b) in f.blocks.iter().enumerate() {
             // block-entry refinements, valid until the var is redefined in this block
@@ -259,8 +263,20 @@ fn analyze_flow(f: &Function, facts: &[Vec<(VarId, Iv)>]) -> Ranges {
             }
         }
         if !changed {
+            converged = true;
             break;
         }
+    }
+    if !converged {
+        // give up soundly: every assigned var gets its declared range, or FULL
+        for b in &f.blocks {
+            for s in &b.stmts {
+                if let Stmt::Assign(v, _) = s {
+                    r.iv[*v as usize] = Some(declared[*v as usize].unwrap_or(Iv::FULL));
+                }
+            }
+        }
+        return r;
     }
     // narrowing: widening jumps loop-carried vars to FULL even when an edge fact bounds them
     // (`i + 1` under `i < n`). Re-evaluating every definition from the (sound) widened ranges
@@ -520,6 +536,7 @@ fn sink_wraps(f: &mut Function) -> bool {
         let mut cur = t;
         let mut extra = r.op(&x).mag() - r.iv[t].map(|i| i.mag()).unwrap_or(0.0);
         let mut ok = false;
+        let mut sink = (0, 0);
         for _ in 0..64 {
             if uses[cur] != 1 {
                 break;
@@ -530,6 +547,7 @@ fn sink_wraps(f: &mut Function) -> bool {
             match rv {
                 Rv::Un(Un::Wrap(k2) | Un::WrapNear(k2, ..), _) if k2.bits <= k.bits => {
                     ok = true;
+                    sink = (ub, us);
                     break;
                 }
                 Rv::Bin(Bin::Add | Bin::Sub, _, _) if f.vars[dst].range.is_none() && defs[dst] == 1 => {
@@ -545,6 +563,13 @@ fn sink_wraps(f: &mut Function) -> bool {
         }
         if ok {
             f.blocks[bi].stmts[si] = Stmt::Assign(t as VarId, Rv::Use(x));
+            // a `WrapNear` sink only corrects one modulus step: valid for the wrapped operand,
+            // not for the unwrapped chain (`h * 31 + c` is up to 31 steps out of range). Make it
+            // a full wrap; `run` narrows it again only if the wider operand allows.
+            if let Stmt::Assign(_, Rv::Un(op @ Un::WrapNear(..), _)) = &mut f.blocks[sink.0].stmts[sink.1] {
+                let Un::WrapNear(k2, ..) = *op else { unreachable!() };
+                *op = Un::Wrap(k2);
+            }
             changed = true;
             r = analyze(f);
         }
