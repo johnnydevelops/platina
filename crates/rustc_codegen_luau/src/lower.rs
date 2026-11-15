@@ -381,12 +381,16 @@ impl<'a, 'tcx> FnLower<'a, 'tcx> {
 
         // lower reachable blocks (constant-folding switches on compile-time-known conditions)
         let mut reachable = self.reachable_blocks();
-        if crate::platform::is_body_override(tcx, self.instance) {
+        let overridden = crate::platform::is_body_override(tcx, self.instance);
+        if overridden {
             reachable.iter_mut().for_each(|r| *r = false);
             self.cur = self.bbs[0];
             crate::platform::override_body(self);
         }
         for (bb, data) in mir.basic_blocks.iter_enumerated() {
+            if overridden && bb.as_usize() == 0 {
+                continue; // the override's code starts here; keep its terminator
+            }
             if data.is_cleanup || !reachable[bb.as_usize()] {
                 self.cur = self.bbs[bb.as_usize()];
                 self.term(Term::Unreachable);
@@ -2531,6 +2535,21 @@ impl<'a, 'tcx> FnLower<'a, 'tcx> {
             self.write_place(&fp, Val::Regs(vals));
         }
         self.set_discriminant(dest, v);
+    }
+    /// The layout of parameter `i` (0-based).
+    pub(crate) fn i_param_layout(&self, i: usize) -> TyAndLayout<'tcx> {
+        let ty = self.mir.local_decls[Local::from_usize(i + 1)].ty;
+        let ty = self.monomorphize(ty);
+        self.i_layout(ty)
+    }
+    /// The instance being lowered.
+    pub(crate) fn i_instance(&self) -> Instance<'tcx> {
+        self.instance
+    }
+    /// End the current block by returning `ops` (the return value's leaves).
+    pub(crate) fn i_return(&mut self, ops: Vec<Operand>) {
+        self.push(Stmt::SetSp(Operand::Var(self.sp_top)));
+        self.term(Term::Return(ops));
     }
     pub(crate) fn i_param(&self, i: usize) -> Vec<Operand> {
         let (vars, _) = self.local_leaves(Local::from_usize(i + 1));

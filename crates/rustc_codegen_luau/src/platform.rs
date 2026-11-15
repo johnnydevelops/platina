@@ -26,6 +26,9 @@ pub fn lower_override<'tcx>(
 ) -> bool {
     let tcx = fx.i_tcx();
     let def_id = inst.def_id();
+    if tcx.crate_name(def_id.krate).as_str() == "dlmalloc" {
+        return lower_dlmalloc(fx, inst, args, dest);
+    }
     if tcx.crate_name(def_id.krate) != sym::std {
         return false;
     }
@@ -53,22 +56,39 @@ pub fn lower_override<'tcx>(
         let r = match name {
             "alloc" | "alloc_zeroed" => {
                 let (size, align) = layout_arg(1, fx);
-                let h = if name == "alloc" { "rt_alloc" } else { "rt_alloc_zeroed" };
-                fx.i_helper(h, &[size, align], 1)
+                fx.i_helper("rt_sys_alloc", &[size, align, Operand::Bool(name == "alloc_zeroed")], 1)
             }
-            "dealloc" => {
-                let (size, align) = layout_arg(2, fx);
-                fx.i_helper("rt_dealloc", &[ops[1].0[0], size, align], 0)
-            }
-            "realloc" => {
-                let (size, align) = layout_arg(2, fx);
-                fx.i_helper("rt_realloc", &[ops[1].0[0], size, align, ops[3].0[0]], 1)
-            }
+            "dealloc" => fx.i_helper("rt_sys_free", &[ops[1].0[0]], 0),
+            "realloc" => fx.i_helper("rt_sys_realloc", &[ops[1].0[0], ops[3].0[0]], 1),
             _ => return false,
         };
         if !r.is_empty() {
             fx.i_write(dest, r);
         }
+        return true;
+    }
+
+    // `System::alloc_impl(&self, Layout, zeroed) -> Result<NonNull<[u8]>, AllocError>`: std
+    // inlines `<System as GlobalAlloc>` (and dlmalloc behind it) into it, so `Allocator for
+    // System` (`Arc<_, System>` in std's threads) needs replacing one level up
+    if path == "std::alloc::System::alloc_impl" {
+        let (layout, layout_ty) = fx.i_operand(&args[1].node);
+        let (zeroed, _) = fx.i_operand(&args[2].node);
+        let (size, align) = layout_size_align(fx, &layout, layout_ty);
+        let p = fx.i_helper("rt_sys_alloc_impl", &[size, align, zeroed[0]], 1);
+        let lay = dest.layout_pub();
+        let ty::Adt(def, _) = lay.ty.kind() else { fx.i_fatal("alloc_impl result is not an ADT") };
+        let ok = def.variants().iter_enumerated().find(|(_, v)| v.name.as_str() == "Ok").map(|(i, _)| i).unwrap();
+        fx.i_write_variant(dest, ok, vec![p[0], size]);
+        return true;
+    }
+
+    // `<System as Allocator>::deallocate(&self, NonNull<u8>, Layout)`: the same inlining
+    if path.contains("Allocator for std::alloc::System") && name == "deallocate" {
+        let (ptr, _) = fx.i_operand(&args[1].node);
+        let (layout, layout_ty) = fx.i_operand(&args[2].node);
+        let (size, _) = layout_size_align(fx, &layout, layout_ty);
+        fx.i_helper("rt_sys_dealloc_nz", &[ptr[0], size], 0);
         return true;
     }
 
@@ -144,6 +164,53 @@ pub fn lower_override<'tcx>(
     false
 }
 
+/// dlmalloc, std's wasm allocator behind `System`, as the runtime's System heap
+/// (`rt_sys_*`). MIR inlining folds `<System as GlobalAlloc>` and dlmalloc's `#[inline]` methods
+/// into std, so both its public API (`dlmalloc::Dlmalloc`, sizes passed in) and the inner
+/// allocator behind it (`dlmalloc::dlmalloc::Dlmalloc`, `free(mem)` / `realloc(mem, n)` without
+/// sizes) are reached directly. Lowering dlmalloc itself would fail (it needs the linker's
+/// `__heap_base`) or, worse, run it on runtime-heap memory.
+fn lower_dlmalloc<'tcx>(
+    fx: &mut FnLower<'_, 'tcx>,
+    inst: Instance<'tcx>,
+    args: Args<'_, 'tcx>,
+    dest: &PlaceVal<'tcx>,
+) -> bool {
+    let tcx = fx.i_tcx();
+    let path = rustc_middle::ty::print::with_no_trimmed_paths!(tcx.def_path_str(inst.def_id()));
+    let inner = path.starts_with("dlmalloc::dlmalloc::Dlmalloc");
+    if !inner && !path.starts_with("dlmalloc::Dlmalloc") {
+        return false;
+    }
+    let Some(name) = tcx.opt_item_name(inst.def_id()) else { return false };
+    // args: &(mut) self, then integers and pointers
+    let ops: Vec<Operand> = args[1..].iter().map(|a| fx.i_operand(&a.node).0[0]).collect();
+    let no = Operand::Bool(false);
+    let r = match (inner, name.as_str()) {
+        // dlmalloc::Dlmalloc: malloc(size, align), calloc(size, align), free(ptr, size, align),
+        // realloc(ptr, old_size, old_align, new_size)
+        (false, "malloc") => fx.i_helper("rt_sys_alloc", &[ops[0], ops[1], no], 1),
+        (false, "calloc") => fx.i_helper("rt_sys_alloc", &[ops[0], ops[1], Operand::Bool(true)], 1),
+        (false, "free") => fx.i_helper("rt_sys_free", &[ops[0]], 0),
+        (false, "realloc") => fx.i_helper("rt_sys_realloc", &[ops[0], ops[3]], 1),
+        // dlmalloc::dlmalloc::Dlmalloc: malloc(size), memalign(align, size), free(mem),
+        // realloc(mem, size); the alignment `malloc` guarantees; whether calloc must clear;
+        // validate_size (a debug check against dlmalloc's chunk headers)
+        (true, "malloc") => fx.i_helper("rt_sys_alloc", &[ops[0], Operand::Num(8.0), no], 1),
+        (true, "memalign") => fx.i_helper("rt_sys_alloc", &[ops[1], ops[0], no], 1),
+        (true, "free") => fx.i_helper("rt_sys_free", &[ops[0]], 0),
+        (true, "realloc") => fx.i_helper("rt_sys_realloc", &[ops[0], ops[1]], 1),
+        (true, "malloc_alignment") => vec![Operand::Num(8.0)],
+        (true, "calloc_must_clear") => vec![Operand::Bool(true)],
+        (true, "validate_size") => vec![],
+        _ => return false,
+    };
+    if !r.is_empty() {
+        fx.i_write(dest, r);
+    }
+    true
+}
+
 /// (size, align) of a `core::alloc::Layout` value given as leaves.
 fn layout_size_align<'tcx>(fx: &mut FnLower<'_, 'tcx>, vals: &[Operand], lay: TyAndLayout<'tcx>) -> (Operand, Operand) {
     let tcx = fx.i_tcx();
@@ -184,6 +251,21 @@ fn write_duration_newtype<'tcx>(fx: &mut FnLower<'_, 'tcx>, dest: &PlaceVal<'tcx
     fx.i_write(dest, out);
 }
 
+/// `System`'s `GlobalAlloc` methods (std::sys::alloc::wasm), by name.
+fn system_alloc_method<'tcx>(tcx: ty::TyCtxt<'tcx>, def_id: rustc_span::def_id::DefId) -> Option<&'static str> {
+    let p = rustc_middle::ty::print::with_no_trimmed_paths!(tcx.def_path_str(def_id));
+    if !(p.contains("sys::alloc::wasm") && p.contains("GlobalAlloc")) {
+        return None;
+    }
+    match tcx.opt_item_name(def_id)?.as_str() {
+        "alloc" => Some("alloc"),
+        "alloc_zeroed" => Some("alloc_zeroed"),
+        "dealloc" => Some("dealloc"),
+        "realloc" => Some("realloc"),
+        _ => None,
+    }
+}
+
 /// Functions whose bodies are replaced entirely.
 pub fn is_body_override<'tcx>(tcx: ty::TyCtxt<'tcx>, inst: Instance<'tcx>) -> bool {
     let def_id = inst.def_id();
@@ -192,13 +274,44 @@ pub fn is_body_override<'tcx>(tcx: ty::TyCtxt<'tcx>, inst: Instance<'tcx>) -> bo
         && {
             let p = rustc_middle::ty::print::with_no_trimmed_paths!(tcx.def_path_str(def_id));
             matches!(p.as_str(), "std::panicking::begin_panic_handler" | "std::panicking::panic_handler")
+                // the system allocator's methods, when they are called through a function
+                // pointer or a vtable (direct calls are replaced in `lower_override`): their
+                // bodies would reach dlmalloc, which needs the linker's `__heap_base`
+                || system_alloc_method(tcx, def_id).is_some()
         }
+}
+
+/// `<System as GlobalAlloc>::{alloc, alloc_zeroed, dealloc, realloc}` as the runtime's System heap.
+fn override_system_alloc<'tcx>(fx: &mut FnLower<'_, 'tcx>, method: &str) {
+    let r = match method {
+        "alloc" | "alloc_zeroed" => {
+            let lay = fx.i_param_layout(1);
+            let vals = fx.i_param(1);
+            let (size, align) = layout_size_align(fx, &vals, lay);
+            fx.i_helper("rt_sys_alloc", &[size, align, Operand::Bool(method == "alloc_zeroed")], 1)
+        }
+        "dealloc" => {
+            let ptr = fx.i_param(1)[0];
+            fx.i_helper("rt_sys_free", &[ptr], 0)
+        }
+        _ => {
+            let ptr = fx.i_param(1)[0];
+            let new_size = fx.i_param(3)[0];
+            fx.i_helper("rt_sys_realloc", &[ptr, new_size], 1)
+        }
+    };
+    fx.i_return(r);
 }
 
 /// `std::panicking::begin_panic_handler(info: &PanicInfo) -> !`: format the message with
 /// `ToString`, hand it (with the location) to the runtime and abort with it as the error.
 pub fn override_body<'tcx>(fx: &mut FnLower<'_, 'tcx>) {
     let tcx = fx.i_tcx();
+    // by def_id: a function pointer to the method is a reify shim of it, with the same body
+    if let Some(method) = system_alloc_method(tcx, fx.i_instance().def_id()) {
+        override_system_alloc(fx, method);
+        return;
+    }
     let info = fx.i_param(0);
     // PanicInfo methods
     let info_def = tcx.lang_items().panic_info().expect("PanicInfo lang item");

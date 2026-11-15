@@ -334,6 +334,50 @@ local function rt_alloc_zeroed(size: number, align: number): number
 	buffer.fill(MEM, p, 0, size)
 	return p
 end
+-- std::alloc::System's heap. MIR inlining can fold System's GlobalAlloc, and dlmalloc's own
+-- methods, into std, so System is reached through entry points that free or reallocate without
+-- a size (dlmalloc's inner `free(mem)`, `realloc(mem, n)`). Each System allocation therefore
+-- carries an 8-byte header just below it: the offset back to the block (the alignment, >= 8)
+-- and the block's total size. Memory is always freed by the allocator that allocated it, so
+-- these never meet `rt_alloc`'s plain blocks.
+local function rt_sys_alloc(size: number, align: number, zeroed: boolean): number
+	local a = math.max(align, 8)
+	local total = size + a
+	local p = rt_alloc(total, a) + a
+	buffer.writeu32(MEM, p - 8, a)
+	buffer.writeu32(MEM, p - 4, total)
+	if zeroed then
+		buffer.fill(MEM, p, 0, size)
+	end
+	return p
+end
+local function rt_sys_free(p: number)
+	if p ~= 0 then
+		local a = buffer.readu32(MEM, p - 8)
+		rt_dealloc(p - a, buffer.readu32(MEM, p - 4), a)
+	end
+end
+local function rt_sys_realloc(p: number, newsize: number): number
+	local a = buffer.readu32(MEM, p - 8)
+	local old = buffer.readu32(MEM, p - 4) - a
+	local q = rt_sys_alloc(newsize, a, false)
+	buffer.copy(MEM, q, MEM, p, math.min(old, newsize))
+	rt_sys_free(p)
+	return q
+end
+-- <System as Allocator>: size 0 is a dangling, aligned pointer (std's `layout.dangling_ptr()`)
+-- and is never freed
+local function rt_sys_alloc_impl(size: number, align: number, zeroed: boolean): number
+	if size == 0 then
+		return align
+	end
+	return rt_sys_alloc(size, align, zeroed)
+end
+local function rt_sys_dealloc_nz(p: number, size: number)
+	if size ~= 0 then
+		rt_sys_free(p)
+	end
+end
 local function rt_realloc(p: number, size: number, align: number, newsize: number): number
 	local n0 = math.max(size, align, 8)
 	local n1 = math.max(newsize, align, 8)

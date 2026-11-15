@@ -134,20 +134,32 @@ fn bench(root: &Path, filters: &[String]) {
     }
 }
 
+/// Crate attributes for a test: a `// features: a, b` line enables nightly features (tests are
+/// included as a module, so they can't declare `#![feature]` themselves).
+fn crate_attrs(test: &Path) -> String {
+    let src = std::fs::read_to_string(test).unwrap_or_default();
+    src.lines()
+        .filter_map(|l| l.trim().strip_prefix("// features:"))
+        .map(|f| format!("#![feature({})]\n", f.trim()))
+        .collect()
+}
+
 /// std tests: `tests/std/*.rs` define `pub fn run()` and print with `println!`.
 fn std_native(root: &Path, test: &Path, name: &str) -> Result<String, String> {
     let dir = root.join("target/luau-tests/native");
     std::fs::create_dir_all(&dir).unwrap();
     let main = dir.join(format!("std_{name}.rs"));
-    std::fs::write(&main, format!("#![allow(dead_code, unused)]\nmod t {{ include!({test:?}); }}\nfn main() {{ t::run(); }}\n")).unwrap();
+    let attrs = crate_attrs(test);
+    std::fs::write(&main, format!("{attrs}#![allow(dead_code, unused)]\nmod t {{ include!({test:?}); }}\nfn main() {{ t::run(); }}\n")).unwrap();
     let bin = dir.join(format!("std_{name}"));
     sh(Command::new("rustc").args(["--edition", "2024", "-O", "-o"]).arg(&bin).arg(&main))?;
     sh(&mut Command::new(&bin))
 }
 
 fn std_luau(root: &Path, test: &Path, name: &str) -> Result<String, String> {
+    let attrs = crate_attrs(test);
     let glue = format!(
-        "#![allow(dead_code, unused)]\nmod t {{ include!({test:?}); }}\n#[unsafe(no_mangle)]\npub extern \"C\" fn main() {{ t::run(); }}\n"
+        "{attrs}#![allow(dead_code, unused)]\nmod t {{ include!({test:?}); }}\n#[unsafe(no_mangle)]\npub extern \"C\" fn main() {{ t::run(); }}\n"
     );
     let module = build_luau_mode(root, &format!("std_{name}"), &glue, true)?;
     let out = Command::new("timeout")
